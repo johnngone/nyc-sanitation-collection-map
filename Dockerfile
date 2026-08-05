@@ -15,6 +15,7 @@ COPY backend ./backend
 COPY scripts ./scripts
 COPY --from=frontend-build /app/frontend/dist ./frontend-dist
 RUN pip install --no-cache-dir .
+RUN mkdir -p /app/data
 
 ENV DATABASE_PATH=/app/data/app.sqlite3
 ENV DATA_MANIFEST_PATH=/app/data/data_manifest.json
