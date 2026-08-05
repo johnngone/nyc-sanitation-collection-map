@@ -1,95 +1,119 @@
 # NYC Sanitation Map
 
-Interactive map of NYC sanitation collection schedules. The citywide dataset is generated from official NYC DSNY frequency polygons and NYC DCP LION street centerlines, then served from SQLite through FastAPI and rendered with MapLibre.
+Interactive NYC sanitation collection map. The published standalone image contains the compiled React frontend and FastAPI backend, backed by SQLite.
 
-## Requirements
+## Standalone architecture
 
-- Python 3.11+
-- Node.js 20+
-- npm
+FastAPI serves both applications on container port `8000`:
 
-## Run the backend
-
-```powershell
-cd backend
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e "..[test]"
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```text
+/              -> React frontend
+/api/health    -> FastAPI health endpoint
+/api/...       -> FastAPI API endpoints
 ```
 
-The health endpoint is available at http://127.0.0.1:8000/api/health. The map API serves only processed records loaded into the local SQLite database; it does not treat an empty database as proof that no collection exists.
+There is no separate frontend container, Nginx port, or backend host port in the normal deployment. The frontend uses same-origin relative `/api/...` requests.
 
-## Run the frontend
+## Ports
 
-In a second terminal:
+| Item | Value | Meaning |
+|---|---:|---|
+| FastAPI bind address | `0.0.0.0` | All container interfaces; not a browser URL |
+| Container port | `8000` | Fixed port serving frontend and API |
+| Default host port | `8080` | User-selectable browser-facing port |
+| Docker mapping | `8080:8000` | `HOST_PORT:CONTAINER_PORT` |
+| Vite | `5173` | Development only |
+| Nginx | `80` | Separate frontend image only |
 
-```powershell
-cd frontend
-npm install
-npm run dev
+`-p 8080:8000` means visit `http://SERVER-IP:8080`.
+
+`-p 9090:8000` means visit `http://SERVER-IP:9090`.
+
+The left number is selectable; the right number remains `8000`. `0.0.0.0` is a bind address, not a URL. `127.0.0.1` means the current computer; when Docker runs on another computer or unRAID, use that server's LAN IP. `EXPOSE 8000` is image metadata and does not publish a port by itself.
+
+## Deploy the published GHCR image
+
+Choose a persistent host directory, such as `/opt/nyc-sanitation-map/data` on Linux, then run:
+
+```bash
+mkdir -p /opt/nyc-sanitation-map/data
+docker pull ghcr.io/johnngone/nyc-sanitation-collection-map:latest
+docker run -d --name nyc-sanitation-map --restart unless-stopped \
+  -p 8080:8000 \
+  -v /opt/nyc-sanitation-map/data:/app/data \
+  ghcr.io/johnngone/nyc-sanitation-collection-map:latest
 ```
 
-Open http://127.0.0.1:5173. The page currently displays an empty NYC map and reports backend connectivity. Data research begins only after Phase 1 is verified.
+Open `http://SERVER-IP:8080`; verify at `http://SERVER-IP:8080/api/health`.
 
-## Build the pilot data
-
-Do not start with a citywide batch. Download official source exports, inspect their schemas, then build a small pilot:
-
-```powershell
-cd C:\Users\thing\Desktop\playground\nyc-sanitation-map
-.\backend\.venv\Scripts\Activate.ps1
-python scripts\inspect_official_sources.py
-python scripts\build_pilot.py --lion data\raw\lion.geojson --frequencies data\raw\dsny_frequencies.geojson --limit 100
-python scripts\load_processed.py data\processed\pilot.geojson
-```
-
-The LION input must be converted to GeoJSON by the operator from the official File Geodatabase export. The pilot script requires an explicit `FREQ_REFUSE`/`refuse_days` field and writes failures to `output/pilot_failures.jsonl`.
-
-## Container deployment
-
-```powershell
-docker compose build
-docker compose up -d
-```
-
-Open http://127.0.0.1:8080. The SQLite database persists in `data/app.sqlite3`. For production, place Nginx or Caddy in front of the frontend container; the included deployment remains self-contained with SQLite.
-
-The standalone deployment uses no external database. Configure ports and refresh behavior in `.env`:
+## Deploy using Docker Compose
 
 ```bash
 cp .env.example .env
-docker compose build
+docker compose up -d --build
+```
+
+`APP_HOST_PORT=8080` controls only the browser-facing host port. Set `APP_HOST_PORT=9090` to use `http://SERVER-IP:9090`; the container remains on port 8000.
+
+```bash
+docker compose ps
+docker compose logs -f app
+docker compose down
+```
+
+Compose mounts `./data:/app/data`, so the SQLite database and manifest persist. A refresh worker, if run separately, is a data job and publishes no ports.
+
+## unRAID
+
+Use one container template:
+
+```text
+Repository: ghcr.io/johnngone/nyc-sanitation-collection-map:latest
+Network type: Bridge
+Container port: 8000
+Host port: 8080 (or another unused host port)
+Protocol: TCP
+Container data path: /app/data
+Host data path: an appropriate persistent appdata directory
+```
+
+The WebUI is `http://UNRAID-IP:HOST-PORT`, for example `http://192.168.1.50:8080`. Create only this one web mapping; do not separately map 80, 5173, or another host port for container 8000.
+
+## Verify and troubleshoot
+
+```bash
+curl http://SERVER-IP:8080/api/health
+docker logs nyc-sanitation-map
+docker ps
+```
+
+The health response is JSON containing `"status":"ok"`. Connection failures usually mean a wrong host IP, missing mapping, port conflict, firewall, or stopped container. If the frontend loads but says the backend is unavailable, check `/api/health` and logs. Zero processed records means the backend is connected but the SQLite database has no processed data. For “port already allocated”, change only the left side, such as `9090:8000`.
+
+## Updating the image
+
+```bash
+docker compose pull
 docker compose up -d
-docker compose logs -f
 ```
 
-The default source refresh interval is 14 days. Change `DATA_REFRESH_INTERVAL_DAYS`, or disable it with `DATA_REFRESH_ENABLED=false`. The refresh worker stages a new SQLite database and only promotes it after integrity checks. Back up `data/app.sqlite3` and `data/data_manifest.json` before upgrades.
+For a direct Docker deployment, pull the image and recreate the container with the same `/app/data` bind mount. Recreating the container does not remove data stored in the host-mounted directory.
 
-To build images directly without publishing them:
+## Local development
+
+FastAPI development uses port 8000 and Vite uses port 5173. Production does not need two published ports. The separate `frontend/Dockerfile` and `backend/Dockerfile` are development/legacy options; the root `Dockerfile` and combined GHCR image are authoritative.
 
 ```bash
-docker build -f backend/Dockerfile -t nyc-sanitation-backend:local .
-docker build -f frontend/Dockerfile -t nyc-sanitation-frontend:local .
+cd backend && python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+cd frontend && npm ci && npm run dev
 ```
-
-To run a citywide refresh manually:
-
-```bash
-python scripts/run_refresh.py --allow-large-run
-```
-
-The command writes a staged database, GeoJSON, failure log, and manifest. Use `scripts/promote_staging.py` to promote a completed staging directory after validation.
-
-The `Data updated` value in the map comes from `data/data_manifest.json`. The information button explains the source-to-browser data flow and identifies missing or unvalidated records.
-
-## GitHub preparation
-
-The repository includes CI configuration for backend tests, frontend compilation, and Docker image builds. It does not publish images or contact GitHub. Generated databases, raw downloads, virtual environments, logs, and frontend dependencies are excluded by `.gitignore`.
 
 ## Tests
 
-```powershell
-cd backend
+```bash
 python -m pytest
+cd frontend && npm ci && npm run build
+docker build -f Dockerfile -t nyc-sanitation-map:test .
 ```
+
+GitHub Actions tests the combined image before publishing `ghcr.io/johnngone/nyc-sanitation-collection-map:latest` and the commit-SHA tag.
+

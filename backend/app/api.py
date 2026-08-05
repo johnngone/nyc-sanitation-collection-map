@@ -4,6 +4,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
+from pathlib import Path
+import json
 
 from .database import connect
 from .config import DATABASE_PATH
@@ -12,6 +14,27 @@ LOGGER = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 VALID_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
 VALID_TYPES = ("REFUSE", "RECYCLING", "ORGANICS", "BULK")
+
+
+@router.get("/health")
+def health() -> dict[str, object]:
+    from .config import APP_ENV, DATA_MANIFEST_PATH
+
+    try:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM block_faces").fetchone()[0]
+            schedule_counts = {row[0]: row[1] for row in connection.execute("SELECT collection_type, COUNT(*) FROM collection_schedules GROUP BY collection_type")}
+    except sqlite3.Error:
+        LOGGER.exception("Health check could not inspect the local database")
+        raise
+    metadata = {}
+    manifest = Path(DATA_MANIFEST_PATH)
+    if manifest.exists():
+        try:
+            metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            LOGGER.exception("Could not read dataset manifest path=%s", DATA_MANIFEST_PATH)
+    return {"status": "ok", "environment": APP_ENV, "processed_records": count, "schedule_counts": schedule_counts, "data_updated": metadata.get("processed_at"), "data_manifest": metadata.get("manifest_version")}
 
 
 def _validate_bounds(west: float | None, south: float | None, east: float | None, north: float | None) -> None:

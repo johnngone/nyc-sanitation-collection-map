@@ -3,7 +3,7 @@ import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
 const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
 type Weekday = (typeof weekdays)[number];
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
 const sourceId = "collection-streets";
 const layerId = "collection-streets-line";
 const lowZoomLayerId = "collection-streets-lowzoom";

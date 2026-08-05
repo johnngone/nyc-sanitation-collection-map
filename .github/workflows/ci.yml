@@ -21,5 +21,16 @@ jobs:
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
-      - run: docker build -f backend/Dockerfile -t nyc-sanitation-backend:test .
-      - run: docker build -f frontend/Dockerfile -t nyc-sanitation-frontend:test .
+      - run: docker build -f Dockerfile -t nyc-sanitation-map:test .
+      - name: Smoke-test combined image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() { docker logs nyc-sanitation-map-test 2>&1 || true; docker rm -f nyc-sanitation-map-test >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name nyc-sanitation-map-test -p 18080:8000 nyc-sanitation-map:test
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:18080/ >/tmp/frontend.html && curl --fail --silent http://127.0.0.1:18080/api/health >/tmp/health.json; then grep -q 'status' /tmp/health.json; exit 0; fi
+            sleep 2
+          done
+          exit 1

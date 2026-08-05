@@ -28,7 +28,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build combined image for verification
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: nyc-sanitation-map:ci
+      - name: Smoke-test combined image
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() { docker logs nyc-sanitation-map-publish-test 2>&1 || true; docker rm -f nyc-sanitation-map-publish-test >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name nyc-sanitation-map-publish-test -p 18080:8000 nyc-sanitation-map:ci
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:18080/ >/tmp/frontend.html && curl --fail --silent http://127.0.0.1:18080/api/health >/tmp/health.json; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Push verified image
         uses: docker/build-push-action@v6
         with:
           context: .
