@@ -1064,6 +1064,15 @@ def _database_feature_hashes(database: Path) -> dict[str, str]:
         record["source"] = next(iter(sources[feature_id]))
         record["retrieved_at"] = next(iter(retrieved[feature_id]))
         record["segment_ids"] = sorted(set(record["segment_ids"]))
+        # SQLite's lexical weekday order is not the source contract.  Rebuild
+        # each list in the same Monday-to-Saturday order used by processed
+        # GeoJSON, so semantically identical schedules hash identically.
+        record["schedules"] = {
+            collection_type: [
+                day for day in DAY_ORDER if day in record["schedules"][collection_type]
+            ]
+            for collection_type in sorted(VALID_COLLECTION_TYPES)
+        }
     return {
         feature_id: _canonical_record_sha256(record)
         for feature_id, record in records.items()

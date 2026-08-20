@@ -34,7 +34,7 @@ curl http://127.0.0.1:8080/api/health
 docker compose down
 ```
 
-Set `DATA_REFRESH_ON_STARTUP=false` after the first run if recreating the container should wait until the next interval. Set `DATA_REFRESH_ENABLED=false` to stop scheduled refreshes entirely.
+Set `DATA_REFRESH_ON_STARTUP=false` after the first run if recreating the container should wait until the next interval. Set `DATA_REFRESH_ENABLED=false` to stop scheduled refreshes entirely. Failed refreshes retain the current release and retry after `DATA_REFRESH_FAILURE_RETRY_MINUTES` (30 minutes by default), rather than waiting for the normal 14-day interval.
 
 ## Deploy the published GHCR images
 

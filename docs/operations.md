@@ -117,7 +117,7 @@ Default first-release floors are 200,000 raw LION rows, 500 DSNY polygons, and 1
 
 ## Running refreshes
 
-The scheduler runs inside the standalone container on startup when `DATA_REFRESH_ON_STARTUP=true`, then waits `DATA_REFRESH_INTERVAL_DAYS` between attempts. A failure is logged and the current manifest remains unchanged.
+The scheduler runs inside the standalone container on startup when `DATA_REFRESH_ON_STARTUP=true`, then waits `DATA_REFRESH_INTERVAL_DAYS` between successful attempts. A failure leaves the current manifest unchanged and retries after `DATA_REFRESH_FAILURE_RETRY_MINUTES` (30 minutes by default; minimum one minute).
 
 For a one-time local run from the repository root:
 

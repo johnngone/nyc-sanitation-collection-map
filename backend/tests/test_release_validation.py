@@ -465,6 +465,34 @@ def test_processed_database_semantics_reject_same_count_substitution(tmp_path) -
         validate_processed_database_semantics(processed, database)
 
 
+def test_processed_database_semantics_normalizes_sqlite_weekday_order(tmp_path) -> None:
+    """SQLite's lexical ORDER BY must not change the calendar schedule contract."""
+
+    bundle = _bundle(tmp_path, "release-weekday-order")
+    processed_path = bundle / "citywide.geojson"
+    payload = _processed_payload()
+    properties = payload["features"][0]["properties"]
+    properties["refuse_days"] = ["WED", "SAT"]
+    properties["schedules"]["REFUSE"] = ["WED", "SAT"]
+    processed_path.write_text(json.dumps(payload), encoding="utf-8")
+    processed = validate_processed_geojson(processed_path)
+
+    database = bundle / "app.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM collection_schedules "
+            "WHERE block_face_id = 'face-1' AND collection_type = 'REFUSE'"
+        )
+        connection.executemany(
+            """INSERT INTO collection_schedules
+               (block_face_id, collection_type, weekday, source, retrieved_at, validation_status)
+               VALUES ('face-1', 'REFUSE', ?, 'DSNY', '2026-08-19', 'AUDITED_SIDE_OFFSET')""",
+            [(day,) for day in ("WED", "SAT")],
+        )
+
+    assert validate_processed_database_semantics(processed, database)["semantic_feature_count"] == 1
+
+
 def test_tileset_semantics_reject_weekday_tamper_with_matching_counts(tmp_path) -> None:
     bundle = _bundle(tmp_path, "release-tile-semantic")
     database = bundle / "app.sqlite3"
