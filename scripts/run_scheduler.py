@@ -24,9 +24,13 @@ def main() -> None:
             LOGGER.info("Next data refresh in seconds=%s", interval)
             time.sleep(interval)
         command = [sys.executable, "scripts/run_refresh.py", "--allow-large-run"]
+        started = time.monotonic()
+        LOGGER.info("Starting scheduled data refresh")
         result = subprocess.run(command, check=False)
         if result.returncode:
             LOGGER.error("Data refresh failed exit_code=%s; retaining live database", result.returncode)
+        else:
+            LOGGER.info("Completed scheduled data refresh elapsed_s=%.1f", time.monotonic() - started)
 
 
 if __name__ == "__main__":

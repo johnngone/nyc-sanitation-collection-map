@@ -23,6 +23,7 @@ from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Iterable
 
 import mapbox_vector_tile
@@ -51,6 +52,7 @@ WEB_MERCATOR_HALF_WORLD = 20_037_508.342789244
 WEB_MERCATOR_LATITUDE_LIMIT = 85.05112878
 VALID_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
 VALID_TYPES = ("REFUSE", "RECYCLING", "ORGANICS", "BULK")
+TILE_PROGRESS_EVERY_SECONDS = 30.0
 DAY_FIELDS = {
     "REFUSE": "refuse_days",
     "RECYCLING": "recycling_days",
@@ -652,6 +654,8 @@ def build_tiles(
     if source_version is not None and not VERSION_PATTERN.fullmatch(source_version):
         raise ValueError("source version must be 1-128 URL-safe letters, numbers, dots, dashes, or underscores")
 
+    LOGGER.info("Loading SQLite snapshot for vector tiles database=%s", database_path)
+    snapshot_started = monotonic()
     source_database_sha256 = _file_sha256(database_path)
     with closing(_readonly_connection(database_path)) as source:
         source.execute("BEGIN")
@@ -680,6 +684,14 @@ def build_tiles(
         "max_compressed_tile_bytes": max_compressed_tile_bytes,
         "max_uncompressed_tile_bytes": max_uncompressed_tile_bytes,
     }
+    LOGGER.info(
+        "Loaded tile source features=%s schedules=%s zooms=%s-%s elapsed_s=%.1f",
+        feature_count,
+        snapshot.source_schedule_count,
+        minzoom,
+        maxzoom,
+        monotonic() - snapshot_started,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -695,6 +707,7 @@ def build_tiles(
         with closing(sqlite3.connect(temporary_path)) as archive:
             _create_archive(archive)
             for zoom in range(minzoom, maxzoom + 1):
+                zoom_started = monotonic()
                 span = (2 * WEB_MERCATOR_HALF_WORLD) / (1 << zoom)
                 simplify_tolerance = span * simplify_pixels / 512
                 buffer_distance = span * buffer_pixels / 512
@@ -711,8 +724,15 @@ def build_tiles(
                         for y in y_values:
                             tile_members[(x, y)].append(index)
 
+                LOGGER.info(
+                    "Encoding vector tiles zoom=%s candidate_tiles=%s source_features=%s",
+                    zoom,
+                    len(tile_members),
+                    feature_count,
+                )
                 zoom_tiles = 0
-                for (x, y), indexes in sorted(tile_members.items()):
+                last_progress_at = monotonic()
+                for candidate_number, ((x, y), indexes) in enumerate(sorted(tile_members.items()), start=1):
                     min_x, min_y, max_x, max_y = _tile_bounds(zoom, x, y)
                     clip_bounds = (
                         min_x - buffer_distance,
@@ -769,14 +789,31 @@ def build_tiles(
                     tile_count += 1
                     tile_feature_count += len(encoded_features)
                     sizes_by_zoom[zoom].append((compressed_size, uncompressed_size))
+                    now = monotonic()
+                    if now - last_progress_at >= TILE_PROGRESS_EVERY_SECONDS:
+                        LOGGER.info(
+                            "Tile encoding progress zoom=%s candidates=%s/%s emitted_tiles=%s elapsed_s=%.1f",
+                            zoom,
+                            candidate_number,
+                            len(tile_members),
+                            zoom_tiles,
+                            now - zoom_started,
+                        )
+                        last_progress_at = now
                 archive.commit()
                 LOGGER.info(
-                    "Built zoom=%s tiles=%s source_features=%s simplify_m=%.3f",
+                    "Built zoom=%s tiles=%s source_features=%s simplify_m=%.3f elapsed_s=%.1f",
                     zoom,
                     zoom_tiles,
                     feature_count,
                     simplify_tolerance,
+                    monotonic() - zoom_started,
                 )
+            LOGGER.info(
+                "Verifying complete maximum-zoom representation expected_features=%s represented_features=%s",
+                len(block_faces),
+                len(represented_at_maxzoom),
+            )
             if len(represented_at_maxzoom) != len(block_faces):
                 raise RuntimeError(
                     "tile build did not represent every source block face at max zoom: "
@@ -810,6 +847,7 @@ def build_tiles(
         if _file_sha256(database_path) != source_database_sha256:
             raise RuntimeError("source database changed while vector tiles were being built")
         os.replace(temporary_path, output_path)
+        LOGGER.info("Published completed vector tile archive path=%s", output_path)
     except BaseException:
         try:
             temporary_path.unlink()

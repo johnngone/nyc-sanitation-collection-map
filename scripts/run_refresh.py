@@ -12,6 +12,7 @@ import tempfile
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 
 import httpx
 
@@ -33,6 +34,18 @@ DSNY_LAYER = "https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/
 DSNY_QUERY = f"{DSNY_LAYER}/query"
 LION_URL = "https://data.cityofnewyork.us/download/2v4z-66xt/application/zip"
 USER_AGENT = "nyc-sanitation-map/1.0"
+DOWNLOAD_PROGRESS_BYTES = 16 * 1024 * 1024
+DOWNLOAD_PROGRESS_SECONDS = 30.0
+
+
+def _format_bytes(value: int) -> str:
+    """Return a compact, operator-friendly byte count for refresh logs."""
+
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{value} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
 
 
 def _arcgis_json(client: httpx.Client, url: str, params: dict[str, object]) -> dict[str, object]:
@@ -240,15 +253,53 @@ def download_dsny(output: Path, client: httpx.Client | None = None) -> dict[str,
 def download_file(url: str, output: Path) -> dict[str, object]:
     with httpx.stream("GET", url, timeout=180, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as response:
         response.raise_for_status()
-        with output.open("wb") as handle:
-            for chunk in response.iter_bytes():
-                handle.write(chunk)
         advertised_size = response.headers.get("content-length")
+        expected_size = int(advertised_size) if advertised_size is not None else None
+        LOGGER.info(
+            "Downloading archive destination=%s expected_bytes=%s",
+            output.name,
+            _format_bytes(expected_size) if expected_size is not None else "unknown",
+        )
+        downloaded = 0
+        started = monotonic()
+        last_progress_at = started
+        last_progress_bytes = 0
+        with output.open("wb") as handle:
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                handle.write(chunk)
+                downloaded += len(chunk)
+                now = monotonic()
+                if (
+                    downloaded - last_progress_bytes >= DOWNLOAD_PROGRESS_BYTES
+                    or now - last_progress_at >= DOWNLOAD_PROGRESS_SECONDS
+                ):
+                    percentage = (
+                        f"{downloaded / expected_size:.1%}"
+                        if expected_size
+                        else "unknown"
+                    )
+                    elapsed = max(now - started, 0.001)
+                    LOGGER.info(
+                        "LION download progress bytes=%s expected=%s percent=%s rate_mib_s=%.2f elapsed_s=%.0f",
+                        _format_bytes(downloaded),
+                        _format_bytes(expected_size) if expected_size is not None else "unknown",
+                        percentage,
+                        downloaded / elapsed / (1024 * 1024),
+                        elapsed,
+                    )
+                    last_progress_at = now
+                    last_progress_bytes = downloaded
         actual_size = output.stat().st_size
-        if advertised_size is not None and int(advertised_size) != actual_size:
+        if expected_size is not None and expected_size != actual_size:
             raise RuntimeError(
-                f"download size mismatch url={url} expected={advertised_size} actual={actual_size}"
+                f"download size mismatch url={url} expected={expected_size} actual={actual_size}"
             )
+        LOGGER.info(
+            "Completed archive download destination=%s bytes=%s elapsed_s=%.1f",
+            output.name,
+            _format_bytes(actual_size),
+            monotonic() - started,
+        )
         return {
             "bytes": actual_size,
             "etag": response.headers.get("etag"),
@@ -343,10 +394,17 @@ def main() -> None:
         bundle.mkdir()
         dsny = bundle / "dsny_frequencies.geojson"
         lion_zip = bundle / "lion.zip"
-        LOGGER.info("Downloading complete DSNY frequency layer")
+        LOGGER.info("Stage 1/8: downloading complete DSNY frequency layer")
         dsny_source_audit = download_dsny(dsny)
-        LOGGER.info("Downloading complete LION archive")
+        LOGGER.info(
+            "Stage 1/8 complete: DSNY features=%s object_id_field=%s",
+            dsny_source_audit["record_count"],
+            dsny_source_audit["object_id_field"],
+        )
+        LOGGER.info("Stage 2/8: downloading complete LION archive")
         lion_source_audit = download_file(LION_URL, lion_zip)
+        LOGGER.info("Stage 2/8 complete: LION archive bytes=%s", _format_bytes(int(lion_source_audit["bytes"])))
+        LOGGER.info("Stage 3/8: hashing and extracting LION archive")
         input_hashes = {"dsny": file_sha256(dsny), "lion": file_sha256(lion_zip)}
         extracted = staging / "lion-extracted"
         shutil.unpack_archive(lion_zip, extracted)
@@ -357,6 +415,7 @@ def main() -> None:
                 f"found={len(geodatabases)}"
             )
         gdb = geodatabases[0]
+        LOGGER.info("Stage 3/8 complete: discovered LION geodatabase=%s", gdb.name)
         processed = bundle / "citywide.geojson"
         failures = bundle / "ingestion_failures.jsonl"
         staged_audit = bundle / "ingestion_audit.json"
@@ -378,12 +437,24 @@ def main() -> None:
             "--side-offset-feet",
             str(args.side_offset_feet),
         ]
+        LOGGER.info("Stage 4/8: auditing LION block faces against DSNY frequency polygons")
+        stage_started = monotonic()
         subprocess.run(command, check=True)
+        LOGGER.info("Stage 4/8 complete elapsed_s=%.1f", monotonic() - stage_started)
+        LOGGER.info("Stage 5/8: validating audited GeoJSON and provenance")
+        stage_started = monotonic()
         processed_summary = validate_processed_geojson(processed)
         ingestion_audit = validate_ingestion_audit(
             staged_audit,
             expected_processed_sha256=processed_summary["sha256"],
             expected_processed_features=processed_summary["feature_count"],
+        )
+        LOGGER.info(
+            "Stage 5/8 complete features=%s raw_lion_rows=%s dsny_rows=%s elapsed_s=%.1f",
+            processed_summary["feature_count"],
+            ingestion_audit["source_rows"],
+            ingestion_audit["frequency_rows"],
+            monotonic() - stage_started,
         )
 
         processed_time = datetime.now(UTC)
@@ -391,6 +462,8 @@ def main() -> None:
         dataset_version = _release_version(processed_time, str(processed_summary["sha256"]))
         audit_sha256 = file_sha256(staged_audit)
         staged_db = bundle / "app.sqlite3"
+        LOGGER.info("Stage 6/8: loading audited GeoJSON into SQLite")
+        stage_started = monotonic()
         subprocess.run([sys.executable, "scripts/load_processed.py", str(processed), "--database", str(staged_db)], check=True)
         _bind_database_metadata(
             staged_db,
@@ -411,9 +484,21 @@ def main() -> None:
         database_summary.update(
             validate_processed_database_semantics(processed_summary, staged_db)
         )
+        LOGGER.info(
+            "Stage 6/8 complete block_faces=%s schedules=%s elapsed_s=%.1f",
+            database_summary["block_faces"],
+            database_summary["schedule_count"],
+            monotonic() - stage_started,
+        )
 
         staged_tileset = bundle / "collection_streets.mbtiles"
         tile_report_path = bundle / "tile_build_report.json"
+        LOGGER.info(
+            "Stage 7/8: building gzip vector tiles zooms=%s-%s",
+            args.tile_minzoom,
+            args.tile_maxzoom,
+        )
+        stage_started = monotonic()
         subprocess.run(
             [
                 sys.executable,
@@ -448,6 +533,12 @@ def main() -> None:
             expected_version=dataset_version,
             database=database_summary,
             tileset=tileset_summary,
+        )
+        LOGGER.info(
+            "Stage 7/8 complete tiles=%s max_compressed_bytes=%s elapsed_s=%.1f",
+            tileset_summary["tile_count"],
+            tile_report["tile_size_metrics"]["max_compressed_tile_bytes"],
+            monotonic() - stage_started,
         )
 
         audit_summary = {key: value for key, value in ingestion_audit.items() if key != "records"}
@@ -536,6 +627,8 @@ def main() -> None:
             },
         }
         atomic_json(bundle / "release_manifest.json", manifest)
+        LOGGER.info("Stage 8/8: validating release bundle and publishing atomically")
+        stage_started = monotonic()
         published = publish_release(
             bundle,
             manifest_path,
@@ -548,10 +641,11 @@ def main() -> None:
             },
         )
         LOGGER.info(
-            "Promoted audited dataset version=%s block_faces=%s tiles=%s",
+            "Stage 8/8 complete: promoted audited dataset version=%s block_faces=%s tiles=%s elapsed_s=%.1f",
             published["dataset_version"],
             database_summary["block_faces"],
             tileset_summary["tile_count"],
+            monotonic() - stage_started,
         )
 
 

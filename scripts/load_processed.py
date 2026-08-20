@@ -21,6 +21,7 @@ from scripts.build_pilot import DAY_ORDER, SCHEDULE_FIELDS, combine_line_geometr
 LOGGER = logging.getLogger("load_processed")
 VALID_DAYS = set(DAY_ORDER)
 COLLECTION_TYPES = tuple(SCHEDULE_FIELDS)
+PROGRESS_EVERY_FEATURES = 10_000
 
 
 @dataclass(frozen=True)
@@ -50,10 +51,14 @@ def prepare_features(payload: object) -> list[ValidatedFeature]:
     if not isinstance(raw_features, list):
         raise ValueError("FeatureCollection features must be a list")
 
+    LOGGER.info("Validating processed GeoJSON features=%s", len(raw_features))
     groups: dict[str, list[ValidatedFeature]] = defaultdict(list)
     for feature_number, feature in enumerate(raw_features):
         validated = _validate_feature(feature, feature_number)
         groups[validated.block_face_id].append(validated)
+        completed = feature_number + 1
+        if completed % PROGRESS_EVERY_FEATURES == 0 or completed == len(raw_features):
+            LOGGER.info("Processed GeoJSON validation progress features=%s/%s", completed, len(raw_features))
 
     aggregated: list[ValidatedFeature] = []
     for block_face_id in sorted(groups):
@@ -94,6 +99,7 @@ def prepare_features(payload: object) -> list[ValidatedFeature]:
             source=first.source,
             retrieved_at=first.retrieved_at,
         ))
+    LOGGER.info("Validated and aggregated processed features=%s", len(aggregated))
     return aggregated
 
 
@@ -103,6 +109,7 @@ def load_payload(payload: object, database: str | Path) -> int:
     features = prepare_features(payload)
     if not features:
         raise ValueError("input contains no features")
+    LOGGER.info("Initializing SQLite and loading audited features=%s database=%s", len(features), database)
     initialize(database)
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
@@ -150,7 +157,7 @@ def load_payload(payload: object, database: str | Path) -> int:
         connection.execute("DELETE FROM block_faces_rtree")
         connection.execute("DELETE FROM block_face_rtree_map")
         connection.execute("DELETE FROM block_faces")
-        for feature in features:
+        for feature_number, feature in enumerate(features, start=1):
             min_x, min_y, max_x, max_y = feature.geometry.bounds
             stored_segment_ids = "|".join(feature.segment_ids)
             connection.execute(
@@ -239,6 +246,8 @@ def load_payload(payload: object, database: str | Path) -> int:
                     for component_index, component in enumerate(feature.lion_components)
                 ],
             )
+            if feature_number % PROGRESS_EVERY_FEATURES == 0 or feature_number == len(features):
+                LOGGER.info("SQLite load progress features=%s/%s", feature_number, len(features))
     return len(features)
 
 

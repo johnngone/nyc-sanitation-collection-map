@@ -19,6 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Iterable
 
 import geopandas as gpd
@@ -42,6 +43,8 @@ MIN_MAPPABLE_TRACE_FEET = 0.25
 OFFSET_COVERAGE_TOLERANCE_FEET = 1e-5
 MAX_INNER_JOIN_TRIM_FRACTION = 0.25
 NEAR_REVERSAL_COSINE = -0.95
+PROGRESS_EVERY_PREPARED_SEGMENTS = 5_000
+PROGRESS_EVERY_SOURCE_ROWS = 25_000
 DAY_ORDER = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
 DAY_ALIASES = {
     "MON": "MON",
@@ -231,6 +234,12 @@ def build_collection_features(
     if lion.crs is None or frequencies.crs is None:
         raise ValueError("both inputs must declare a coordinate reference system")
 
+    LOGGER.info(
+        "Preparing spatial inputs lion_rows=%s frequency_polygons=%s working_crs=%s",
+        len(lion),
+        len(frequencies),
+        WORKING_CRS,
+    )
     lion_working = lion.to_crs(WORKING_CRS).copy()
     frequencies_working = frequencies.to_crs(WORKING_CRS).copy()
     source_rows = len(lion_working)
@@ -246,6 +255,13 @@ def build_collection_features(
         source_indices,
         side_results,
         global_errors,
+    )
+    LOGGER.info(
+        "Prepared LION physical segments=%s raw_rows=%s in_scope_rows=%s aliases_deduplicated=%s",
+        len(prepared_segments),
+        source_rows,
+        source_row_outcomes["in_scope"],
+        source_row_outcomes["deduplicated_alias"],
     )
 
     missing_schedule_fields = [field for field in SCHEDULE_FIELDS.values() if field not in frequencies_working.columns]
@@ -287,7 +303,8 @@ def build_collection_features(
 
     frequency_index = frequencies_working.sindex if not frequencies_working.empty else None
     encountered_frequency_rows: set[int] = set()
-    for prepared in prepared_segments:
+    spatial_join_started = monotonic()
+    for prepared_number, prepared in enumerate(prepared_segments, start=1):
         source_row = prepared.source_row
         row = prepared.row
         source_index = prepared.source_index
@@ -488,6 +505,20 @@ def build_collection_features(
                     source_records=prepared.source_records,
                 ))
 
+        if (
+            prepared_number % PROGRESS_EVERY_PREPARED_SEGMENTS == 0
+            or prepared_number == len(prepared_segments)
+        ):
+            LOGGER.info(
+                "Spatial join progress segments=%s/%s sides=%s candidate_groups=%s dsny_polygons_touched=%s elapsed_s=%.1f",
+                prepared_number,
+                len(prepared_segments),
+                len(side_results),
+                len(candidates),
+                len(encountered_frequency_rows),
+                monotonic() - spatial_join_started,
+            )
+
     output_features: list[dict[str, object]] = []
     conflict_groups = 0
     split_feature_groups = 0
@@ -496,6 +527,11 @@ def build_collection_features(
     borough_split_output_features = 0
     to_wgs84 = Transformer.from_crs(WORKING_CRS, "EPSG:4326", always_xy=True)
     retrieved = retrieved_at or date.today().isoformat()
+    LOGGER.info(
+        "Aggregating validated side matches candidate_groups=%s elapsed_s=%.1f",
+        len(candidates),
+        monotonic() - spatial_join_started,
+    )
     for origin_block_face_id in sorted(candidates):
         origin_group = sorted(
             candidates[origin_block_face_id],
@@ -615,6 +651,13 @@ def build_collection_features(
         borough_split_feature_groups=borough_split_feature_groups,
         borough_split_output_features=borough_split_output_features,
     )
+    LOGGER.info(
+        "Finished spatial audit output_features=%s classified_sides=%s expected_sides=%s elapsed_s=%.1f",
+        len(output_features),
+        audit["classified_sides"],
+        audit["expected_sides"],
+        monotonic() - spatial_join_started,
+    )
     return payload, audit
 
 
@@ -678,8 +721,16 @@ def _prepare_lion_segments(
             "identity_conflict_groups": 0,
         }
 
+    LOGGER.info("Classifying official LION scope and curbside eligibility rows=%s", len(lion))
     grouped: dict[str, list[int]] = defaultdict(list)
-    for source_row, row in lion.iterrows():
+    for source_number, (source_row, row) in enumerate(lion.iterrows(), start=1):
+        if source_number % PROGRESS_EVERY_SOURCE_ROWS == 0 or source_number == len(lion):
+            LOGGER.info(
+                "LION scope progress rows=%s/%s physical_segment_ids=%s",
+                source_number,
+                len(lion),
+                len(grouped),
+            )
         source_row = int(source_row)
         segment_type = _source_code(row.get("SegmentTyp"))
         feature_type = _source_code(row.get("FeatureTyp"))
@@ -730,7 +781,9 @@ def _prepare_lion_segments(
     alias_groups = 0
     identity_conflict_groups = 0
     multi_geometry_segment_ids: list[dict[str, object]] = []
-    for segment_id in sorted(grouped):
+    sorted_segment_ids = sorted(grouped)
+    LOGGER.info("Normalizing LION aliases physical_segment_ids=%s", len(sorted_segment_ids))
+    for segment_number, segment_id in enumerate(sorted_segment_ids, start=1):
         positions = sorted(grouped[segment_id])
         geometry_groups: dict[str, list[int]] = defaultdict(list)
         identity_groups: dict[tuple[str, str, str], list[int]] = defaultdict(list)
@@ -852,6 +905,17 @@ def _prepare_lion_segments(
                 address_ranges_by_side=address_ranges_by_side,
                 boundary_out_of_scope_by_side=boundary_out_of_scope_by_side,
             ))
+        if (
+            segment_number % PROGRESS_EVERY_SOURCE_ROWS == 0
+            or segment_number == len(sorted_segment_ids)
+        ):
+            LOGGER.info(
+                "LION alias normalization progress segments=%s/%s prepared=%s aliases=%s",
+                segment_number,
+                len(sorted_segment_ids),
+                len(prepared),
+                row_outcomes["deduplicated_alias"],
+            )
     return prepared, row_outcomes, {
         "segment_alias_groups": alias_groups,
         "multi_geometry_segment_ids": multi_geometry_segment_ids,
@@ -1895,8 +1959,12 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    LOGGER.info("Reading LION source path=%s layer=%s", args.lion, args.lion_layer)
     lion = gpd.read_file(args.lion, layer=args.lion_layer if args.lion.suffix.lower() == ".gdb" or args.lion.is_dir() else None)
+    LOGGER.info("Read LION source rows=%s columns=%s", len(lion), len(lion.columns))
+    LOGGER.info("Reading DSNY frequency polygons path=%s", args.frequencies)
     frequencies = gpd.read_file(args.frequencies)
+    LOGGER.info("Read DSNY frequency polygons rows=%s", len(frequencies))
     if args.limit is not None:
         if args.limit <= 0:
             raise ValueError("limit must be positive")
@@ -1904,12 +1972,14 @@ def main() -> None:
     if lion.empty:
         raise ValueError("LION input contains no rows")
 
+    LOGGER.info("Starting complete side-aware LION-to-DSNY audit")
     payload, audit = build_collection_features(
         lion,
         frequencies,
         side_offset_feet=args.side_offset_feet,
         trace_tolerance_feet=args.trace_tolerance_feet,
     )
+    LOGGER.info("Serializing audited GeoJSON features=%s", len(payload["features"]))
     processed_bytes = serialize_processed_payload(payload)
     bind_processed_sha256(audit, processed_bytes)
     audit_bytes = (
@@ -1919,6 +1989,7 @@ def main() -> None:
         json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
         for record in audit["records"]
     ).encode("utf-8")
+    LOGGER.info("Writing audited artifacts atomically")
     _atomic_write_many([
         (args.output, processed_bytes),
         (args.audit, audit_bytes),
