@@ -33,7 +33,7 @@ class FrontendStaticFiles(StaticFiles):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Existing root databases are legacy snapshots and must remain readable as
-    # deployed while the refresh worker builds the first immutable v2 release.
+    # deployed while the background refresh builds the first immutable v2 release.
     # Only bootstrap storage when neither form of data exists.
     if not Path(DATABASE_PATH).exists() and not Path(DATA_MANIFEST_PATH).exists():
         initialize(DATABASE_PATH)

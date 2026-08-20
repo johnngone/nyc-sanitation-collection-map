@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Never interrupt a publish between the paired moving-tag updates.
+  # Keep one mutable image tag from being advanced out of order.
   group: sanitation-container-publish
   cancel-in-progress: false
 
@@ -48,15 +48,7 @@ jobs:
           load: true
           push: false
           tags: nyc-sanitation-map:ci
-      - name: Build refresh image for verification
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.refresh
-          load: true
-          push: false
-          tags: nyc-sanitation-map-refresh:ci
-      - name: Smoke-test paired app and refresh images
+      - name: Smoke-test standalone image
         shell: bash
         run: |
           set -euo pipefail
@@ -71,11 +63,12 @@ jobs:
 
           docker run --rm --entrypoint python \
             -v "${smoke_data}:/smoke-data" \
-            nyc-sanitation-map-refresh:ci \
+            nyc-sanitation-map:ci \
             scripts/build_smoke_release.py --data-dir /smoke-data >"${fixture_json}"
 
           docker run -d --name nyc-sanitation-map-publish-test \
             -e APP_ENV=publish-smoke \
+            -e DATA_REFRESH_ENABLED=false \
             -p 18080:8000 \
             -v "${smoke_data}:/app/data" \
             nyc-sanitation-map:ci
@@ -142,7 +135,7 @@ jobs:
           )"
           docker run --rm --entrypoint python \
             -v "${smoke_data}:/smoke-data:ro" \
-            nyc-sanitation-map-refresh:ci \
+            nyc-sanitation-map:ci \
             -c 'import gzip, pathlib, mapbox_vector_tile as m; payload=gzip.decompress(pathlib.Path("/smoke-data/tile.pbf").read_bytes()); decoded=m.decode(payload); assert decoded["collection_streets"]["features"]'
           cache_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
             -H "If-None-Match: ${etag}" "http://127.0.0.1:18080${tile_url}")"
@@ -155,23 +148,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push paired commit tags
+      - name: Push immutable commit tag
         shell: bash
         run: |
           set -euo pipefail
           docker tag nyc-sanitation-map:ci "${IMAGE}:${GITHUB_SHA}"
-          docker tag nyc-sanitation-map-refresh:ci "${IMAGE}:refresh-${GITHUB_SHA}"
           docker push "${IMAGE}:${GITHUB_SHA}"
-          docker push "${IMAGE}:refresh-${GITHUB_SHA}"
 
-      - name: Advance refresh tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker tag nyc-sanitation-map-refresh:ci "${IMAGE}:refresh"
-          docker push "${IMAGE}:refresh"
-
-      - name: Advance app tag last
+      - name: Advance latest tag
         shell: bash
         run: |
           set -euo pipefail

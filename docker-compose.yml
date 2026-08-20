@@ -12,23 +12,6 @@ services:
       DATA_MANIFEST_PATH: /app/data/data_manifest.json
       HEALTH_SYNC_HASH_MAX_BYTES: ${HEALTH_SYNC_HASH_MAX_BYTES:-16777216}
       INGESTION_AUDIT_PATH: /app/data/ingestion_audit.json
-    volumes:
-      - ./data:/app/data
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-  refresh:
-    build:
-      context: .
-      dockerfile: Dockerfile.refresh
-    environment:
-      DATABASE_PATH: /app/data/app.sqlite3
-      TILESET_PATH: /app/data/collection_streets.mbtiles
-      DATA_MANIFEST_PATH: /app/data/data_manifest.json
-      INGESTION_AUDIT_PATH: /app/data/ingestion_audit.json
       DATA_REFRESH_ENABLED: ${DATA_REFRESH_ENABLED:-true}
       DATA_REFRESH_INTERVAL_DAYS: ${DATA_REFRESH_INTERVAL_DAYS:-14}
       DATA_REFRESH_ON_STARTUP: ${DATA_REFRESH_ON_STARTUP:-true}
@@ -44,4 +27,9 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 

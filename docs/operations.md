@@ -5,7 +5,7 @@
 ```text
 official DSNY + LION sources
             |
-       refresh worker
+   background refresh process
             |
    audited immutable release
    (SQLite + MBTiles + reports)
@@ -19,7 +19,7 @@ official DSNY + LION sources
     MapLibre viewport cache
 ```
 
-FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not encode geometry during a request. The refresh image owns the geospatial dependencies and expensive source processing; the smaller app image reads completed release artifacts on the request path.
+FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not encode geometry during a request. The same standalone container runs the geospatial refresh scheduler in the background; completed release artifacts remain on the mounted data volume.
 
 ## Vector-tile contract
 
@@ -77,7 +77,7 @@ data/
 
 The dataset version combines the processing timestamp and processed-data digest. Each artifact descriptor carries a SHA-256 checksum and relevant count/version bindings.
 
-The worker builds in a temporary directory on the same volume, validates the complete bundle, installs a new immutable release directory, and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. A malformed committed v2 pointer fails closed instead of falling back to loose legacy files.
+The background refresh builds in a temporary directory on the same volume, validates the complete bundle, installs a new immutable release directory, and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. A malformed committed v2 pointer fails closed instead of falling back to loose legacy files.
 
 On first access to a new production-sized release, the app hashes the committed database and tileset once on a background worker. While this single-flight check is running, `/api/health` returns HTTP `503` with `Committed artifact checksums are verifying`, and `/api/map-config` reports `available: false`; the frontend retries both after 0.5 seconds and exponentially backs off to a 15-second cap. Verified results are cached against the artifact path, size, modification time, and expected digest. `HEALTH_SYNC_HASH_MAX_BYTES` is the maximum total artifact size verified inline (16 MiB by default). Lowering it moves more checks to the background; raising it can make a health request block on more I/O. Every artifact is still hashed.
 
@@ -90,11 +90,11 @@ python scripts/run_refresh.py --status
 python scripts/activate_release.py <dataset-version>
 ```
 
-Inside the published worker container:
+Inside the standalone container:
 
 ```bash
-docker exec nyc-sanitation-refresh python scripts/run_refresh.py --status
-docker exec nyc-sanitation-refresh python scripts/activate_release.py <dataset-version>
+docker exec nyc-sanitation-map python scripts/run_refresh.py --status
+docker exec nyc-sanitation-map python scripts/activate_release.py <dataset-version>
 ```
 
 Activation revalidates the installed bundle and then atomically switches the pointer. It works only while that release is retained. Back up the persistent volume before manual recovery work.
@@ -103,7 +103,7 @@ Activation revalidates the installed bundle and then atomically switches the poi
 
 ## Refresh gates
 
-The worker will not change the manifest unless all of these pass:
+The background refresh will not change the manifest unless all of these pass:
 
 1. Complete source download and stable DSNY snapshot checks.
 2. Full LION row, LION-side, and DSNY-frequency reconciliation with zero fatal audit outcomes.
@@ -117,7 +117,7 @@ Default first-release floors are 200,000 raw LION rows, 500 DSNY polygons, and 1
 
 ## Running refreshes
 
-The scheduler runs on startup when `DATA_REFRESH_ON_STARTUP=true`, then waits `DATA_REFRESH_INTERVAL_DAYS` between attempts. A failure is logged and the current manifest remains unchanged.
+The scheduler runs inside the standalone container on startup when `DATA_REFRESH_ON_STARTUP=true`, then waits `DATA_REFRESH_INTERVAL_DAYS` between attempts. A failure is logged and the current manifest remains unchanged.
 
 For a one-time local run from the repository root:
 
@@ -136,12 +136,12 @@ The `--allow-large-run` flag is required. Useful expert overrides include `--til
 
 | Symptom | Check |
 |---|---|
-| Basemap only on a new install | The first refresh may still be running; watch the worker log and `/api/map-config`. |
+| Basemap only on a new install | The first refresh may still be running; watch the container log and `/api/map-config`. |
 | `/api/health` shows `map_available: false` | No valid tileset has been committed yet, or the configured/shared volume is wrong. |
-| Refresh exits before promotion | Read the first validation error in the worker log; the previous release remains live. |
+| Refresh exits before promotion | Read the first validation error in the container log; the previous release remains live. |
 | Refresh repeatedly starts after recreation | Set `DATA_REFRESH_ON_STARTUP=false` after initialization. |
 | Health returns `503` with checksums `verifying` | Expected briefly after startup or a release switch; keep polling while the single background hash completes. |
 | Health returns `503` with checksums `invalid` or another integrity error | The manifest, checksum, or database/tileset metadata is invalid; restore a backup or activate a retained valid release. |
 | Tile request returns `404` | The version is not current/retained, the zoom is outside the archive range, or coordinates are invalid. |
 | Legacy request returns `413` | Use vector tiles or a smaller bounding box. |
-| Worker cannot publish | Verify both containers mount the same writable host directory at `/app/data` and that it has free space. |
+| Refresh cannot publish | Verify the container's `/app/data` mount is writable and has free space. |

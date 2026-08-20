@@ -14,16 +14,17 @@ COPY pyproject.toml README.md ./
 COPY backend ./backend
 COPY scripts ./scripts
 COPY --from=frontend-build /app/frontend/dist ./frontend-dist
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[refresh]" \
+    && chmod +x /app/scripts/container_entrypoint.sh
 RUN mkdir -p /app/data
 
 ENV DATABASE_PATH=/app/data/app.sqlite3
 ENV TILESET_PATH=/app/data/collection_streets.mbtiles
 ENV DATA_MANIFEST_PATH=/app/data/data_manifest.json
-ENV DATA_REFRESH_ENABLED=false
+ENV DATA_REFRESH_ENABLED=true
 ENV DATA_REFRESH_INTERVAL_DAYS=14
-ENV DATA_REFRESH_ON_STARTUP=false
+ENV DATA_REFRESH_ON_STARTUP=true
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
-CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/app/scripts/container_entrypoint.sh"]

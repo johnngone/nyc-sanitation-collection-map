@@ -28,10 +28,9 @@ jobs:
       - run: npm run build
         working-directory: frontend
       - run: docker build -f Dockerfile -t nyc-sanitation-map:test .
-      - run: docker build -f Dockerfile.refresh -t nyc-sanitation-map-refresh:test .
-      - name: Verify refresh image dependencies
-        run: docker run --rm --entrypoint python nyc-sanitation-map-refresh:test -c "import geopandas, mapbox_vector_tile, shapely; from scripts.build_tiles import build_tiles"
-      - name: Smoke-test paired app and refresh images
+      - name: Verify standalone refresh dependencies
+        run: docker run --rm --entrypoint python nyc-sanitation-map:test -c "import geopandas, mapbox_vector_tile, shapely; from scripts.build_tiles import build_tiles"
+      - name: Smoke-test standalone image
         shell: bash
         run: |
           set -euo pipefail
@@ -46,11 +45,12 @@ jobs:
 
           docker run --rm --entrypoint python \
             -v "${smoke_data}:/smoke-data" \
-            nyc-sanitation-map-refresh:test \
+            nyc-sanitation-map:test \
             scripts/build_smoke_release.py --data-dir /smoke-data >"${fixture_json}"
 
           docker run -d --name nyc-sanitation-map-test \
             -e APP_ENV=ci-smoke \
+            -e DATA_REFRESH_ENABLED=false \
             -p 18080:8000 \
             -v "${smoke_data}:/app/data" \
             nyc-sanitation-map:test
@@ -117,7 +117,7 @@ jobs:
           )"
           docker run --rm --entrypoint python \
             -v "${smoke_data}:/smoke-data:ro" \
-            nyc-sanitation-map-refresh:test \
+            nyc-sanitation-map:test \
             -c 'import gzip, pathlib, mapbox_vector_tile as m; payload=gzip.decompress(pathlib.Path("/smoke-data/tile.pbf").read_bytes()); decoded=m.decode(payload); assert decoded["collection_streets"]["features"]'
           cache_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
             -H "If-None-Match: ${etag}" "http://127.0.0.1:18080${tile_url}")"
