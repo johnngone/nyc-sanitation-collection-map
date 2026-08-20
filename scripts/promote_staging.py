@@ -1,62 +1,75 @@
-"""Validate and atomically promote a completed citywide staging directory."""
+"""Revalidate and atomically promote a prebuilt immutable release bundle."""
+
+from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import shutil
-import sqlite3
-from datetime import UTC, datetime
+import sys
 from pathlib import Path
 
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.release_validation import (
+    publish_release,
+)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("staging", type=Path)
-    parser.add_argument("--database", type=Path, default=Path("data/app.sqlite3"))
-    parser.add_argument("--manifest", type=Path, default=Path("data/data_manifest.json"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "staging",
+        type=Path,
+        help="Directory containing release_manifest.json and every bound artifact",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path(os.getenv("DATA_MANIFEST_PATH", "data/data_manifest.json")),
+    )
+    parser.add_argument(
+        "--release-retention",
+        type=int,
+        default=int(os.getenv("DATA_RELEASE_RETENTION", "2")),
+    )
+    parser.add_argument(
+        "--min-lion-rows",
+        type=int,
+        default=int(os.getenv("MIN_LION_SOURCE_ROWS", "200000")),
+    )
+    parser.add_argument(
+        "--min-dsny-rows",
+        type=int,
+        default=int(os.getenv("MIN_DSNY_SOURCE_ROWS", "500")),
+    )
+    parser.add_argument(
+        "--min-output-features",
+        type=int,
+        default=int(os.getenv("MIN_OUTPUT_FEATURES", "100000")),
+    )
+    parser.add_argument(
+        "--max-count-drop-percent",
+        type=float,
+        default=float(os.getenv("MAX_COUNT_DROP_PERCENT", "10")),
+    )
     args = parser.parse_args()
-    staged_db = args.staging / "app.sqlite3"
-    processed = args.staging / "citywide.geojson"
-    failures = args.staging / "citywide_failures.jsonl"
-    if not staged_db.exists() or not processed.exists():
-        raise FileNotFoundError("staging directory must contain app.sqlite3 and citywide.geojson")
-    with sqlite3.connect(staged_db) as connection:
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise RuntimeError(f"staged database integrity check failed: {integrity}")
-        block_faces = connection.execute("SELECT COUNT(*) FROM block_faces").fetchone()[0]
-        schedules = dict(connection.execute("SELECT collection_type, COUNT(*) FROM collection_schedules GROUP BY collection_type"))
-    if block_faces <= 0:
-        raise RuntimeError("staged database contains no block faces")
-    manifest = {
-        "manifest_version": 1,
-        "processed_at": datetime.now(UTC).isoformat(),
-        "sources": {
-            "dsny": "https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0/query",
-            "lion": "https://data.cityofnewyork.us/download/2v4z-66xt/application/zip",
+    if args.release_retention < 2:
+        raise SystemExit("--release-retention must be at least 2")
+    if not 0 <= args.max_count_drop_percent < 100:
+        raise SystemExit("--max-count-drop-percent must be at least 0 and below 100")
+
+    # The staging manifest supplies all identities and checksums.  This command
+    # deliberately does not invent missing trust metadata for loose files.
+    manifest = publish_release(
+        args.staging,
+        args.manifest,
+        retention=args.release_retention,
+        regression_gate={
+            "min_lion_rows": args.min_lion_rows,
+            "min_dsny_rows": args.min_dsny_rows,
+            "min_output_features": args.min_output_features,
+            "max_drop_fraction": args.max_count_drop_percent / 100,
         },
-        "staged_geojson_sha256": sha256(processed),
-        "block_faces": block_faces,
-        "schedule_counts": schedules,
-        "failure_records": sum(1 for _ in failures.open(encoding="utf-8")) if failures.exists() else 0,
-    }
-    args.database.parent.mkdir(parents=True, exist_ok=True)
-    if args.database.exists():
-        shutil.copy2(args.database, args.database.with_suffix(args.database.suffix + ".previous"))
-    live_stage = args.database.with_suffix(args.database.suffix + ".staged")
-    shutil.copy2(staged_db, live_stage)
-    os.replace(live_stage, args.database)
-    args.manifest.parent.mkdir(parents=True, exist_ok=True)
-    args.manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    )
     print(json.dumps(manifest, indent=2))
 
 

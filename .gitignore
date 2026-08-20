@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.pytest-tmp*/
+.pytest-*/
+.verification/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
@@ -22,6 +25,7 @@ output/
 *.sqlite3
 *.sqlite3-*
 *.sqlite3.*
+*.mbtiles
 *.geojson
 *.gdb/
 *.zip
@@ -31,9 +35,13 @@ data/lion-extracted/
 data/raw/*
 data/processed/*
 data/cache/*
+data/audits/*
+data/tilesets/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/cache/.gitkeep
+!data/audits/.gitkeep
+!data/tilesets/.gitkeep
 *.pem
 *.key
 *.p12

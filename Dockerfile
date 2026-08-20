@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir .
 RUN mkdir -p /app/data
 
 ENV DATABASE_PATH=/app/data/app.sqlite3
+ENV TILESET_PATH=/app/data/collection_streets.mbtiles
 ENV DATA_MANIFEST_PATH=/app/data/data_manifest.json
 ENV DATA_REFRESH_ENABLED=false
 ENV DATA_REFRESH_INTERVAL_DAYS=14

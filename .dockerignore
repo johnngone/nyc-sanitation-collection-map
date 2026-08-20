@@ -3,11 +3,10 @@
 backend/.venv
 frontend/node_modules
 frontend/dist
-data/raw
-data/processed
-data/cache
-data/*.sqlite3
-data/*.sqlite3-*
+data
+.verification
+.pytest-tmp*
+.pytest-*
 output
 *.log
 __pycache__

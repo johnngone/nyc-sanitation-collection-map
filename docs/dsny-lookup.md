@@ -1,4 +1,6 @@
-# Phase 3: DSNY lookup investigation
+# DSNY address-lookup investigation
+
+This is a research utility only. The production map refresh does not call or scrape the address-lookup page; it uses the official DSNY frequency layer described in [data sources](data-sources.md).
 
 The official collection schedule page is:
 

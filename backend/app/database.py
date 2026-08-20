@@ -6,6 +6,7 @@ from typing import Iterator
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS block_faces (
     block_face_id TEXT PRIMARY KEY,
+    origin_block_face_id TEXT NOT NULL,
     segment_id TEXT NOT NULL,
     borough TEXT NOT NULL,
     street_name TEXT NOT NULL,
@@ -18,6 +19,29 @@ CREATE TABLE IF NOT EXISTS block_faces (
     sample_address TEXT,
     sample_latitude REAL,
     sample_longitude REAL
+);
+
+CREATE TABLE IF NOT EXISTS block_face_lion_components (
+    block_face_id TEXT NOT NULL REFERENCES block_faces(block_face_id) ON DELETE CASCADE,
+    component_index INTEGER NOT NULL CHECK (component_index >= 0),
+    segment_id TEXT NOT NULL,
+    source_side TEXT NOT NULL CHECK (source_side IN ('LEFT', 'RIGHT')),
+    source_rows_json TEXT NOT NULL,
+    source_indices_json TEXT NOT NULL,
+    street_names_json TEXT NOT NULL,
+    source_records_json TEXT NOT NULL,
+    dsny_object_ids_json TEXT NOT NULL,
+    PRIMARY KEY (block_face_id, component_index)
+);
+
+CREATE TABLE IF NOT EXISTS block_face_dsny_sources (
+    block_face_id TEXT NOT NULL REFERENCES block_faces(block_face_id) ON DELETE CASCADE,
+    dsny_object_id TEXT NOT NULL,
+    frequency_row INTEGER,
+    schedule_code TEXT,
+    section TEXT,
+    district TEXT,
+    PRIMARY KEY (block_face_id, dsny_object_id)
 );
 
 CREATE TABLE IF NOT EXISTS collection_schedules (
@@ -75,6 +99,8 @@ CREATE INDEX IF NOT EXISTS idx_block_face_min_y ON block_faces(min_y);
 CREATE INDEX IF NOT EXISTS idx_block_face_max_y ON block_faces(max_y);
 CREATE INDEX IF NOT EXISTS idx_block_face_borough
     ON block_faces(borough);
+CREATE INDEX IF NOT EXISTS idx_dsny_source_object
+    ON block_face_dsny_sources(dsny_object_id);
 """
 
 
@@ -89,6 +115,20 @@ def initialize(database_path: str | Path) -> None:
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     with connect(database_path) as connection:
         connection.executescript(SCHEMA)
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(block_faces)")
+        }
+        if "origin_block_face_id" not in columns:
+            connection.execute("ALTER TABLE block_faces ADD COLUMN origin_block_face_id TEXT")
+            connection.execute(
+                "UPDATE block_faces SET origin_block_face_id = block_face_id "
+                "WHERE origin_block_face_id IS NULL"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_block_face_origin "
+            "ON block_faces(origin_block_face_id)"
+        )
 
 
 def iter_rows(connection: sqlite3.Connection, query: str, parameters: tuple[object, ...] = ()) -> Iterator[sqlite3.Row]:

@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY backend ./backend
+COPY scripts ./scripts
+RUN pip install --no-cache-dir ".[refresh]"
+
+ENV DATABASE_PATH=/app/data/app.sqlite3
+ENV TILESET_PATH=/app/data/collection_streets.mbtiles
+ENV DATA_MANIFEST_PATH=/app/data/data_manifest.json
+ENV INGESTION_AUDIT_PATH=/app/data/ingestion_audit.json
+ENV DATA_REFRESH_ENABLED=true
+ENV DATA_REFRESH_INTERVAL_DAYS=14
+ENV DATA_REFRESH_ON_STARTUP=true
+
+CMD ["python", "scripts/run_scheduler.py"]

@@ -9,3 +9,10 @@ DATA_REFRESH_ENABLED = os.getenv("DATA_REFRESH_ENABLED", "true").lower() == "tru
 DATA_REFRESH_INTERVAL_DAYS = int(os.getenv("DATA_REFRESH_INTERVAL_DAYS", "14"))
 DATA_REFRESH_ON_STARTUP = os.getenv("DATA_REFRESH_ON_STARTUP", "false").lower() == "true"
 DATA_MANIFEST_PATH = os.getenv("DATA_MANIFEST_PATH", "data/data_manifest.json")
+DATA_RELEASE_RETENTION = max(2, int(os.getenv("DATA_RELEASE_RETENTION", "2")))
+HEALTH_SYNC_HASH_MAX_BYTES = max(
+    0, int(os.getenv("HEALTH_SYNC_HASH_MAX_BYTES", str(16 * 1024 * 1024)))
+)
+TILESET_PATH = os.getenv("TILESET_PATH", "data/collection_streets.mbtiles")
+TILE_MIN_ZOOM = int(os.getenv("TILE_MIN_ZOOM", "12"))
+TILE_MAX_ZOOM = int(os.getenv("TILE_MAX_ZOOM", "17"))

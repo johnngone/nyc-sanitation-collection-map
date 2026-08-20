@@ -6,8 +6,12 @@ services:
     ports:
       - "${APP_HOST_PORT:-8080}:8000"
     environment:
+      APP_ENV: ${APP_ENV:-production}
       DATABASE_PATH: /app/data/app.sqlite3
+      TILESET_PATH: /app/data/collection_streets.mbtiles
       DATA_MANIFEST_PATH: /app/data/data_manifest.json
+      HEALTH_SYNC_HASH_MAX_BYTES: ${HEALTH_SYNC_HASH_MAX_BYTES:-16777216}
+      INGESTION_AUDIT_PATH: /app/data/ingestion_audit.json
     volumes:
       - ./data:/app/data
     healthcheck:
@@ -15,4 +19,29 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  refresh:
+    build:
+      context: .
+      dockerfile: Dockerfile.refresh
+    environment:
+      DATABASE_PATH: /app/data/app.sqlite3
+      TILESET_PATH: /app/data/collection_streets.mbtiles
+      DATA_MANIFEST_PATH: /app/data/data_manifest.json
+      INGESTION_AUDIT_PATH: /app/data/ingestion_audit.json
+      DATA_REFRESH_ENABLED: ${DATA_REFRESH_ENABLED:-true}
+      DATA_REFRESH_INTERVAL_DAYS: ${DATA_REFRESH_INTERVAL_DAYS:-14}
+      DATA_REFRESH_ON_STARTUP: ${DATA_REFRESH_ON_STARTUP:-true}
+      DATA_RELEASE_RETENTION: ${DATA_RELEASE_RETENTION:-2}
+      MIN_LION_SOURCE_ROWS: ${MIN_LION_SOURCE_ROWS:-200000}
+      MIN_DSNY_SOURCE_ROWS: ${MIN_DSNY_SOURCE_ROWS:-500}
+      MIN_OUTPUT_FEATURES: ${MIN_OUTPUT_FEATURES:-100000}
+      MAX_COUNT_DROP_PERCENT: ${MAX_COUNT_DROP_PERCENT:-10}
+      TILE_MIN_ZOOM: ${TILE_MIN_ZOOM:-12}
+      TILE_MAX_ZOOM: ${TILE_MAX_ZOOM:-17}
+      TILE_MAX_COMPRESSED_BYTES: ${TILE_MAX_COMPRESSED_BYTES:-512000}
+      TILE_MAX_UNCOMPRESSED_BYTES: ${TILE_MAX_UNCOMPRESSED_BYTES:-5242880}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
 

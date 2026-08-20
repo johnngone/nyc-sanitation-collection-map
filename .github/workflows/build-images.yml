@@ -6,6 +6,11 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  # Never interrupt a publish between the paired moving-tag updates.
+  group: sanitation-container-publish
+  cancel-in-progress: false
+
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/nyc-sanitation-collection-map
 
@@ -21,14 +26,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          python-version: '3.11'
 
-      - name: Build combined image for verification
+      - name: Install test and refresh dependencies
+        run: python -m pip install -e ".[test,refresh]"
+
+      - name: Prepare writable runtime data directory
+        run: mkdir -p data
+
+      - name: Run full Python test suite
+        run: python -m pytest
+
+      - name: Build app image for verification
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -36,24 +48,132 @@ jobs:
           load: true
           push: false
           tags: nyc-sanitation-map:ci
-      - name: Smoke-test combined image
-        shell: bash
-        run: |
-          set -euo pipefail
-          cleanup() { docker logs nyc-sanitation-map-publish-test 2>&1 || true; docker rm -f nyc-sanitation-map-publish-test >/dev/null 2>&1 || true; }
-          trap cleanup EXIT
-          docker run -d --name nyc-sanitation-map-publish-test -p 18080:8000 nyc-sanitation-map:ci
-          for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:18080/ >/tmp/frontend.html && curl --fail --silent http://127.0.0.1:18080/api/health >/tmp/health.json; then exit 0; fi
-            sleep 2
-          done
-          exit 1
-      - name: Push verified image
+      - name: Build refresh image for verification
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+          file: ./Dockerfile.refresh
+          load: true
+          push: false
+          tags: nyc-sanitation-map-refresh:ci
+      - name: Smoke-test paired app and refresh images
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_data="$(mktemp -d)"
+          fixture_json="${RUNNER_TEMP}/smoke-fixture.json"
+          health_json="${RUNNER_TEMP}/smoke-health.json"
+          map_json="${RUNNER_TEMP}/smoke-map-config.json"
+          tile_headers="${smoke_data}/tile.headers"
+          tile_body="${smoke_data}/tile.pbf"
+          cleanup() { docker logs nyc-sanitation-map-publish-test 2>&1 || true; docker rm -f nyc-sanitation-map-publish-test >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          docker run --rm --entrypoint python \
+            -v "${smoke_data}:/smoke-data" \
+            nyc-sanitation-map-refresh:ci \
+            scripts/build_smoke_release.py --data-dir /smoke-data >"${fixture_json}"
+
+          docker run -d --name nyc-sanitation-map-publish-test \
+            -e APP_ENV=publish-smoke \
+            -p 18080:8000 \
+            -v "${smoke_data}:/app/data" \
+            nyc-sanitation-map:ci
+
+          ready=0
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/ >"${RUNNER_TEMP}/frontend.html" \
+              && curl --fail --silent --show-error http://127.0.0.1:18080/api/health >"${health_json}"; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "${ready}" -eq 1
+
+          curl --fail --silent --show-error \
+            http://127.0.0.1:18080/api/map-config >"${map_json}"
+          python3 - "${health_json}" "${map_json}" "${fixture_json}" <<'PY'
+          import json
+          import math
+          import sys
+
+          health = json.load(open(sys.argv[1], encoding="utf-8"))
+          config = json.load(open(sys.argv[2], encoding="utf-8"))
+          fixture = json.load(open(sys.argv[3], encoding="utf-8"))
+          assert health["status"] == "ok"
+          assert health["environment"] == "publish-smoke"
+          assert health["map_available"] is True
+          assert health["artifact_integrity"] == "verified"
+          assert health["dataset_version"] == fixture["version"]
+          assert config["available"] is True
+          assert config["version"] == fixture["version"]
+          assert config["tile_schema_revision"] == 2
+          assert config["source_layer"] == "collection_streets"
+          bounds = config["bounds"]
+          assert isinstance(bounds, list) and len(bounds) == 4
+          assert all(isinstance(value, (int, float)) and math.isfinite(value) for value in bounds)
+          assert bounds[0] < bounds[2] and bounds[1] < bounds[3]
+          assert bounds == fixture["bounds"]
+          PY
+
+          tile_url="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tile_url"])' "${fixture_json}")"
+          curl --fail --silent --show-error \
+            --dump-header "${tile_headers}" \
+            --output "${tile_body}" \
+            "http://127.0.0.1:18080${tile_url}"
+          etag="$(python3 - "${tile_headers}" "${tile_body}" <<'PY'
+          import pathlib
+          import sys
+
+          headers = {}
+          for line in pathlib.Path(sys.argv[1]).read_text(encoding="iso-8859-1").splitlines()[1:]:
+              if ":" in line:
+                  name, value = line.split(":", 1)
+                  headers[name.strip().lower()] = value.strip()
+          body = pathlib.Path(sys.argv[2]).read_bytes()
+          assert body.startswith(b"\x1f\x8b")
+          assert headers["content-encoding"].lower() == "gzip"
+          assert headers["content-type"].startswith("application/vnd.mapbox-vector-tile")
+          assert headers["cache-control"] == "public, max-age=31536000, immutable"
+          assert headers["etag"]
+          print(headers["etag"])
+          PY
+          )"
+          docker run --rm --entrypoint python \
+            -v "${smoke_data}:/smoke-data:ro" \
+            nyc-sanitation-map-refresh:ci \
+            -c 'import gzip, pathlib, mapbox_vector_tile as m; payload=gzip.decompress(pathlib.Path("/smoke-data/tile.pbf").read_bytes()); decoded=m.decode(payload); assert decoded["collection_streets"]["features"]'
+          cache_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            -H "If-None-Match: ${etag}" "http://127.0.0.1:18080${tile_url}")"
+          test "${cache_status}" = "304"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push paired commit tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag nyc-sanitation-map:ci "${IMAGE}:${GITHUB_SHA}"
+          docker tag nyc-sanitation-map-refresh:ci "${IMAGE}:refresh-${GITHUB_SHA}"
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:refresh-${GITHUB_SHA}"
+
+      - name: Advance refresh tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag nyc-sanitation-map-refresh:ci "${IMAGE}:refresh"
+          docker push "${IMAGE}:refresh"
+
+      - name: Advance app tag last
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag nyc-sanitation-map:ci "${IMAGE}:latest"
+          docker push "${IMAGE}:latest"
