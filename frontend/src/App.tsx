@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
+import { resolveApiUrl } from "./apiUrl";
+
 const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
 type Weekday = (typeof weekdays)[number];
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
@@ -41,7 +43,7 @@ export function App() {
   const selectedDayRef = useRef<Weekday>(dayFromCode(new URLSearchParams(window.location.search).get("day")));
   const selectedTypesRef = useRef<CollectionType[]>(["REFUSE"]);
   const updateTileStatusRef = useRef<(() => void) | null>(null);
-  const tileErrorRef = useRef(false);
+  const tileErrorRef = useRef<string | null>(null);
   const [selectedDay, setSelectedDay] = useState<Weekday>(selectedDayRef.current);
   const [backendStatus, setBackendStatus] = useState("Checking backend…");
   const [mapStatus, setMapStatus] = useState("Loading map tiles…");
@@ -217,7 +219,7 @@ export function App() {
             if (!selectedTypesRef.current.length) {
               setMapStatus("No collection types selected");
             } else if (tileErrorRef.current) {
-              setMapStatus("Some map tiles failed to load; displayed data may be incomplete");
+              setMapStatus(`Map tile failed: ${tileErrorRef.current}`);
             } else {
               setMapStatus(`Map tiles loaded for ${selectedDayRef.current}`);
             }
@@ -249,7 +251,7 @@ export function App() {
           map.on("mouseleave", collectionLayerIds, () => { map.getCanvas().style.cursor = ""; });
 
           map.on("movestart", () => {
-            tileErrorRef.current = false;
+            tileErrorRef.current = null;
             if (selectedTypesRef.current.length) setMapStatus(`Loading ${selectedDayRef.current} map tiles…`);
           });
           map.on("sourcedataloading", (event) => {
@@ -261,9 +263,9 @@ export function App() {
           map.on("error", (event) => {
             const tileEvent = event as typeof event & { sourceId?: string };
             if (tileEvent.sourceId !== sourceId) return;
-            tileErrorRef.current = true;
+            tileErrorRef.current = mapErrorMessage(event.error);
             console.error("Collection map tile failed to load", event.error);
-            setMapStatus("A map tile failed to load; retry by moving or zooming the map");
+            setMapStatus(`Map tile failed: ${tileErrorRef.current}`);
           });
 
           setMapStatus(`Loading ${selectedDayRef.current} map tiles…`);
@@ -294,7 +296,7 @@ export function App() {
   useEffect(() => {
     selectedDayRef.current = selectedDay;
     selectedTypesRef.current = selectedTypes;
-    tileErrorRef.current = false;
+    tileErrorRef.current = null;
 
     const map = mapRef.current;
     if (!map || !hasCollectionLayers(map)) return;
@@ -378,10 +380,12 @@ function collectionForLayerId(id: string): CollectionDefinition | undefined {
 }
 
 function apiUrl(path: string): string {
-  if (/^(?:https?:)?\/\//i.test(path)) return path;
-  const base = apiBaseUrl.replace(/\/+$/, "");
-  const suffix = `/${path.replace(/^\/+/, "")}`;
-  return `${base}${suffix}`;
+  return resolveApiUrl(path, apiBaseUrl, window.location.origin);
+}
+
+function mapErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error ?? "Unknown map error");
+  return message.length > 180 ? `${message.slice(0, 177)}...` : message;
 }
 
 function isAbortError(error: unknown): boolean {
