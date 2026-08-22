@@ -7,6 +7,7 @@ const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Satur
 type Weekday = (typeof weekdays)[number];
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
 const sourceId = "collection-streets";
+const mobileControlsMediaQuery = "(max-width: 700px), (max-height: 520px) and (pointer: coarse)";
 const collectionTypes = [
   ["REFUSE", "Refuse", "#111111", "refuse_days", 0],
   ["RECYCLING", "Recycling", "#1479d1", "recycling_days", 6],
@@ -15,6 +16,7 @@ const collectionTypes = [
 ] as const;
 type CollectionType = (typeof collectionTypes)[number][0];
 type CollectionDefinition = (typeof collectionTypes)[number];
+type BackendConnection = "checking" | "connected" | "verifying" | "unavailable";
 const collectionLayerIds = collectionTypes.flatMap(([type]) => [lowZoomLayerId(type), highZoomLayerId(type)]);
 const unknownLayerIds = ["collection-unknown-geometry", "collection-unknown-identity"];
 
@@ -41,21 +43,74 @@ function dayFromCode(code: string | null): Weekday {
   return weekdays.find((day) => dayCode(day) === code) ?? "Monday";
 }
 
+function dayShortLabel(day: Weekday): string {
+  return day.slice(0, 2);
+}
+
+function backendConnectionLabel(connection: BackendConnection): string {
+  if (connection === "connected") return "Connected";
+  if (connection === "verifying") return "Verifying data · retrying";
+  if (connection === "unavailable") return "Unavailable · retrying";
+  return "Checking connection";
+}
+
+function formatDataUpdated(value: string | null): string {
+  if (!value) return "Not available";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Not available";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(date);
+}
+
 export function App() {
   const mapNode = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
+  const sheetContentRef = useRef<HTMLDivElement>(null);
+  const infoButtonRef = useRef<HTMLButtonElement>(null);
+  const modalCloseRef = useRef<HTMLButtonElement>(null);
+  const sheetGestureStartYRef = useRef<number | null>(null);
+  const sheetGestureHandledRef = useRef(false);
   const selectedDayRef = useRef<Weekday>(dayFromCode(new URLSearchParams(window.location.search).get("day")));
   const selectedTypesRef = useRef<CollectionType[]>(["REFUSE"]);
   const showUnknownsRef = useRef(true);
   const updateTileStatusRef = useRef<(() => void) | null>(null);
   const tileErrorRef = useRef<string | null>(null);
   const [selectedDay, setSelectedDay] = useState<Weekday>(selectedDayRef.current);
-  const [backendStatus, setBackendStatus] = useState("Checking backend…");
+  const [backendConnection, setBackendConnection] = useState<BackendConnection>("checking");
+  const [mappedFeatureCount, setMappedFeatureCount] = useState<number | null>(null);
   const [mapStatus, setMapStatus] = useState("Loading map tiles…");
   const [selectedTypes, setSelectedTypes] = useState<CollectionType[]>(selectedTypesRef.current);
   const [dataUpdated, setDataUpdated] = useState<string | null>(null);
   const [showInfo, setShowInfo] = useState(false);
   const [showUnknowns, setShowUnknowns] = useState(true);
+  const [mobileSheetOpen, setMobileSheetOpen] = useState(true);
+  const [brandExpanded, setBrandExpanded] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState(
+    () => window.matchMedia(mobileControlsMediaQuery).matches,
+  );
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(mobileControlsMediaQuery);
+    const updateViewport = (event: MediaQueryListEvent) => setIsMobileViewport(event.matches);
+    mediaQuery.addEventListener("change", updateViewport);
+    return () => mediaQuery.removeEventListener("change", updateViewport);
+  }, []);
+
+  useEffect(() => {
+    const content = sheetContentRef.current;
+    if (!content) return;
+    if (isMobileViewport && !mobileSheetOpen) content.setAttribute("inert", "");
+    else content.removeAttribute("inert");
+  }, [isMobileViewport, mobileSheetOpen]);
+
+  useEffect(() => {
+    if (!showInfo) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeInfo();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    modalCloseRef.current?.focus();
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [showInfo]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -78,14 +133,15 @@ export function App() {
             throw new Error("Backend returned an invalid health payload");
           }
           retryDelayMs = 500;
-          setBackendStatus(`Backend connected · ${payload.processed_records} mapped street features`);
+          setBackendConnection("connected");
+          setMappedFeatureCount(payload.processed_records);
           setDataUpdated(payload.data_updated ?? null);
         })
         .catch((error: unknown) => {
           if (isAbortError(error) || controller.signal.aborted) return;
           console.error("Backend health check failed", error);
           const status = error instanceof Error && "status" in error ? error.status : undefined;
-          setBackendStatus(status === 503 ? "Backend verifying data; retrying…" : "Backend unavailable; retrying…");
+          setBackendConnection(status === 503 ? "verifying" : "unavailable");
           window.clearTimeout(retryTimer);
           retryTimer = window.setTimeout(checkHealth, retryDelayMs);
           retryDelayMs = Math.min(retryDelayMs * 2, 15_000);
@@ -109,6 +165,7 @@ export function App() {
       container: mapNode.current,
       center: [-73.95, 40.72],
       zoom: 13,
+      attributionControl: false,
       style: {
         version: 8,
         sources: {
@@ -129,6 +186,7 @@ export function App() {
     });
     mapRef.current = map;
     map.addControl(new maplibregl.NavigationControl(), "bottom-right");
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right");
 
     map.once("style.load", () => {
       const loadMapTiles = () => {
@@ -390,23 +448,110 @@ export function App() {
     window.history.replaceState({}, "", url);
   }
 
+  function beginSheetGesture(event: React.PointerEvent<HTMLButtonElement>) {
+    sheetGestureStartYRef.current = event.clientY;
+    sheetGestureHandledRef.current = false;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function finishSheetGesture(event: React.PointerEvent<HTMLButtonElement>) {
+    const startY = sheetGestureStartYRef.current;
+    sheetGestureStartYRef.current = null;
+    if (startY === null) return;
+    const distance = event.clientY - startY;
+    if (Math.abs(distance) < 32) return;
+    sheetGestureHandledRef.current = true;
+    setMobileSheetOpen(distance < 0);
+  }
+
+  function cancelSheetGesture() {
+    sheetGestureStartYRef.current = null;
+    sheetGestureHandledRef.current = false;
+  }
+
+  function toggleMobileSheet() {
+    if (sheetGestureHandledRef.current) {
+      sheetGestureHandledRef.current = false;
+      return;
+    }
+    setMobileSheetOpen((current) => !current);
+  }
+
+  function closeInfo() {
+    setShowInfo(false);
+    window.requestAnimationFrame(() => infoButtonRef.current?.focus());
+  }
+
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${mobileSheetOpen ? "mobile-sheet-open" : "mobile-sheet-collapsed"}`}>
+      <h1 className="visually-hidden">NYC Sanitation – Collection Map</h1>
       <section className="map-panel" aria-label="NYC sanitation collection map">
         <div ref={mapNode} className="map" />
-        <aside className="map-overlay">
-          <div className="title-row"><strong>NYC Sanitation - Visual Collection Schedule</strong><button className="info-button" type="button" aria-label="About this data" onClick={() => setShowInfo(true)}>i</button></div>
-          <small>Data updated: {dataUpdated ? new Date(dataUpdated).toLocaleDateString() : "Not available"}</small>
-          <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-pressed={selectedDay === day}>{dayCode(day)[0]}</button>)}</div>
-          <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
-          <label><input type="checkbox" checked={showUnknowns} onChange={() => setShowUnknowns((current) => !current)} /> Show known data gaps at high zoom</label>
-          <span><i className="swatch unavailable" /> Gray/amber dashed streets mean the source schedule or evidence is unavailable</span>
-          <small>{mapStatus}</small>
-          <small>{selectedTypes.length ? "Vector tiles load on demand for the current view" : "Select a collection type to show data"}</small>
-          <small>{backendStatus}</small>
+        <div
+          className={`brand-lockup ${brandExpanded ? "is-expanded" : ""}`}
+          onPointerEnter={(event) => {
+            if (event.pointerType === "mouse") setBrandExpanded(true);
+          }}
+          onPointerLeave={(event) => {
+            if (event.pointerType === "mouse") setBrandExpanded(false);
+          }}
+        >
+          <button
+            className="brand-button"
+            type="button"
+            aria-label={brandExpanded ? "Hide map title" : "Show map title"}
+            aria-expanded={brandExpanded}
+            onClick={() => setBrandExpanded((current) => !current)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setBrandExpanded(false);
+            }}
+          >
+            <span className="brand-copy">
+              <strong>NYC Sanitation – Collection Map</strong>
+              <small>See curbside collection schedules by street, weekday, and service type.</small>
+            </span>
+            <img className="brand-logo" src="/logo.png" alt="" draggable="false" />
+          </button>
+        </div>
+        <aside className={`map-overlay ${mobileSheetOpen ? "is-open" : "is-collapsed"}`} aria-label="Map controls">
+          <button
+            className="sheet-toggle"
+            type="button"
+            aria-label={mobileSheetOpen ? "Collapse map controls" : "Expand map controls"}
+            aria-expanded={mobileSheetOpen}
+            aria-controls="map-control-content"
+            onClick={toggleMobileSheet}
+            onPointerDown={beginSheetGesture}
+            onPointerUp={finishSheetGesture}
+            onPointerCancel={cancelSheetGesture}
+          >
+            <span className="sheet-grabber" aria-hidden="true" />
+            <span className="sheet-toggle-label">{mobileSheetOpen ? "Hide controls" : "Show controls"}</span>
+            <svg className="sheet-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m5.5 7.5 4.5 4 4.5-4" /></svg>
+          </button>
+          <div
+            ref={sheetContentRef}
+            id="map-control-content"
+            className="sheet-content"
+            aria-hidden={isMobileViewport && !mobileSheetOpen}
+          >
+            <div className="controls-heading">
+              <strong>Collection schedule</strong>
+              <button ref={infoButtonRef} className="info-button" type="button" aria-label="About this data" onClick={() => setShowInfo(true)}>i</button>
+            </div>
+            <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-label={day} aria-pressed={selectedDay === day}>{dayShortLabel(day)}</button>)}</div>
+            <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
+            <label className="unknown-toggle"><input type="checkbox" checked={showUnknowns} onChange={() => setShowUnknowns((current) => !current)} /> Show source gaps at high zoom</label>
+            <dl className="status-summary" aria-live="polite">
+              <div><dt>Backend</dt><dd><i className={`status-dot ${backendConnection}`} aria-hidden="true" />{backendConnectionLabel(backendConnection)}</dd></div>
+              <div><dt>Mapped</dt><dd>{mappedFeatureCount === null ? "Waiting for data" : `${mappedFeatureCount.toLocaleString()} street features`}</dd></div>
+              <div><dt>Status</dt><dd>{mapStatus}</dd></div>
+            </dl>
+            <small className="data-updated"><span>Data updated</span><time dateTime={dataUpdated ?? undefined}>{formatDataUpdated(dataUpdated)}</time></small>
+          </div>
         </aside>
       </section>
-      {showInfo && <div className="modal-backdrop" role="presentation" onClick={() => setShowInfo(false)}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="Close information" onClick={() => setShowInfo(false)}>×</button><h2 id="data-info-title">About this map</h2><p>Official NYC Department of Sanitation frequency data supplies collection schedules. NYC Department of City Planning LION data supplies street centerlines and separate left/right block-face identifiers.</p><p>Explicit source values always win. When Organics is blank but Recycling is explicit, Organics follows Recycling under <a href="https://www.nyc.gov/site/dsny/collection/residents/curbside-composting.page" target="_blank" rel="noreferrer">DSNY's citywide compost policy</a>. Other blanks remain visibly unknown.</p><p>Bulk means non-recyclable large items; recyclable large items follow the Recycling schedule under <a href="https://www.nyc.gov/site/dsny/collection/get-rid-of/large-items.page" target="_blank" rel="noreferrer">DSNY large-item guidance</a>.</p><p>Missing, unmatched, or unvalidated source records are shown as high-zoom dashed lines and are never treated as proof of no service.</p></section></div>}
+      {showInfo && <div className="modal-backdrop" role="presentation" onClick={closeInfo}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button ref={modalCloseRef} className="modal-close" type="button" aria-label="Close information" onClick={closeInfo}>×</button><h2 id="data-info-title">About this map</h2><p>Official NYC Department of Sanitation frequency data supplies collection schedules. NYC Department of City Planning LION data supplies street centerlines and separate left/right block-face identifiers.</p><p>Explicit source values always win. When Organics is blank but Recycling is explicit, Organics follows Recycling under <a href="https://www.nyc.gov/site/dsny/collection/residents/curbside-composting.page" target="_blank" rel="noreferrer">DSNY's citywide compost policy</a>. Other blanks remain visibly unknown.</p><p>Bulk means non-recyclable large items; recyclable large items follow the Recycling schedule under <a href="https://www.nyc.gov/site/dsny/collection/get-rid-of/large-items.page" target="_blank" rel="noreferrer">DSNY large-item guidance</a>.</p><p>Missing, unmatched, or unvalidated source records are shown as high-zoom dashed lines and are never treated as proof of no service.</p></section></div>}
     </main>
   );
 }
