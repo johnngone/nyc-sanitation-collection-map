@@ -76,6 +76,18 @@ def _source_database(path, *, include_schedule: bool = True) -> None:
                    VALUES ('bf-1', ?, ?, 'DSNY', '2026-08-19', 'VALIDATED')""",
                 [("REFUSE", "THU"), ("REFUSE", "MON"), ("RECYCLING", "TUE")],
             )
+            connection.executemany(
+                """INSERT INTO block_face_collection_states
+                   (block_face_id, collection_type, effective_days_json, state,
+                    source_field, raw_value, rule_id, source_policy_conflict, provenance)
+                   VALUES ('bf-1', ?, ?, ?, ?, ?, NULL, 0, 'DSNY test fixture')""",
+                [
+                    ("REFUSE", '["MON","THU"]', "SOURCE_EXPLICIT", "FREQ_REFUSE", "MON,THU"),
+                    ("RECYCLING", '["TUE"]', "SOURCE_EXPLICIT", "FREQ_RECYCLING", "TUE"),
+                    ("ORGANICS", '[]', "UNKNOWN_SOURCE_BLANK", "FREQ_ORGANICS", None),
+                    ("BULK", '[]', "UNKNOWN_SOURCE_BLANK", "FREQ_BULK", None),
+                ],
+            )
 
 
 def test_map_config_and_tile_response(tmp_path, monkeypatch) -> None:
@@ -92,6 +104,9 @@ def test_map_config_and_tile_response(tmp_path, monkeypatch) -> None:
         "tile_schema_revision": 2,
         "tiles_url": "/api/tiles/dataset-v1/{z}/{x}/{y}.pbf",
         "source_layer": "collection_streets",
+        "known_source_layer": "collection_streets",
+        "unknown_source_layer": None,
+        "unknown_minzoom": None,
         "minzoom": 1,
         "maxzoom": 2,
         "bounds": [-74.3, 40.4, -73.6, 40.95],
@@ -209,7 +224,7 @@ def test_builder_writes_one_feature_per_geometry_with_size_and_source_binding(tm
     )
 
     assert report.version == "source-v7"
-    assert report.tile_schema_revision == 2
+    assert report.tile_schema_revision == 3
     assert report.feature_count == 1
     assert report.geometry_count == 1
     assert report.maxzoom_feature_count == 1
@@ -225,7 +240,7 @@ def test_builder_writes_one_feature_per_geometry_with_size_and_source_binding(tm
         tile_rows = connection.execute("SELECT tile_data FROM tiles").fetchall()
     assert metadata["format"] == "pbf"
     assert metadata["version"] == "source-v7"
-    assert metadata["tile_schema_revision"] == "2"
+    assert metadata["tile_schema_revision"] == "3"
     assert metadata["source_database_sha256"] == report.source_database_sha256
     assert metadata["source_database_version"] == "database-v3"
     assert metadata["source_block_face_count"] == "1"
@@ -413,3 +428,34 @@ def test_builder_rejects_raising_hard_tile_size_ceilings(tmp_path) -> None:
             maxzoom=11,
             max_compressed_tile_bytes=512_001,
         )
+
+
+def test_v3_unknown_layer_has_no_schedule_properties_and_survives_maxzoom(tmp_path) -> None:
+    database = tmp_path / "app.sqlite3"
+    archive = tmp_path / "collection.mbtiles"
+    _source_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """INSERT INTO unknown_block_faces
+               (unknown_id, technical_identity, segment_id, borough, street_name, side,
+                reason_code, reason, identity_method, geometry_method, geometry_wkt,
+                min_x, min_y, max_x, max_y, evidence_json)
+               VALUES ('unknown-1', 'LION:1:LEFT', '1', 'BROOKLYN', 'UNKNOWN STREET', 'LEFT',
+                       'OUTSIDE_DSNY_COVERAGE', 'No exact polygon coverage', 'UNRESOLVED',
+                       'DIRECT_SIDE_TRACE_UNRESOLVED',
+                       'LINESTRING (-74.0 40.6, -73.99 40.61)',
+                       -74.0, 40.6, -73.99, 40.61, '{}')"""
+        )
+
+    report = build_tiles(database, archive, minzoom=16, maxzoom=16)
+
+    assert report.unknown_feature_count == report.maxzoom_unknown_feature_count == 1
+    decoded_unknowns = []
+    with sqlite3.connect(archive) as connection:
+        for (tile_data,) in connection.execute("SELECT tile_data FROM tiles"):
+            decoded = mapbox_vector_tile.decode(gzip.decompress(tile_data))
+            decoded_unknowns.extend(decoded.get("collection_unknowns", {}).get("features", []))
+    assert decoded_unknowns
+    properties = decoded_unknowns[0]["properties"]
+    assert properties["reason_code"] == "OUTSIDE_DSNY_COVERAGE"
+    assert not any(key.endswith("_days") or key.endswith("_status") for key in properties)

@@ -46,10 +46,11 @@ SOURCE_ROW_OUTCOMES = {
 }
 FATAL_SIDE_OUTCOMES = {"ambiguous", "invalid", "conflicts"}
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-EXPECTED_TILE_SCHEMA_REVISION = 2
+EXPECTED_TILE_SCHEMA_REVISION = 3
 MAX_RELEASE_COMPRESSED_TILE_BYTES = 512_000
 MAX_RELEASE_UNCOMPRESSED_TILE_BYTES = 5_242_880
 TILE_SOURCE_LAYER = "collection_streets"
+TILE_UNKNOWN_SOURCE_LAYER = "collection_unknowns"
 TILE_REQUIRED_PROPERTIES = {
     "id",
     "origin_block_face_id",
@@ -63,6 +64,16 @@ TILE_REQUIRED_PROPERTIES = {
     "bulk_days",
     "source",
     "retrieved_at",
+    "refuse_status",
+    "recycling_status",
+    "organics_status",
+    "bulk_status",
+    "identity_method",
+    "geometry_method",
+}
+UNKNOWN_TILE_REQUIRED_PROPERTIES = {
+    "id", "technical_identity", "segment_id", "borough", "street_name", "side",
+    "reason_code", "reason", "identity_method", "geometry_method",
 }
 VALID_DAYS = {"MON", "TUE", "WED", "THU", "FRI", "SAT"}
 DAY_ORDER = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
@@ -82,6 +93,12 @@ RELEASE_FILENAMES = {
     "ingestion_failures": "ingestion_failures.jsonl",
     "source_dsny": "dsny_frequencies.geojson",
     "source_lion": "lion.zip",
+    "source_pad": "pad.zip",
+    "unknown_geojson": "unknown_block_faces.geojson",
+    "addresspoint_query_report": "addresspoint_query_report.json",
+    "cscl_alignment_report": "cscl_alignment_report.json",
+    "recovery_shadow_report": "recovery_shadow_report.json",
+    "recovery_diff": "recovery_diff.json",
 }
 
 
@@ -213,6 +230,19 @@ def validate_database(
         dsny_provenance_faces = connection.execute(
             "SELECT COUNT(DISTINCT block_face_id) FROM block_face_dsny_sources"
         ).fetchone()[0]
+        state_count = connection.execute(
+            "SELECT COUNT(*) FROM block_face_collection_states"
+        ).fetchone()[0]
+        state_face_count = connection.execute(
+            "SELECT COUNT(DISTINCT block_face_id) FROM block_face_collection_states"
+        ).fetchone()[0]
+        unknown_feature_count = connection.execute(
+            "SELECT COUNT(*) FROM unknown_block_faces"
+        ).fetchone()[0]
+        invalid_unknown_schedule_overlap = connection.execute(
+            """SELECT COUNT(*) FROM unknown_block_faces u
+               JOIN collection_schedules s ON s.block_face_id = u.unknown_id"""
+        ).fetchone()[0]
 
     if faces_without_schedules:
         raise RuntimeError(f"staged database has block faces without schedules: {faces_without_schedules}")
@@ -223,6 +253,13 @@ def validate_database(
             "staged database provenance coverage is incomplete "
             f"block_faces={block_faces} lion={lion_provenance_faces} dsny={dsny_provenance_faces}"
         )
+    if state_count != block_faces * 4 or state_face_count != block_faces:
+        raise RuntimeError(
+            "staged database collection-state reconciliation failed "
+            f"expected={block_faces * 4} actual={state_count} faces={state_face_count}"
+        )
+    if invalid_unknown_schedule_overlap:
+        raise RuntimeError("unknown features may not have collection schedules")
     if rtree_rows != block_faces or rtree_map_rows != block_faces or missing_rtree_rows:
         raise RuntimeError(
             "staged database spatial index is incomplete "
@@ -257,6 +294,8 @@ def validate_database(
         "rtree_rows": rtree_rows,
         "lion_provenance_faces": lion_provenance_faces,
         "dsny_provenance_faces": dsny_provenance_faces,
+        "collection_state_count": state_count,
+        "unknown_feature_count": unknown_feature_count,
         "metadata": metadata,
     }
 
@@ -283,6 +322,8 @@ def validate_tileset(
             "minzoom",
             "maxzoom",
             "source_layer",
+            "unknown_source_layer",
+            "unknown_minzoom",
             "tile_schema_revision",
             "source_database_sha256",
             "source_database_version",
@@ -292,6 +333,8 @@ def validate_tileset(
             "feature_count",
             "geometry_count",
             "maxzoom_feature_count",
+            "unknown_feature_count",
+            "maxzoom_unknown_feature_count",
             "tile_size_metrics",
             "tile_size_limits",
             "compression",
@@ -343,6 +386,8 @@ def validate_tileset(
         "feature_count",
         "geometry_count",
         "maxzoom_feature_count",
+        "unknown_feature_count",
+        "maxzoom_unknown_feature_count",
     )
     binding: dict[str, object] = {}
     for key in binding_keys:
@@ -366,11 +411,17 @@ def validate_tileset(
     }
     if binding["maxzoom_feature_count"] != binding["feature_count"]:
         raise RuntimeError("staged tileset maxzoom coverage count does not match feature_count")
+    if binding["maxzoom_unknown_feature_count"] != binding["unknown_feature_count"]:
+        raise RuntimeError("staged tileset maxzoom unknown coverage does not match unknown_feature_count")
     if payload_validation["maxzoom_unique_id_count"] != binding["maxzoom_feature_count"]:
         raise RuntimeError(
             "staged tileset decoded maxzoom ID coverage does not match metadata "
             f"expected={binding['maxzoom_feature_count']} "
             f"actual={payload_validation['maxzoom_unique_id_count']}"
+        )
+    if payload_validation["maxzoom_unknown_unique_id_count"] != binding["maxzoom_unknown_feature_count"]:
+        raise RuntimeError(
+            "staged tileset decoded unknown maxzoom ID coverage does not match metadata"
         )
     if expected_database is not None:
         if expected_database_path is None:
@@ -384,6 +435,8 @@ def validate_tileset(
             "source_schedule_group_count": expected_database["schedule_group_count"],
             "feature_count": expected_database["block_faces"],
             "geometry_count": expected_database["block_faces"],
+            "unknown_feature_count": expected_database["unknown_feature_count"],
+            "maxzoom_unknown_feature_count": expected_database["unknown_feature_count"],
         }
         _require_equal_fields(binding, expected_bindings, "MBTiles/database binding")
         expected_properties = _expected_tile_properties(Path(expected_database_path))
@@ -430,6 +483,8 @@ def _validate_tile_payloads(
 ) -> dict[str, object]:
     if metadata.get("source_layer") != TILE_SOURCE_LAYER:
         raise RuntimeError(f"staged tileset source layer must be {TILE_SOURCE_LAYER}")
+    if metadata.get("unknown_source_layer") != TILE_UNKNOWN_SOURCE_LAYER:
+        raise RuntimeError(f"staged tileset unknown source layer must be {TILE_UNKNOWN_SOURCE_LAYER}")
     if metadata.get("compression") != "gzip":
         raise RuntimeError("staged tileset must declare gzip compression")
     limits = _metadata_json_object(metadata, "tile_size_limits")
@@ -454,6 +509,7 @@ def _validate_tile_payloads(
     sizes_by_zoom: dict[int, list[tuple[int, int]]] = {}
     ids_by_zoom: dict[int, set[str]] = {}
     maxzoom_ids: set[str] = set()
+    maxzoom_unknown_ids: set[str] = set()
     properties_by_id: dict[str, dict[str, object]] = {}
     decoded_feature_count = 0
     rows = connection.execute(
@@ -476,14 +532,18 @@ def _validate_tile_payloads(
             raise RuntimeError(
                 f"staged tileset contains an invalid PBF z={zoom} x={column} row={row}"
             ) from error
-        if not isinstance(decoded, dict) or set(decoded) != {TILE_SOURCE_LAYER}:
+        if (
+            not isinstance(decoded, dict)
+            or not decoded
+            or not set(decoded).issubset({TILE_SOURCE_LAYER, TILE_UNKNOWN_SOURCE_LAYER})
+        ):
             raise RuntimeError(
                 f"staged tile has unexpected vector layers z={zoom} x={column} row={row}"
             )
-        layer = decoded[TILE_SOURCE_LAYER]
+        layer = decoded.get(TILE_SOURCE_LAYER, {"features": []})
         features = layer.get("features") if isinstance(layer, dict) else None
-        if not isinstance(features, list) or not features:
-            raise RuntimeError(f"staged tile has no collection features z={zoom} x={column} row={row}")
+        if not isinstance(features, list):
+            raise RuntimeError(f"staged tile has invalid collection layer z={zoom} x={column} row={row}")
         tile_ids: set[str] = set()
         for feature in features:
             if not isinstance(feature, dict):
@@ -516,7 +576,24 @@ def _validate_tile_payloads(
                 raise RuntimeError(f"staged tile feature {feature_id!r} has invalid line geometry")
             if zoom == maxzoom:
                 maxzoom_ids.add(feature_id)
-        decoded_feature_count += len(features)
+        unknown_layer = decoded.get(TILE_UNKNOWN_SOURCE_LAYER, {"features": []})
+        unknown_features = unknown_layer.get("features") if isinstance(unknown_layer, dict) else None
+        if not isinstance(unknown_features, list):
+            raise RuntimeError("staged tile has invalid unknown layer")
+        unknown_tile_ids: set[str] = set()
+        for feature in unknown_features:
+            properties = feature.get("properties") if isinstance(feature, dict) else None
+            if not isinstance(properties, dict) or not UNKNOWN_TILE_REQUIRED_PROPERTIES.issubset(properties):
+                raise RuntimeError("staged unknown tile feature is missing required properties")
+            if any(key.endswith("_days") or key.endswith("_status") for key in properties):
+                raise RuntimeError("staged unknown tile feature contains schedule properties")
+            feature_id = str(properties["id"])
+            if feature_id in unknown_tile_ids:
+                raise RuntimeError(f"staged tile contains duplicate unknown ID {feature_id!r}")
+            unknown_tile_ids.add(feature_id)
+            if zoom == maxzoom:
+                maxzoom_unknown_ids.add(feature_id)
+        decoded_feature_count += len(features) + len(unknown_features)
         sizes_by_zoom.setdefault(int(zoom), []).append((compressed_size, uncompressed_size))
 
     expected_zooms = set(range(minzoom, maxzoom + 1))
@@ -532,6 +609,7 @@ def _validate_tile_payloads(
     return {
         "decoded_tile_feature_count": decoded_feature_count,
         "maxzoom_unique_id_count": len(maxzoom_ids),
+        "maxzoom_unknown_unique_id_count": len(maxzoom_unknown_ids),
         "properties_by_id": properties_by_id,
         "feature_coverage_by_zoom": {
             str(zoom): len(ids_by_zoom.get(zoom, set()))
@@ -560,6 +638,10 @@ def _validate_tile_properties(properties: dict[str, object]) -> None:
         days = value.split(",") if value else []
         if len(days) != len(set(days)) or not set(days).issubset(VALID_DAYS):
             raise RuntimeError(f"staged tile property {key!r} has invalid weekdays")
+    for collection_type in COLLECTION_DAY_FIELDS:
+        status = properties[f"{collection_type.lower()}_status"]
+        if status not in {"SOURCE_EXPLICIT", "POLICY_DERIVED", "UNKNOWN_SOURCE_BLANK"}:
+            raise RuntimeError("staged tile feature has an invalid schedule status")
 
 
 def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
@@ -608,6 +690,19 @@ def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
             day_sets[feature_id][collection_type].add(weekday)
             sources[feature_id].add(str(row["source"]).strip())
             retrieval_times[feature_id].add(str(row["retrieved_at"]).strip())
+        for row in connection.execute(
+            """SELECT block_face_id, collection_type, state, rule_id,
+                      source_policy_conflict, provenance
+               FROM block_face_collection_states
+               ORDER BY block_face_id, collection_type"""
+        ):
+            feature_id = str(row["block_face_id"])
+            collection_type = str(row["collection_type"])
+            prefix = collection_type.lower()
+            expected[feature_id][f"{prefix}_status"] = str(row["state"])
+            expected[feature_id][f"{prefix}_rule"] = "" if row["rule_id"] is None else str(row["rule_id"])
+            expected[feature_id][f"{prefix}_conflict"] = "1" if int(row["source_policy_conflict"]) else "0"
+            expected[feature_id][f"{prefix}_provenance"] = str(row["provenance"])
 
     for feature_id, properties in expected.items():
         if len(sources[feature_id]) != 1 or len(retrieval_times[feature_id]) != 1:
@@ -620,6 +715,8 @@ def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
             )
         properties["source"] = next(iter(sources[feature_id]))
         properties["retrieved_at"] = next(iter(retrieval_times[feature_id]))
+        properties["identity_method"] = "LION_BLOCK_FACE_ID"
+        properties["geometry_method"] = "DIRECT_SIDE_TRACE"
     return expected
 
 
@@ -868,6 +965,8 @@ def validate_processed_geojson(
             "processed GeoJSON contains repeated block-face IDs that would be collapsed by the loader"
         )
     semantic_sha256 = _aggregate_feature_hashes(feature_hashes)
+    unknown_feature_hashes = _processed_unknown_feature_hashes(payload)
+    unknown_semantic_sha256 = _aggregate_feature_hashes(unknown_feature_hashes)
     if expected_semantic_sha256 is not None and semantic_sha256 != expected_semantic_sha256:
         raise RuntimeError("processed GeoJSON semantic checksum does not match its binding")
     return {
@@ -875,6 +974,9 @@ def validate_processed_geojson(
         "semantic_sha256": semantic_sha256,
         "feature_hashes": feature_hashes,
         "feature_count": feature_count,
+        "unknown_feature_hashes": unknown_feature_hashes,
+        "unknown_feature_count": len(unknown_feature_hashes),
+        "unknown_semantic_sha256": unknown_semantic_sha256,
         "bytes": processed.stat().st_size,
     }
 
@@ -910,9 +1012,18 @@ def validate_processed_database_semantics(
     semantic_sha256 = _aggregate_feature_hashes(actual_hashes)
     if semantic_sha256 != processed.get("semantic_sha256"):
         raise RuntimeError("processed/database aggregate semantic checksum mismatch")
+    expected_unknown_hashes = processed.get("unknown_feature_hashes", {})
+    actual_unknown_hashes = _database_unknown_feature_hashes(Path(database_path))
+    if not _same_value(expected_unknown_hashes, actual_unknown_hashes):
+        raise RuntimeError("processed/database unknown-feature semantic reconciliation failed")
+    unknown_semantic_sha256 = _aggregate_feature_hashes(actual_unknown_hashes)
+    if unknown_semantic_sha256 != processed.get("unknown_semantic_sha256"):
+        raise RuntimeError("processed/database unknown aggregate semantic checksum mismatch")
     return {
         "semantic_sha256": semantic_sha256,
         "semantic_feature_count": len(actual_hashes),
+        "unknown_semantic_sha256": unknown_semantic_sha256,
+        "unknown_semantic_feature_count": len(actual_unknown_hashes),
     }
 
 
@@ -941,6 +1052,7 @@ def _processed_feature_hashes(payload: dict[str, object]) -> dict[str, str]:
                 collection_type: list(feature.schedules[collection_type])
                 for collection_type in sorted(VALID_COLLECTION_TYPES)
             },
+            "schedule_states": feature.schedule_states,
             "source": feature.source,
             "retrieved_at": feature.retrieved_at,
             "dsny_sources": list(feature.dsny_sources),
@@ -950,6 +1062,62 @@ def _processed_feature_hashes(payload: dict[str, object]) -> dict[str, str]:
         feature_id: _canonical_record_sha256(record)
         for feature_id, record in records.items()
     }
+
+
+def _processed_unknown_feature_hashes(payload: dict[str, object]) -> dict[str, str]:
+    from scripts.load_processed import prepare_unknown_features
+
+    try:
+        features = prepare_unknown_features(payload)
+    except ValueError as error:
+        raise RuntimeError(f"processed unknown semantic validation failed: {error}") from error
+    return {
+        feature.unknown_id: _canonical_record_sha256({
+            "unknown_id": feature.unknown_id,
+            "technical_identity": feature.technical_identity,
+            "segment_id": feature.segment_id,
+            "borough": feature.borough,
+            "street_name": feature.street_name,
+            "side": feature.side,
+            "reason_code": feature.reason_code,
+            "reason": feature.reason,
+            "identity_method": feature.identity_method,
+            "geometry_method": feature.geometry_method,
+            "geometry": _canonical_geometry(feature.geometry, feature.unknown_id),
+            "evidence": feature.evidence,
+        })
+        for feature in features
+    }
+
+
+def _database_unknown_feature_hashes(database: Path) -> dict[str, str]:
+    with closing(sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        records: dict[str, str] = {}
+        for row in connection.execute(
+            """SELECT unknown_id, technical_identity, segment_id, borough, street_name,
+                      side, reason_code, reason, identity_method, geometry_method,
+                      geometry_wkt, evidence_json
+               FROM unknown_block_faces ORDER BY unknown_id"""
+        ):
+            feature_id = str(row["unknown_id"])
+            geometry = wkt.loads(str(row["geometry_wkt"]))
+            evidence = json.loads(str(row["evidence_json"]))
+            records[feature_id] = _canonical_record_sha256({
+                "unknown_id": feature_id,
+                "technical_identity": row["technical_identity"],
+                "segment_id": str(row["segment_id"]),
+                "borough": row["borough"],
+                "street_name": str(row["street_name"]),
+                "side": str(row["side"]),
+                "reason_code": str(row["reason_code"]),
+                "reason": str(row["reason"]),
+                "identity_method": str(row["identity_method"]),
+                "geometry_method": str(row["geometry_method"]),
+                "geometry": _canonical_geometry(geometry, feature_id),
+                "evidence": evidence,
+            })
+    return records
 
 
 def _database_feature_hashes(database: Path) -> dict[str, str]:
@@ -987,6 +1155,7 @@ def _database_feature_hashes(database: Path) -> dict[str, str]:
                     collection_type: []
                     for collection_type in sorted(VALID_COLLECTION_TYPES)
                 },
+                "schedule_states": {},
                 "source": None,
                 "retrieved_at": None,
                 "dsny_sources": [],
@@ -1007,6 +1176,25 @@ def _database_feature_hashes(database: Path) -> dict[str, str]:
             records[feature_id]["schedules"][collection_type].append(str(row["weekday"]))
             sources[feature_id].add(str(row["source"]))
             retrieved[feature_id].add(str(row["retrieved_at"]))
+
+        for row in connection.execute(
+            """SELECT block_face_id, collection_type, state, source_field, raw_value,
+                      rule_id, source_policy_conflict, provenance
+               FROM block_face_collection_states
+               ORDER BY block_face_id, collection_type"""
+        ):
+            feature_id = str(row["block_face_id"])
+            collection_type = str(row["collection_type"])
+            if feature_id not in records or collection_type not in VALID_COLLECTION_TYPES:
+                raise RuntimeError("source database has invalid semantic collection state")
+            records[feature_id]["schedule_states"][collection_type] = {
+                "state": str(row["state"]),
+                "source_field": str(row["source_field"]),
+                "raw_value": row["raw_value"],
+                "rule_id": row["rule_id"],
+                "source_policy_conflict": bool(row["source_policy_conflict"]),
+                "provenance": str(row["provenance"]),
+            }
 
         for row in connection.execute(
             """SELECT block_face_id, dsny_object_id, frequency_row, schedule_code,
@@ -1146,6 +1334,8 @@ def validate_tile_build_report(
         "minzoom": tileset["minzoom"],
         "maxzoom": tileset["maxzoom"],
         "maxzoom_feature_count": tileset["maxzoom_feature_count"],
+        "unknown_feature_count": database["unknown_feature_count"],
+        "maxzoom_unknown_feature_count": tileset["maxzoom_unknown_feature_count"],
         "tile_feature_count": tileset["decoded_tile_feature_count"],
         "tile_size_metrics": tileset["tile_size_metrics"],
         "tile_size_limits": tileset["tile_size_limits"],
@@ -1162,6 +1352,8 @@ def validate_tile_build_report(
         raise RuntimeError("tile build report maxzoom coverage is below the source feature count")
     if report["tile_feature_count"] < report["maxzoom_feature_count"]:
         raise RuntimeError("tile build report total feature count is internally inconsistent")
+    if report["maxzoom_unknown_feature_count"] != report["unknown_feature_count"]:
+        raise RuntimeError("tile build report unknown maxzoom coverage is incomplete")
     return report
 
 
@@ -1259,6 +1451,18 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
     )
     source_report = read_json_object(paths["source_report"], "source report")
     _validate_source_report(source_report, version, artifacts, audit)
+    unknown_geojson = read_json_object(paths["unknown_geojson"], "unknown GeoJSON")
+    unknown_features = unknown_geojson.get("features")
+    if unknown_geojson.get("type") != "FeatureCollection" or not isinstance(unknown_features, list):
+        raise RuntimeError("unknown GeoJSON must be a FeatureCollection")
+    if len(unknown_features) != database["unknown_feature_count"]:
+        raise RuntimeError("unknown GeoJSON count does not match database")
+    for feature in unknown_features:
+        properties = feature.get("properties") if isinstance(feature, dict) else None
+        if not isinstance(properties, dict) or any(
+            key.endswith("_days") or key == "schedules" for key in properties
+        ):
+            raise RuntimeError("unknown GeoJSON contains schedule data")
     _require_exact_fields(
         artifacts["database"],
         {
@@ -1322,7 +1526,39 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
         },
         "LION source artifact descriptor",
     )
+    _require_exact_fields(
+        artifacts["source_pad"],
+        {
+            "path": RELEASE_FILENAMES["source_pad"],
+            "sha256": artifacts["source_pad"]["sha256"],
+            "release_identifier": artifacts["source_pad"].get("release_identifier"),
+        },
+        "PAD source artifact descriptor",
+    )
+    _require_exact_fields(
+        artifacts["unknown_geojson"],
+        {
+            "path": RELEASE_FILENAMES["unknown_geojson"],
+            "sha256": artifacts["unknown_geojson"]["sha256"],
+            "feature_count": database["unknown_feature_count"],
+        },
+        "unknown GeoJSON artifact descriptor",
+    )
     for artifact_name in ("tile_build_report", "source_report", "ingestion_failures"):
+        _require_exact_fields(
+            artifacts[artifact_name],
+            {
+                "path": RELEASE_FILENAMES[artifact_name],
+                "sha256": artifacts[artifact_name]["sha256"],
+            },
+            f"{artifact_name} artifact descriptor",
+        )
+    for artifact_name in (
+        "addresspoint_query_report",
+        "cscl_alignment_report",
+        "recovery_shadow_report",
+        "recovery_diff",
+    ):
         _require_exact_fields(
             artifacts[artifact_name],
             {
@@ -1345,6 +1581,7 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
         "schedule_groups": database["schedule_group_count"],
         "schedule_rows_by_type": database["schedule_counts"],
         "tile_features": tile_report["feature_count"],
+        "unknown_features": database["unknown_feature_count"],
     }
     if not isinstance(counts, dict):
         raise RuntimeError("release manifest counts must be an object")
@@ -1679,6 +1916,9 @@ def _validate_source_report(
             raise RuntimeError(f"source report {source} checksum does not match its artifact")
         if details.get("record_count") != expected_count:
             raise RuntimeError(f"source report {source} count does not match ingestion audit")
+    pad = sources.get("pad")
+    if not isinstance(pad, dict) or pad.get("sha256") != artifacts["source_pad"]["sha256"]:
+        raise RuntimeError("source report PAD checksum does not match its artifact")
 
 
 def _manifest_version(manifest: dict[str, object]) -> str:

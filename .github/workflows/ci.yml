@@ -83,8 +83,9 @@ jobs:
           assert health["dataset_version"] == fixture["version"]
           assert config["available"] is True
           assert config["version"] == fixture["version"]
-          assert config["tile_schema_revision"] == 2
+          assert config["tile_schema_revision"] == 3
           assert config["source_layer"] == "collection_streets"
+          assert config["unknown_source_layer"] == "collection_unknowns"
           bounds = config["bounds"]
           assert isinstance(bounds, list) and len(bounds) == 4
           assert all(isinstance(value, (int, float)) and math.isfinite(value) for value in bounds)

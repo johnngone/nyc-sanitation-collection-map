@@ -17,7 +17,8 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
+SUPPORTED_MANIFEST_VERSIONS = {2, 3}
 VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -44,7 +45,7 @@ class CurrentRelease:
 
 
 def read_current_release(manifest_path: str | Path) -> CurrentRelease | None:
-    """Return the committed v2 release, or ``None`` for legacy/no manifest.
+    """Return a committed v2/v3 release, or ``None`` for legacy/no manifest.
 
     A malformed v2 manifest fails closed.  Falling back in that case could
     silently combine a legacy database with tiles from a different release.
@@ -66,19 +67,19 @@ def read_current_release(manifest_path: str | Path) -> CurrentRelease | None:
     manifest_version = manifest.get("manifest_version")
     if type(manifest_version) is int and manifest_version == 1:
         return None
-    if type(manifest_version) is not int or manifest_version != MANIFEST_VERSION:
+    if type(manifest_version) is not int or manifest_version not in SUPPORTED_MANIFEST_VERSIONS:
         raise ReleaseManifestError("dataset manifest version is unsupported or missing")
 
     has_release_path = "release_path" in manifest
     has_artifacts = "artifacts" in manifest
     if not has_release_path or not has_artifacts:
-        raise ReleaseManifestError("v2 dataset manifest has incomplete release fields")
+        raise ReleaseManifestError("dataset manifest has incomplete release fields")
 
     dataset_version = _version(manifest.get("dataset_version"), "dataset_version")
     release_root = _release_root(pointer.parent, manifest.get("release_path"), dataset_version)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
-        raise ReleaseManifestError("v2 dataset manifest is missing artifacts")
+        raise ReleaseManifestError("dataset manifest is missing artifacts")
     database_path, database_hash = _artifact(
         release_root, artifacts, "database", "app.sqlite3"
     )

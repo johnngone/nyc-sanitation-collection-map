@@ -5,6 +5,7 @@ venv/
 .pytest_cache/
 .pytest-tmp*/
 .pytest-*/
+.test-tmp/
 .verification/
 .mypy_cache/
 .ruff_cache/

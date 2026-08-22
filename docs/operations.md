@@ -23,7 +23,7 @@ FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not en
 
 ## Vector-tile contract
 
-The default archive is an MBTiles SQLite file covering zooms 12–17. The MVT source layer is `collection_streets`, with one logical source feature per stored `block_faces` row:
+The default v3 archive is an MBTiles SQLite file covering zooms 12–17. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at high zoom. The runtime continues to read retained v2 releases during rollout.
 
 | Property | Meaning |
 |---|---|
@@ -36,8 +36,10 @@ The default archive is an MBTiles SQLite file covering zooms 12–17. The MVT so
 | `organics_days` | Comma-separated weekday codes |
 | `bulk_days` | Comma-separated weekday codes |
 | `source`, `retrieved_at` | Schedule provenance |
+| `*_status`, `*_rule`, `*_conflict`, `*_provenance` | Per-type evidence state and policy provenance |
+| `identity_method`, `geometry_method` | How identity and geometry were validated |
 
-Blank day lists mean that collection type has no validated schedule on that feature; they do not remove the geometry. At build time, every database block face must have valid line geometry, at least one schedule row, consistent provenance, and representation at maximum zoom. The archive is bound to the database version, counts, and SHA-256 digest.
+Blank day lists with `UNKNOWN_SOURCE_BLANK` mean the official source schedule is unavailable, never that service does not exist. Every known block face has exactly four state rows. Unknown-layer features contain no weekday or status properties and must also survive maximum zoom exactly once.
 
 A line crossing a tile boundary is clipped into each intersecting tile. `feature_count` is the unique source count; `tile_feature_count` includes these per-tile placements.
 
@@ -72,12 +74,18 @@ data/
       source_report.json
       dsny_frequencies.geojson
       lion.zip
+      pad.zip
+      unknown_block_faces.geojson
+      addresspoint_query_report.json
+      cscl_alignment_report.json
+      recovery_shadow_report.json
+      recovery_diff.json
       release_manifest.json
 ```
 
 The dataset version combines the processing timestamp and processed-data digest. Each artifact descriptor carries a SHA-256 checksum and relevant count/version bindings.
 
-The background refresh builds in a temporary directory on the same volume, validates the complete bundle, installs a new immutable release directory, and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. A malformed committed v2 pointer fails closed instead of falling back to loose legacy files.
+The background refresh builds in a temporary directory on the same volume, validates the complete bundle, installs a new immutable release directory, and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. Malformed committed v2 or v3 pointers fail closed instead of falling back to loose legacy files.
 
 On first access to a new production-sized release, the app hashes the committed database and tileset once on a background worker. While this single-flight check is running, `/api/health` returns HTTP `503` with `Committed artifact checksums are verifying`, and `/api/map-config` reports `available: false`; the frontend retries both after 0.5 seconds and exponentially backs off to a 15-second cap. Verified results are cached against the artifact path, size, modification time, and expected digest. `HEALTH_SYNC_HASH_MAX_BYTES` is the maximum total artifact size verified inline (16 MiB by default). Lowering it moves more checks to the background; raising it can make a health request block on more I/O. Every artifact is still hashed.
 

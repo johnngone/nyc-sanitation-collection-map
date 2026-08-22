@@ -1,6 +1,6 @@
 # Data sources and completeness contract
 
-The production refresh has two authoritative inputs. AddressPoint, PAD, and the public address-lookup page are not used to build the map.
+The production refresh has two authoritative schedule/geometry inputs (DSNY and LION). It also preserves PAD plus audited AddressPoint and CSCL query reports for conservative recovery shadow analysis. Recovery evidence cannot change the colored map until its release, stability, and manual-review gates are enabled.
 
 ## Production sources
 
@@ -13,7 +13,7 @@ The production refresh has two authoritative inputs. AddressPoint, PAD, and the 
 - Geometry: polygon/multipolygon frequency boundaries; the service declares EPSG:2263 and the downloader requests GeoJSON in EPSG:4326.
 - Required identity/schedule fields: the service-declared object ID plus `FREQ_REFUSE`, `FREQ_RECYCLING`, `FREQ_ORGANICS`, and `FREQ_BULK`.
 
-`FREQUENCY` is a DCP-style letter code, not a weekday schedule. Only the four explicit `FREQ_*` fields are normalized. Refuse must have an explicit schedule. Empty values for the other three types mean no schedule for that type; unknown, malformed, or truncated weekday tokens are invalid.
+`FREQUENCY` is a DCP-style letter code, not a weekday schedule. Only the four `FREQ_*` fields are normalized. Refuse must be explicit. A nonblank value is always authoritative and malformed nonblank values are fatal. Blank Recycling and Bulk remain `UNKNOWN_SOURCE_BLANK`. Blank Organics derives the explicit Recycling weekdays under rule `dsny-organics-on-recycling-day-v1`; if Recycling is also blank, Organics remains unknown. `NO_SERVICE` is reserved and is not emitted by current releases.
 
 The downloader first obtains the authoritative count and complete object-ID set. It requests exact ID batches, rejects missing, unexpected, or duplicate IDs, and requires the returned total to equal the advertised total. It then fetches the layer metadata, count, and ID set again; a count, ID, or `lastEditDate` change makes the snapshot fail rather than combine two source revisions.
 
@@ -58,7 +58,7 @@ These outcomes may legitimately produce no map feature, but they are counted and
 |---|---|
 | `out_of_scope` | The LION row is outside the official generic-street/curbside scope, or a boundary side is intentionally outside a borough. |
 | `deduplicated_alias` | An exact SegmentID/geometry/block-face alias is represented by its canonical row. |
-| `non_addressable` | A side has no usable block-face ID or address range. A usable range can instead receive an explicit `LION:<segment>:<side>` fallback ID. |
+| `non_addressable` | A side lacks a promotable block-face identity. `LION:<segment>:<side>` is retained only as a technical candidate; address-range evidence alone never enters the colored schedule layer. |
 | `outside_schedule_area` | The side-offset trace overlaps no DSNY frequency polygon. |
 | `partially_outside_schedule_area` | Only part of the trace is covered; the condition remains visible in the audit. |
 | `matched` | The side has an unambiguous validated schedule mapping. |
@@ -87,9 +87,10 @@ The processed output retains the original block-face identity, contributing LION
 
 ## Preserved release evidence
 
-Every committed release contains:
+Every committed v3 release contains:
 
-- the exact raw DSNY GeoJSON and LION ZIP;
+- the exact raw DSNY GeoJSON, LION ZIP, and PAD ZIP;
+- AddressPoint query, CSCL alignment, recovery-shadow, and unknown-geometry reports;
 - `source_report.json` with URLs, hashes, counts, and available server metadata;
 - `ingestion_audit.json` with reconciliation totals, outcomes, global errors, and diagnostic records;
 - `ingestion_failures.jsonl`, a line-oriented diagnostic view of non-success/fallback records;

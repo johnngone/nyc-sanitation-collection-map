@@ -11,11 +11,12 @@ const collectionTypes = [
   ["REFUSE", "Refuse", "#111111", "refuse_days", 0],
   ["RECYCLING", "Recycling", "#1479d1", "recycling_days", 6],
   ["ORGANICS", "Organics", "#8b4a22", "organics_days", 9],
-  ["BULK", "Bulk", "#7a3db8", "bulk_days", 3],
+  ["BULK", "Bulk trash / non-recyclable large items", "#7a3db8", "bulk_days", 3],
 ] as const;
 type CollectionType = (typeof collectionTypes)[number][0];
 type CollectionDefinition = (typeof collectionTypes)[number];
 const collectionLayerIds = collectionTypes.flatMap(([type]) => [lowZoomLayerId(type), highZoomLayerId(type)]);
+const unknownLayerIds = ["collection-unknown-geometry", "collection-unknown-identity"];
 
 interface MapConfig {
   available: boolean;
@@ -23,6 +24,9 @@ interface MapConfig {
   version: string | null;
   tiles_url: string | null;
   source_layer: string;
+  known_source_layer?: string;
+  unknown_source_layer?: string | null;
+  unknown_minzoom?: number | null;
   minzoom: number | null;
   maxzoom: number | null;
   bounds: [number, number, number, number] | null;
@@ -42,6 +46,7 @@ export function App() {
   const mapRef = useRef<MapLibreMap | null>(null);
   const selectedDayRef = useRef<Weekday>(dayFromCode(new URLSearchParams(window.location.search).get("day")));
   const selectedTypesRef = useRef<CollectionType[]>(["REFUSE"]);
+  const showUnknownsRef = useRef(true);
   const updateTileStatusRef = useRef<(() => void) | null>(null);
   const tileErrorRef = useRef<string | null>(null);
   const [selectedDay, setSelectedDay] = useState<Weekday>(selectedDayRef.current);
@@ -50,6 +55,7 @@ export function App() {
   const [selectedTypes, setSelectedTypes] = useState<CollectionType[]>(selectedTypesRef.current);
   const [dataUpdated, setDataUpdated] = useState<string | null>(null);
   const [showInfo, setShowInfo] = useState(false);
+  const [showUnknowns, setShowUnknowns] = useState(true);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -145,7 +151,7 @@ export function App() {
             !config.tiles_url
             || !config.version
             || !config.source_layer
-            || config.tile_schema_revision !== 2
+            || ![2, 3].includes(config.tile_schema_revision ?? 0)
             || typeof config.minzoom !== "number"
             || typeof config.maxzoom !== "number"
             || !Number.isInteger(config.minzoom)
@@ -162,6 +168,7 @@ export function App() {
           }
 
           tilesInitialized = true;
+          const tileSchemaRevision = config.tile_schema_revision as 2 | 3;
           // Below the archive's minimum zoom the collection overlay would be
           // blank while the legend still looked authoritative. Keep the map in
           // the range where a validated collection layer can be rendered.
@@ -212,6 +219,44 @@ export function App() {
                 "line-offset": lineOffset,
               },
             });
+            if (tileSchemaRevision >= 3) {
+              map.addLayer({
+                id: blankLayerId(type),
+                type: "line",
+                source: sourceId,
+                "source-layer": config.source_layer,
+                minzoom: config.unknown_minzoom ?? 16,
+                filter: ["==", ["get", `${type.toLowerCase()}_status`], "UNKNOWN_SOURCE_BLANK"],
+                layout: { visibility },
+                paint: {
+                  "line-color": "#707981",
+                  "line-width": 3,
+                  "line-dasharray": [2, 2],
+                  "line-opacity": 0.85,
+                  "line-offset": lineOffset,
+                },
+              });
+            }
+          }
+
+          if (tileSchemaRevision >= 3 && config.unknown_source_layer && typeof config.unknown_minzoom === "number") {
+            const unknownSideOffset: maplibregl.ExpressionSpecification = [
+              "*", ["match", ["get", "side"], "LEFT", -1, "RIGHT", 1, 0], 4,
+            ];
+            map.addLayer({
+              id: unknownLayerIds[0], type: "line", source: sourceId,
+              "source-layer": config.unknown_source_layer, minzoom: config.unknown_minzoom,
+              filter: ["in", ["get", "reason_code"], ["literal", ["OUTSIDE_DSNY_COVERAGE", "PARTIAL_GEOMETRY_GAP"]]],
+              layout: { visibility: showUnknownsRef.current ? "visible" : "none" },
+              paint: { "line-color": "#d68a00", "line-width": 3, "line-dasharray": [2, 2], "line-opacity": 0.9, "line-offset": unknownSideOffset },
+            });
+            map.addLayer({
+              id: unknownLayerIds[1], type: "line", source: sourceId,
+              "source-layer": config.unknown_source_layer, minzoom: 17,
+              filter: ["==", ["get", "reason_code"], "INSUFFICIENT_ADDRESS_EVIDENCE"],
+              layout: { visibility: showUnknownsRef.current ? "visible" : "none" },
+              paint: { "line-color": "#687078", "line-width": 3, "line-dasharray": [1, 2], "line-opacity": 0.9, "line-offset": unknownSideOffset },
+            });
           }
 
           const updateTileStatus = () => {
@@ -229,11 +274,24 @@ export function App() {
           const showPopup = (event: maplibregl.MapLayerMouseEvent) => {
             const feature = event.features?.[0];
             if (!feature?.properties) return;
+            if (unknownLayerIds.includes(feature.layer.id)) {
+              const properties = feature.properties;
+              const explanation = unknownReasonText(properties.reason_code);
+              new maplibregl.Popup().setLngLat(event.lngLat).setHTML(
+                `<strong>${escapeHtml(properties.street_name ?? "Unknown street")}</strong><br />${escapeHtml(explanation)}<br /><small>${escapeHtml(properties.reason ?? "Schedule evidence is unavailable")}</small>`
+              ).addTo(map);
+              return;
+            }
             const collection = collectionForLayerId(feature.layer.id);
             if (!collection) return;
             const [, label, , daysProperty] = collection;
             const properties = feature.properties;
             const collectionDays = properties[daysProperty] ?? "Unknown";
+            const status = properties[`${collection[0].toLowerCase()}_status`] ?? "SOURCE_EXPLICIT";
+            const scheduleExplanation = scheduleStatusText(
+              status,
+              properties[`${collection[0].toLowerCase()}_conflict`] === "1",
+            );
             const blockFaceId = properties.origin_block_face_id ?? properties.source_block_face_id ?? properties.id;
             const metadata = [
               blockFaceId ? `Block face: ${escapeHtml(blockFaceId)}` : null,
@@ -243,10 +301,15 @@ export function App() {
             const metadataHtml = metadata.length ? `<br /><small>${metadata.join("<br />")}</small>` : "";
             new maplibregl.Popup()
               .setLngLat(event.lngLat)
-              .setHTML(`<strong>${escapeHtml(properties.street_name ?? properties.name ?? "Unnamed street")}</strong><br />${escapeHtml(properties.borough ?? "Unknown borough")} · ${escapeHtml(properties.side ?? "Unknown side")}<br /><br /><strong>${escapeHtml(label)}:</strong> ${escapeHtml(collectionDays)}${metadataHtml}`)
+              .setHTML(`<strong>${escapeHtml(properties.street_name ?? properties.name ?? "Unnamed street")}</strong><br />${escapeHtml(properties.borough ?? "Unknown borough")} · ${escapeHtml(properties.side ?? "Unknown side")}<br /><br /><strong>${escapeHtml(label)}:</strong> ${escapeHtml(collectionDays || "Unavailable")}<br />${escapeHtml(scheduleExplanation)}${metadataHtml}`)
               .addTo(map);
           };
-          map.on("click", collectionLayerIds, showPopup);
+          const clickableCollectionLayers = [
+            ...collectionLayerIds,
+            ...collectionTypes.map(([type]) => blankLayerId(type)).filter((id) => Boolean(map.getLayer(id))),
+          ];
+          map.on("click", clickableCollectionLayers, showPopup);
+          if (tileSchemaRevision >= 3 && config.unknown_source_layer) map.on("click", unknownLayerIds, showPopup);
           map.on("mouseenter", collectionLayerIds, () => { map.getCanvas().style.cursor = "pointer"; });
           map.on("mouseleave", collectionLayerIds, () => { map.getCanvas().style.cursor = ""; });
 
@@ -311,6 +374,15 @@ export function App() {
     return () => window.cancelAnimationFrame(animationFrame);
   }, [selectedDay, selectedTypes]);
 
+  useEffect(() => {
+    showUnknownsRef.current = showUnknowns;
+    const map = mapRef.current;
+    if (!map) return;
+    for (const id of unknownLayerIds) {
+      if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", showUnknowns ? "visible" : "none");
+    }
+  }, [showUnknowns]);
+
   function selectDay(day: Weekday) {
     setSelectedDay(day);
     const url = new URL(window.location.href);
@@ -327,13 +399,14 @@ export function App() {
           <small>Data updated: {dataUpdated ? new Date(dataUpdated).toLocaleDateString() : "Not available"}</small>
           <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-pressed={selectedDay === day}>{dayCode(day)[0]}</button>)}</div>
           <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
-          <span><i className="swatch unavailable" /> Zoom in for full street detail; no line there means no validated schedule match</span>
+          <label><input type="checkbox" checked={showUnknowns} onChange={() => setShowUnknowns((current) => !current)} /> Show known data gaps at high zoom</label>
+          <span><i className="swatch unavailable" /> Gray/amber dashed streets mean the source schedule or evidence is unavailable</span>
           <small>{mapStatus}</small>
           <small>{selectedTypes.length ? "Vector tiles load on demand for the current view" : "Select a collection type to show data"}</small>
           <small>{backendStatus}</small>
         </aside>
       </section>
-      {showInfo && <div className="modal-backdrop" role="presentation" onClick={() => setShowInfo(false)}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="Close information" onClick={() => setShowInfo(false)}>×</button><h2 id="data-info-title">About this map</h2><p>Official NYC Department of Sanitation frequency data supplies collection schedules. NYC Department of City Planning LION data supplies street centerlines and separate left/right block-face identifiers.</p><p>The sources are downloaded, schema-checked, reprojected, spatially joined, and normalized into weekday schedules. Validated results are stored in a local SQLite database.</p><p>The backend publishes versioned vector tiles, and MapLibre loads only the small tiles needed for the current view. Day and collection-type controls filter those tiles directly in the browser.</p><p>Missing, unmatched, or unvalidated source records are reported during processing and are not treated as proof that no collection exists.</p></section></div>}
+      {showInfo && <div className="modal-backdrop" role="presentation" onClick={() => setShowInfo(false)}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="Close information" onClick={() => setShowInfo(false)}>×</button><h2 id="data-info-title">About this map</h2><p>Official NYC Department of Sanitation frequency data supplies collection schedules. NYC Department of City Planning LION data supplies street centerlines and separate left/right block-face identifiers.</p><p>Explicit source values always win. When Organics is blank but Recycling is explicit, Organics follows Recycling under <a href="https://www.nyc.gov/site/dsny/collection/residents/curbside-composting.page" target="_blank" rel="noreferrer">DSNY's citywide compost policy</a>. Other blanks remain visibly unknown.</p><p>Bulk means non-recyclable large items; recyclable large items follow the Recycling schedule under <a href="https://www.nyc.gov/site/dsny/collection/get-rid-of/large-items.page" target="_blank" rel="noreferrer">DSNY large-item guidance</a>.</p><p>Missing, unmatched, or unvalidated source records are shown as high-zoom dashed lines and are never treated as proof of no service.</p></section></div>}
     </main>
   );
 }
@@ -356,6 +429,10 @@ function highZoomLayerId(type: CollectionType): string {
   return `${sourceId}-${type.toLowerCase()}-line`;
 }
 
+function blankLayerId(type: CollectionType): string {
+  return `${sourceId}-${type.toLowerCase()}-unknown`;
+}
+
 function makeDayFilter(day: Weekday, daysProperty: CollectionDefinition[3]): maplibregl.FilterSpecification {
   return ["in", dayCode(day), ["split", ["coalesce", ["get", daysProperty], ""], ","]];
 }
@@ -372,11 +449,27 @@ function updateCollectionLayers(map: MapLibreMap, day: Weekday, selectedTypes: C
       map.setFilter(id, filter);
       map.setLayoutProperty(id, "visibility", visibility);
     }
+    const unknownId = blankLayerId(type);
+    if (map.getLayer(unknownId)) map.setLayoutProperty(unknownId, "visibility", visibility);
   }
 }
 
 function collectionForLayerId(id: string): CollectionDefinition | undefined {
-  return collectionTypes.find(([type]) => id === lowZoomLayerId(type) || id === highZoomLayerId(type));
+  return collectionTypes.find(([type]) => id === lowZoomLayerId(type) || id === highZoomLayerId(type) || id === blankLayerId(type));
+}
+
+function scheduleStatusText(status: unknown, conflict = false): string {
+  if (conflict) return "Official explicit DSNY schedule; it differs from the general policy relationship and was preserved.";
+  if (status === "POLICY_DERIVED") return "Derived from the explicit Recycling day under DSNY citywide compost policy.";
+  if (status === "UNKNOWN_SOURCE_BLANK") return "The official source schedule is unavailable; no day was inferred.";
+  if (status === "SOURCE_EXPLICIT") return "Official explicit DSNY schedule.";
+  return "Schedule provenance is unavailable.";
+}
+
+function unknownReasonText(reason: unknown): string {
+  if (reason === "INSUFFICIENT_ADDRESS_EVIDENCE") return "Insufficient address evidence to assign a schedule.";
+  if (reason === "PARTIAL_GEOMETRY_GAP") return "Part of this geometry falls outside published DSNY coverage.";
+  return "This geometry falls outside published DSNY coverage.";
 }
 
 function apiUrl(path: string): string {

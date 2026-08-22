@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app.database import initialize
-from backend.app.releases import VERSION_PATTERN
+from backend.app.releases import MANIFEST_VERSION, VERSION_PATTERN
 from scripts.build_tiles import build_tiles
 from scripts.release_validation import (
     atomic_json,
@@ -24,7 +24,7 @@ from scripts.release_validation import (
 )
 
 
-DEFAULT_VERSION = "ci-smoke-v2"
+DEFAULT_VERSION = "ci-smoke-v3"
 DATA_UPDATED = "2026-08-19T12:00:00+00:00"
 WEST, SOUTH, EAST, NORTH = -73.99, 40.70, -73.98, 40.71
 
@@ -72,6 +72,14 @@ def _build_database(path: Path, version: str) -> None:
                VALUES ('smoke-face', ?, 'MON', 'DSNY_SMOKE_FIXTURE',
                        '2026-08-19', 'AUDITED_SIDE_OFFSET')""",
             [(kind,) for kind in ("REFUSE", "RECYCLING", "ORGANICS", "BULK")],
+        )
+        connection.executemany(
+            """INSERT INTO block_face_collection_states
+               (block_face_id, collection_type, effective_days_json, state,
+                source_field, raw_value, rule_id, source_policy_conflict, provenance)
+               VALUES ('smoke-face', ?, '["MON"]', 'SOURCE_EXPLICIT', ?,
+                       'MON', NULL, 0, 'DSNY smoke fixture')""",
+            [(kind, f"FREQ_{kind}") for kind in ("REFUSE", "RECYCLING", "ORGANICS", "BULK")],
         )
         connection.execute(
             "INSERT INTO dataset_metadata(key, value) VALUES ('dataset_version', ?)",
@@ -122,7 +130,7 @@ def build_smoke_release(data_dir: str | Path, version: str = DEFAULT_VERSION) ->
     y = (1 << zoom) - 1 - tms_y
 
     manifest = {
-        "manifest_version": 2,
+        "manifest_version": MANIFEST_VERSION,
         "dataset_version": version,
         "release_path": f"releases/{version}",
         "processed_at": DATA_UPDATED,

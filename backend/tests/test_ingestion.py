@@ -248,7 +248,7 @@ def test_partially_covered_side_emits_only_covered_geometry_and_audits_remainder
     assert audit["passed"] is True
 
 
-def test_blank_bfid_with_address_range_uses_audited_fallback_identity() -> None:
+def test_blank_bfid_with_address_range_remains_unknown_without_corroboration() -> None:
     lion = lion_frame([
         lion_row(left_id="", right_id=0, left_from=2, left_to=100),
     ])
@@ -258,17 +258,20 @@ def test_blank_bfid_with_address_range_uses_audited_fallback_identity() -> None:
 
     payload, audit = build_collection_features(lion, frequencies)
 
-    assert len(payload["features"]) == 1
-    properties = payload["features"][0]["properties"]
-    assert properties["block_face_id"] == properties["origin_block_face_id"] == "LION:segment-1:LEFT"
+    assert payload["features"] == []
+    candidate = next(
+        feature for feature in payload["unknown_features"]
+        if feature["properties"]["technical_identity"] == "LION:segment-1:LEFT"
+    )
+    assert candidate["properties"]["reason_code"] == "INSUFFICIENT_ADDRESS_EVIDENCE"
     assert audit["fallback_block_face_id"] == 1
-    assert audit["outcomes"]["matched"] == 1
+    assert audit["outcomes"]["matched"] == 0
     fallback_record = next(
         record for record in audit["records"] if "fallback_block_face_id" in record
     )
     assert fallback_record["raw_block_face_id"] == ""
     assert fallback_record["address_range"]["FromLeft"] == 2
-    assert audit["passed"] is True
+    assert audit["passed"] is False
 
 
 def test_unused_valid_frequency_row_is_detailed_and_fatal() -> None:
@@ -694,7 +697,7 @@ def test_exact_special_address_aliases_are_sampled_once_with_full_provenance() -
     assert audit["passed"] is True
 
 
-def test_alias_address_range_establishes_fallback_even_when_base_row_has_none() -> None:
+def test_alias_address_range_stays_unknown_and_loader_preserves_it(tmp_path) -> None:
     geometry = LineString([(X, Y), (X + 100, Y)])
     lion = lion_frame([
         lion_row(
@@ -730,10 +733,11 @@ def test_alias_address_range_establishes_fallback_even_when_base_row_has_none() 
 
     payload, audit = build_collection_features(lion, frequencies)
 
-    assert {feature["properties"]["block_face_id"] for feature in payload["features"]} == {
-        "LION:alias-address:LEFT",
-        "normal-left",
-    }
+    assert {feature["properties"]["block_face_id"] for feature in payload["features"]} == {"normal-left"}
+    assert any(
+        feature["properties"]["technical_identity"] == "LION:alias-address:LEFT"
+        for feature in payload["unknown_features"]
+    )
     fallback = next(
         record
         for record in audit["records"]
@@ -743,6 +747,17 @@ def test_alias_address_range_establishes_fallback_even_when_base_row_has_none() 
     assert fallback["address_range"]["FromLeft"] == 101
     assert fallback["address_ranges"] == [fallback["address_range"]]
     assert audit["passed"] is True
+    database = tmp_path / "unknowns.sqlite3"
+    load_payload(payload, database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM unknown_block_faces WHERE technical_identity = ?",
+            ("LION:alias-address:LEFT",),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM collection_schedules
+               WHERE block_face_id LIKE 'UNKNOWN:%'"""
+        ).fetchone()[0] == 0
 
 
 def test_alias_name_is_used_when_canonical_base_street_is_blank() -> None:
@@ -972,6 +987,67 @@ def test_empty_optional_schedules_and_dsny_business_keys_are_audited_and_preserv
     assert audit["passed"] is True
 
 
+def test_blank_organics_derives_only_from_explicit_recycling() -> None:
+    lion = lion_frame([lion_row(right_id=0)])
+    frequencies = frequency_frame([{
+        "OBJECTID": 1201,
+        "FREQ_RECYCLING": "Tue, Sat",
+        "FREQ_ORGANICS": None,
+        "geometry": box(X - 10, Y + 1, X + 110, Y + 100),
+    }])
+
+    payload, audit = build_collection_features(lion, frequencies)
+
+    properties = payload["features"][0]["properties"]
+    assert properties["schedules"]["ORGANICS"] == ["TUE", "SAT"]
+    assert properties["schedule_states"]["ORGANICS"] == {
+        "state": "POLICY_DERIVED",
+        "source_field": "FREQ_ORGANICS",
+        "raw_value": None,
+        "rule_id": "dsny-organics-on-recycling-day-v1",
+        "source_policy_conflict": False,
+        "provenance": "NYC DSNY citywide curbside compost collection occurs on the recycling day",
+    }
+    assert audit["schedule_state_counts"]["ORGANICS"]["POLICY_DERIVED"] == 1
+
+
+def test_blank_organics_and_recycling_remain_unknown_without_inference() -> None:
+    lion = lion_frame([lion_row(right_id=0)])
+    frequencies = frequency_frame([{
+        "OBJECTID": 1202,
+        "FREQ_RECYCLING": " ",
+        "FREQ_ORGANICS": None,
+        "geometry": box(X - 10, Y + 1, X + 110, Y + 100),
+    }])
+
+    payload, _ = build_collection_features(lion, frequencies)
+
+    properties = payload["features"][0]["properties"]
+    assert properties["schedules"]["RECYCLING"] == []
+    assert properties["schedules"]["ORGANICS"] == []
+    assert properties["schedule_states"]["RECYCLING"]["state"] == "UNKNOWN_SOURCE_BLANK"
+    assert properties["schedule_states"]["ORGANICS"]["state"] == "UNKNOWN_SOURCE_BLANK"
+
+
+def test_explicit_organics_conflict_is_preserved_and_flagged() -> None:
+    lion = lion_frame([lion_row(right_id=0)])
+    frequencies = frequency_frame([{
+        "OBJECTID": 1203,
+        "FREQ_RECYCLING": "Tue",
+        "FREQ_ORGANICS": "Wed",
+        "geometry": box(X - 10, Y + 1, X + 110, Y + 100),
+    }])
+
+    payload, audit = build_collection_features(lion, frequencies)
+
+    properties = payload["features"][0]["properties"]
+    assert properties["schedules"]["ORGANICS"] == ["WED"]
+    organics_state = properties["schedule_states"]["ORGANICS"]
+    assert organics_state["state"] == "SOURCE_EXPLICIT"
+    assert organics_state["source_policy_conflict"] is True
+    assert audit["policy_conflicts"] == 1
+
+
 def test_processed_digest_binds_exact_deterministic_payload_bytes() -> None:
     payload = {
         "type": "FeatureCollection",
@@ -1058,7 +1134,7 @@ def test_loader_aggregates_duplicate_ids_and_removes_stale_schedules(tmp_path) -
         assert connection.execute("SELECT COUNT(*) FROM block_face_lion_components").fetchone()[0] == 1
         assert connection.execute(
             "SELECT DISTINCT validation_status FROM collection_schedules"
-        ).fetchall() == [("AUDITED_SIDE_TRACE_V2",)]
+        ).fetchall() == [("AUDITED_SIDE_TRACE_V3",)]
 
 
 def test_loader_persists_split_feature_keys_origins_and_source_provenance(tmp_path) -> None:

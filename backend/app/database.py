@@ -54,6 +54,38 @@ CREATE TABLE IF NOT EXISTS collection_schedules (
     PRIMARY KEY (block_face_id, collection_type, weekday)
 );
 
+CREATE TABLE IF NOT EXISTS block_face_collection_states (
+    block_face_id TEXT NOT NULL REFERENCES block_faces(block_face_id) ON DELETE CASCADE,
+    collection_type TEXT NOT NULL CHECK (collection_type IN ('REFUSE','RECYCLING','ORGANICS','BULK')),
+    effective_days_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('SOURCE_EXPLICIT','POLICY_DERIVED','UNKNOWN_SOURCE_BLANK','NO_SERVICE')),
+    source_field TEXT NOT NULL,
+    raw_value TEXT,
+    rule_id TEXT,
+    source_policy_conflict INTEGER NOT NULL DEFAULT 0 CHECK (source_policy_conflict IN (0,1)),
+    provenance TEXT NOT NULL,
+    PRIMARY KEY (block_face_id, collection_type)
+);
+
+CREATE TABLE IF NOT EXISTS unknown_block_faces (
+    unknown_id TEXT PRIMARY KEY,
+    technical_identity TEXT,
+    segment_id TEXT NOT NULL,
+    borough TEXT,
+    street_name TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('LEFT', 'RIGHT')),
+    reason_code TEXT NOT NULL CHECK (reason_code IN ('INSUFFICIENT_ADDRESS_EVIDENCE','OUTSIDE_DSNY_COVERAGE','PARTIAL_GEOMETRY_GAP')),
+    reason TEXT NOT NULL,
+    identity_method TEXT NOT NULL,
+    geometry_method TEXT NOT NULL,
+    geometry_wkt TEXT NOT NULL,
+    min_x REAL NOT NULL,
+    min_y REAL NOT NULL,
+    max_x REAL NOT NULL,
+    max_y REAL NOT NULL,
+    evidence_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS lookup_cache (
     lookup_key TEXT PRIMARY KEY,
     input_address TEXT NOT NULL,
@@ -91,6 +123,10 @@ CREATE INDEX IF NOT EXISTS idx_schedule_day_type
     ON collection_schedules(collection_type, weekday);
 CREATE INDEX IF NOT EXISTS idx_schedule_type_day_face
     ON collection_schedules(collection_type, weekday, block_face_id);
+CREATE INDEX IF NOT EXISTS idx_collection_state_type
+    ON block_face_collection_states(collection_type, state);
+CREATE INDEX IF NOT EXISTS idx_unknown_reason
+    ON unknown_block_faces(reason_code);
 CREATE INDEX IF NOT EXISTS idx_block_face_bbox
     ON block_faces(min_x, max_x, min_y, max_y);
 CREATE INDEX IF NOT EXISTS idx_block_face_min_x ON block_faces(min_x);

@@ -16,7 +16,13 @@ from shapely.geometry import shape
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend.app.database import initialize
-from scripts.build_pilot import DAY_ORDER, SCHEDULE_FIELDS, combine_line_geometries
+from scripts.build_pilot import (
+    DAY_ORDER,
+    ORGANICS_POLICY_RULE_ID,
+    SCHEDULE_FIELDS,
+    SCHEDULE_STATES,
+    combine_line_geometries,
+)
 
 LOGGER = logging.getLogger("load_processed")
 VALID_DAYS = set(DAY_ORDER)
@@ -35,11 +41,28 @@ class ValidatedFeature:
     side: str
     geometry: BaseGeometry
     schedules: dict[str, tuple[str, ...]]
+    schedule_states: dict[str, dict[str, object]]
     dsny_object_ids: tuple[str, ...]
     dsny_sources: tuple[dict[str, object], ...]
     lion_components: tuple[dict[str, object], ...]
     source: str
     retrieved_at: str
+
+
+@dataclass(frozen=True)
+class ValidatedUnknownFeature:
+    unknown_id: str
+    technical_identity: str | None
+    segment_id: str
+    borough: str | None
+    street_name: str
+    side: str
+    reason_code: str
+    reason: str
+    identity_method: str
+    geometry_method: str
+    geometry: BaseGeometry
+    evidence: dict[str, object]
 
 
 def prepare_features(payload: object) -> list[ValidatedFeature]:
@@ -53,8 +76,11 @@ def prepare_features(payload: object) -> list[ValidatedFeature]:
 
     LOGGER.info("Validating processed GeoJSON features=%s", len(raw_features))
     groups: dict[str, list[ValidatedFeature]] = defaultdict(list)
+    schema_revision = payload.get("schema_revision", 2)
+    if schema_revision not in {2, 3}:
+        raise ValueError(f"unsupported processed schema_revision {schema_revision!r}")
     for feature_number, feature in enumerate(raw_features):
-        validated = _validate_feature(feature, feature_number)
+        validated = _validate_feature(feature, feature_number, schema_revision=int(schema_revision))
         groups[validated.block_face_id].append(validated)
         completed = feature_number + 1
         if completed % PROGRESS_EVERY_FEATURES == 0 or completed == len(raw_features):
@@ -93,6 +119,7 @@ def prepare_features(payload: object) -> list[ValidatedFeature]:
             side=first.side,
             geometry=geometry,
             schedules=first.schedules,
+            schedule_states=first.schedule_states,
             dsny_object_ids=dsny_object_ids,
             dsny_sources=dsny_sources,
             lion_components=lion_components,
@@ -103,10 +130,27 @@ def prepare_features(payload: object) -> list[ValidatedFeature]:
     return aggregated
 
 
+def prepare_unknown_features(payload: object) -> list[ValidatedUnknownFeature]:
+    if not isinstance(payload, dict):
+        raise ValueError("input must be an object")
+    raw_unknowns = payload.get("unknown_features", [])
+    if not isinstance(raw_unknowns, list):
+        raise ValueError("unknown_features must be a list")
+    unknowns = [
+        _validate_unknown_feature(feature, number)
+        for number, feature in enumerate(raw_unknowns)
+    ]
+    ids = [feature.unknown_id for feature in unknowns]
+    if len(ids) != len(set(ids)):
+        raise ValueError("unknown_features contains duplicate unknown_id values")
+    return unknowns
+
+
 def load_payload(payload: object, database: str | Path) -> int:
     """Atomically load a fully validated payload and return its feature count."""
 
     features = prepare_features(payload)
+    unknown_features = prepare_unknown_features(payload)
     if not features:
         raise ValueError("input contains no features")
     LOGGER.info("Initializing SQLite and loading audited features=%s database=%s", len(features), database)
@@ -152,6 +196,8 @@ def load_payload(payload: object, database: str | Path) -> int:
         # relational row in the same transaction so removed faces cannot
         # survive a successful refresh.
         connection.execute("DELETE FROM collection_schedules")
+        connection.execute("DELETE FROM block_face_collection_states")
+        connection.execute("DELETE FROM unknown_block_faces")
         connection.execute("DELETE FROM block_face_lion_components")
         connection.execute("DELETE FROM block_face_dsny_sources")
         connection.execute("DELETE FROM block_faces_rtree")
@@ -207,8 +253,28 @@ def load_payload(payload: object, database: str | Path) -> int:
             connection.executemany(
                 """INSERT INTO collection_schedules
                 (block_face_id, collection_type, weekday, source, retrieved_at, validation_status)
-                VALUES (?, ?, ?, ?, ?, 'AUDITED_SIDE_TRACE_V2')""",
+                VALUES (?, ?, ?, ?, ?, 'AUDITED_SIDE_TRACE_V3')""",
                 schedule_rows,
+            )
+            connection.executemany(
+                """INSERT INTO block_face_collection_states
+                (block_face_id, collection_type, effective_days_json, state, source_field,
+                 raw_value, rule_id, source_policy_conflict, provenance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        feature.block_face_id,
+                        collection_type,
+                        _canonical_json(list(feature.schedules[collection_type])),
+                        feature.schedule_states[collection_type]["state"],
+                        feature.schedule_states[collection_type]["source_field"],
+                        feature.schedule_states[collection_type].get("raw_value"),
+                        feature.schedule_states[collection_type].get("rule_id"),
+                        int(bool(feature.schedule_states[collection_type].get("source_policy_conflict"))),
+                        feature.schedule_states[collection_type]["provenance"],
+                    )
+                    for collection_type in COLLECTION_TYPES
+                ],
             )
             connection.executemany(
                 """INSERT INTO block_face_dsny_sources
@@ -248,10 +314,41 @@ def load_payload(payload: object, database: str | Path) -> int:
             )
             if feature_number % PROGRESS_EVERY_FEATURES == 0 or feature_number == len(features):
                 LOGGER.info("SQLite load progress features=%s/%s", feature_number, len(features))
+        connection.executemany(
+            """INSERT INTO unknown_block_faces
+            (unknown_id, technical_identity, segment_id, borough, street_name, side,
+             reason_code, reason, identity_method, geometry_method, geometry_wkt,
+             min_x, min_y, max_x, max_y, evidence_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    item.unknown_id,
+                    item.technical_identity,
+                    item.segment_id,
+                    item.borough,
+                    item.street_name,
+                    item.side,
+                    item.reason_code,
+                    item.reason,
+                    item.identity_method,
+                    item.geometry_method,
+                    _compatible_wkt(item.geometry),
+                    *item.geometry.bounds,
+                    _canonical_json(item.evidence),
+                )
+                for item in unknown_features
+            ],
+        )
+        LOGGER.info("SQLite unknown-feature load complete features=%s", len(unknown_features))
     return len(features)
 
 
-def _validate_feature(feature: object, feature_number: int) -> ValidatedFeature:
+def _validate_feature(
+    feature: object,
+    feature_number: int,
+    *,
+    schema_revision: int = 2,
+) -> ValidatedFeature:
     if not isinstance(feature, dict) or feature.get("type") != "Feature":
         raise ValueError(f"feature {feature_number} must be a GeoJSON Feature")
     properties = feature.get("properties")
@@ -331,6 +428,12 @@ def _validate_feature(feature: object, feature_number: int) -> ValidatedFeature:
         )
         for collection_type in COLLECTION_TYPES
     }
+    schedule_states = _validate_schedule_states(
+        properties.get("schedule_states"),
+        schedules,
+        feature_number,
+        required=schema_revision >= 3,
+    )
     refuse_days = _validate_days(
         properties["refuse_days"],
         "refuse_days",
@@ -364,6 +467,7 @@ def _validate_feature(feature: object, feature_number: int) -> ValidatedFeature:
         side=side,
         geometry=geometry,
         schedules=schedules,
+        schedule_states=schedule_states,
         dsny_object_ids=dsny_object_ids,
         dsny_sources=dsny_sources,
         lion_components=lion_components,
@@ -393,6 +497,125 @@ def _validate_days(
     if len(value) != len(set(value)):
         raise ValueError(f"feature {feature_number} {field_name} contains duplicate weekdays")
     return tuple(day for day in DAY_ORDER if day in value)
+
+
+def _validate_schedule_states(
+    value: object,
+    schedules: dict[str, tuple[str, ...]],
+    feature_number: int,
+    *,
+    required: bool,
+) -> dict[str, dict[str, object]]:
+    if value is None and not required:
+        return {
+            collection_type: {
+                "state": "SOURCE_EXPLICIT" if schedules[collection_type] else "UNKNOWN_SOURCE_BLANK",
+                "source_field": SCHEDULE_FIELDS[collection_type],
+                "raw_value": ",".join(schedules[collection_type]) or None,
+                "rule_id": None,
+                "source_policy_conflict": False,
+                "provenance": "Legacy v2 processed artifact",
+            }
+            for collection_type in COLLECTION_TYPES
+        }
+    if not isinstance(value, dict) or set(value) != set(COLLECTION_TYPES):
+        raise ValueError(
+            f"feature {feature_number} schedule_states must contain exactly "
+            f"{', '.join(COLLECTION_TYPES)}"
+        )
+    validated: dict[str, dict[str, object]] = {}
+    for collection_type in COLLECTION_TYPES:
+        record = value[collection_type]
+        if not isinstance(record, dict):
+            raise ValueError(f"feature {feature_number} schedule_states.{collection_type} must be an object")
+        state = record.get("state")
+        source_field = record.get("source_field")
+        if state not in SCHEDULE_STATES or source_field != SCHEDULE_FIELDS[collection_type]:
+            raise ValueError(f"feature {feature_number} has invalid {collection_type} schedule state")
+        rule_id = record.get("rule_id")
+        raw_value = record.get("raw_value")
+        conflict = record.get("source_policy_conflict", False)
+        provenance = record.get("provenance")
+        if not isinstance(conflict, bool) or not isinstance(provenance, str) or not provenance.strip():
+            raise ValueError(f"feature {feature_number} has invalid {collection_type} provenance")
+        days = schedules[collection_type]
+        if state == "SOURCE_EXPLICIT" and (not days or not isinstance(raw_value, str) or not raw_value.strip()):
+            raise ValueError(f"feature {feature_number} explicit {collection_type} requires days and raw value")
+        if state == "UNKNOWN_SOURCE_BLANK" and (days or raw_value is not None or rule_id is not None):
+            raise ValueError(f"feature {feature_number} unknown {collection_type} must have no days/value/rule")
+        if state == "POLICY_DERIVED":
+            if (
+                collection_type != "ORGANICS"
+                or rule_id != ORGANICS_POLICY_RULE_ID
+                or raw_value is not None
+                or not days
+                or days != schedules["RECYCLING"]
+            ):
+                raise ValueError(f"feature {feature_number} has invalid policy-derived schedule")
+        if state == "NO_SERVICE":
+            raise ValueError("NO_SERVICE is reserved and cannot appear in current releases")
+        if conflict and not (collection_type == "ORGANICS" and state == "SOURCE_EXPLICIT"):
+            raise ValueError(f"feature {feature_number} has invalid source_policy_conflict flag")
+        validated[collection_type] = {
+            "state": state,
+            "source_field": source_field,
+            "raw_value": raw_value,
+            "rule_id": rule_id,
+            "source_policy_conflict": conflict,
+            "provenance": provenance.strip(),
+        }
+    return validated
+
+
+def _validate_unknown_feature(feature: object, feature_number: int) -> ValidatedUnknownFeature:
+    if not isinstance(feature, dict) or feature.get("type") != "Feature":
+        raise ValueError(f"unknown feature {feature_number} must be a GeoJSON Feature")
+    properties = feature.get("properties")
+    if not isinstance(properties, dict):
+        raise ValueError(f"unknown feature {feature_number} properties must be an object")
+    forbidden = {"schedules", "refuse_days", "recycling_days", "organics_days", "bulk_days"}
+    if forbidden & set(properties):
+        raise ValueError(f"unknown feature {feature_number} may not contain collection schedules")
+    reason_code = properties.get("reason_code")
+    if reason_code not in {
+        "INSUFFICIENT_ADDRESS_EVIDENCE",
+        "OUTSIDE_DSNY_COVERAGE",
+        "PARTIAL_GEOMETRY_GAP",
+    }:
+        raise ValueError(f"unknown feature {feature_number} has invalid reason_code")
+    side = str(properties.get("side", "")).upper()
+    if side not in {"LEFT", "RIGHT"}:
+        raise ValueError(f"unknown feature {feature_number} has invalid side")
+    evidence = properties.get("evidence", {})
+    if not isinstance(evidence, dict):
+        raise ValueError(f"unknown feature {feature_number} evidence must be an object")
+    try:
+        geometry = shape(feature["geometry"])
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"unknown feature {feature_number} has invalid geometry: {error}") from None
+    if geometry.geom_type not in {"LineString", "MultiLineString"} or geometry.is_empty or not geometry.is_valid:
+        raise ValueError(f"unknown feature {feature_number} must have valid line geometry")
+    return ValidatedUnknownFeature(
+        unknown_id=_required_text(properties.get("unknown_id"), "unknown_id", feature_number),
+        technical_identity=_optional_text(properties.get("technical_identity")),
+        segment_id=str(properties.get("segment_id") or ""),
+        borough=_optional_text(properties.get("borough")),
+        street_name=_required_text(properties.get("street_name"), "street_name", feature_number),
+        side=side,
+        reason_code=str(reason_code),
+        reason=_required_text(properties.get("reason"), "reason", feature_number),
+        identity_method=_required_text(properties.get("identity_method"), "identity_method", feature_number),
+        geometry_method=_required_text(properties.get("geometry_method"), "geometry_method", feature_number),
+        geometry=geometry,
+        evidence=evidence,
+    )
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _segment_ids(properties: dict[str, object], feature_number: int) -> tuple[str, ...]:
@@ -649,6 +872,12 @@ def _conflicting_fields(group: list[ValidatedFeature]) -> list[str]:
     }
     if len(schedule_signatures) > 1:
         conflicts.append("schedules")
+    state_signatures = {
+        _canonical_json(item.schedule_states)
+        for item in group
+    }
+    if len(state_signatures) > 1:
+        conflicts.append("schedule_states")
     return conflicts
 
 

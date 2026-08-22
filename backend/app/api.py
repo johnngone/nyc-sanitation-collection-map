@@ -64,6 +64,9 @@ def _unavailable_map_config() -> dict[str, object]:
         "tile_schema_revision": None,
         "tiles_url": None,
         "source_layer": "collection_streets",
+        "known_source_layer": "collection_streets",
+        "unknown_source_layer": None,
+        "unknown_minzoom": None,
         "minzoom": None,
         "maxzoom": None,
         "bounds": None,
@@ -110,6 +113,9 @@ def map_config() -> JSONResponse:
             "tile_schema_revision": metadata.tile_schema_revision,
             "tiles_url": f"/api/tiles/{metadata.version}/{{z}}/{{x}}/{{y}}.pbf",
             "source_layer": metadata.source_layer,
+            "known_source_layer": metadata.source_layer,
+            "unknown_source_layer": metadata.unknown_source_layer,
+            "unknown_minzoom": metadata.unknown_minzoom,
             "minzoom": metadata.minzoom,
             "maxzoom": metadata.maxzoom,
             "bounds": list(metadata.bounds),
@@ -215,9 +221,11 @@ def health() -> dict[str, object]:
         except (FileNotFoundError, OSError, sqlite3.Error, ValueError):
             LOGGER.exception("Health check could not validate committed tileset metadata")
             raise HTTPException(status_code=503, detail="Committed tileset metadata is invalid") from None
+        manifest_version = release.manifest.get("manifest_version")
+        expected_tile_revision = 3 if manifest_version == 3 else 2
         if (
             tile_metadata.version != release.dataset_version
-            or tile_metadata.tile_schema_revision != 2
+            or tile_metadata.tile_schema_revision != expected_tile_revision
         ):
             raise HTTPException(status_code=503, detail="Committed tileset release binding is invalid")
     else:
@@ -245,10 +253,37 @@ def health() -> dict[str, object]:
                         "SELECT collection_type, COUNT(*) FROM collection_schedules GROUP BY collection_type"
                     )
                 }
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            schedule_state_counts: dict[str, dict[str, int]] = {}
+            unresolved_counts: dict[str, int] = {}
+            policy_conflicts = 0
+            if "block_face_collection_states" in tables:
+                for collection_type, state, state_count in connection.execute(
+                    """SELECT collection_type, state, COUNT(*)
+                       FROM block_face_collection_states
+                       GROUP BY collection_type, state"""
+                ):
+                    schedule_state_counts.setdefault(str(collection_type), {})[str(state)] = int(state_count)
+                policy_conflicts = int(connection.execute(
+                    "SELECT COUNT(*) FROM block_face_collection_states WHERE source_policy_conflict = 1"
+                ).fetchone()[0])
+            if "unknown_block_faces" in tables:
+                unresolved_counts = {
+                    str(reason): int(reason_count)
+                    for reason, reason_count in connection.execute(
+                        "SELECT reason_code, COUNT(*) FROM unknown_block_faces GROUP BY reason_code"
+                    )
+                }
     except sqlite3.Error:
         LOGGER.exception("Health check could not inspect the local database")
         raise
     quality = metadata.get("ingestion_audit")
+    quality_record = quality if isinstance(quality, dict) else {}
     return {
         "status": "ok",
         "environment": APP_ENV,
@@ -258,6 +293,13 @@ def health() -> dict[str, object]:
         "data_manifest": metadata.get("manifest_version"),
         "dataset_version": metadata.get("dataset_version"),
         "data_quality": quality if isinstance(quality, dict) else None,
+        "schedule_state_counts": schedule_state_counts,
+        "source_versions": metadata.get("source_versions", {}),
+        "recovery_counts": metadata.get("recovery_counts", {"identity_promoted": 0, "geometry_promoted": 0}),
+        "unresolved_counts": unresolved_counts,
+        "policy_conflicts": policy_conflicts,
+        "policy_rule_version": quality_record.get("policy_rule_version"),
+        "quality_status": quality_record.get("quality_status", "legacy_verified"),
         "map_available": tileset_path.is_file(),
         "artifact_integrity": "verified" if release is not None else "legacy-unverified",
     }

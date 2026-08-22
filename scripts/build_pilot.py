@@ -17,7 +17,7 @@ import re
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Iterable
@@ -69,6 +69,19 @@ SCHEDULE_FIELDS = {
     "ORGANICS": "FREQ_ORGANICS",
     "BULK": "FREQ_BULK",
 }
+SCHEDULE_STATES = {
+    "SOURCE_EXPLICIT",
+    "POLICY_DERIVED",
+    "UNKNOWN_SOURCE_BLANK",
+    "NO_SERVICE",
+}
+ORGANICS_POLICY_RULE_ID = "dsny-organics-on-recycling-day-v1"
+ORGANICS_POLICY_PROVENANCE = (
+    "NYC DSNY citywide curbside compost collection occurs on the recycling day"
+)
+ORGANICS_POLICY_REVIEWED_ON = date(2026, 8, 21)
+ORGANICS_POLICY_WARN_AFTER = ORGANICS_POLICY_REVIEWED_ON + timedelta(days=180)
+ORGANICS_POLICY_BLOCK_AFTER = ORGANICS_POLICY_REVIEWED_ON + timedelta(days=365)
 FREQUENCY_ID_FIELD_NAMES = ("OBJECTID", "ObjectID", "objectid")
 BOROUGHS = {
     1: "MANHATTAN",
@@ -127,6 +140,7 @@ class SideResult:
     status: str = "pending"
     reason: str | None = None
     details: dict[str, object] = field(default_factory=dict)
+    unknown_geometry: BaseGeometry | None = field(default=None, repr=False)
 
     def audit_record(self) -> dict[str, object]:
         record: dict[str, object] = {
@@ -154,6 +168,7 @@ class SideCandidate:
     side: str
     geometry: BaseGeometry
     schedules: dict[str, tuple[str, ...]]
+    schedule_states: dict[str, dict[str, object]]
     frequency_rows: tuple[int, ...]
     dsny_object_ids: tuple[str, ...]
     source_rows: tuple[int, ...]
@@ -231,6 +246,16 @@ def build_collection_features(
         raise ValueError("side_offset_feet must be a positive finite number")
     if not math.isfinite(trace_tolerance_feet) or trace_tolerance_feet < 0:
         raise ValueError("trace_tolerance_feet must be a finite non-negative number")
+    today = date.today()
+    if today > ORGANICS_POLICY_BLOCK_AFTER:
+        raise ValueError(
+            "Organics policy rule review is more than 365 days old; publication is blocked"
+        )
+    if today > ORGANICS_POLICY_WARN_AFTER:
+        LOGGER.warning(
+            "Organics policy rule review is older than 180 days reviewed_on=%s",
+            ORGANICS_POLICY_REVIEWED_ON,
+        )
     if lion.crs is None or frequencies.crs is None:
         raise ValueError("both inputs must declare a coordinate reference system")
 
@@ -270,6 +295,7 @@ def build_collection_features(
     if frequency_id_field is None:
         missing_source_fields.append("OBJECTID")
     parsed_schedules: dict[int, dict[str, tuple[str, ...]]] = {}
+    parsed_schedule_states: dict[int, dict[str, dict[str, object]]] = {}
     frequency_object_ids: dict[int, str] = {}
     frequency_sources: dict[int, dict[str, object]] = {}
     invalid_frequency_rows: dict[int, list[str]] = {}
@@ -285,7 +311,12 @@ def build_collection_features(
             for position in range(len(frequencies_working))
         }
     else:
-        parsed_schedules, invalid_frequency_rows, frequency_object_ids = _parse_frequency_rows(
+        (
+            parsed_schedules,
+            parsed_schedule_states,
+            invalid_frequency_rows,
+            frequency_object_ids,
+        ) = _parse_frequency_rows(
             frequencies_working,
             frequency_id_field,
         )
@@ -331,6 +362,11 @@ def build_collection_features(
                 block_face_id=block_face_id,
             )
             side_results.append(result)
+            result.details.update({
+                "street_name": street_name,
+                "technical_identity": f"LION:{segment_id}:{side}" if segment_id else None,
+                "source_block_face_id": raw_block_face_id or None,
+            })
 
             if used_fallback_id:
                 result.details.update({
@@ -342,9 +378,19 @@ def build_collection_features(
                     "address_range": dict(address_ranges[0]),
                     "address_ranges": [dict(address_range) for address_range in address_ranges],
                 })
+                result.status = "non_addressable"
+                result.reason = (
+                    "LION block-face identity is missing; address-range evidence alone is not "
+                    "sufficient for schedule promotion"
+                )
+                if geometry is not None and not geometry.is_empty:
+                    result.unknown_geometry = geometry
+                continue
             elif _is_non_addressable(row.get(id_field)):
                 result.status = "non_addressable"
                 result.reason = f"{id_field} is missing/zero and the side has no usable address range"
+                if geometry is not None and not geometry.is_empty:
+                    result.unknown_geometry = geometry
                 continue
             if missing_source_fields:
                 result.status = "invalid"
@@ -364,6 +410,7 @@ def build_collection_features(
                 result.reason = "missing segment ID"
                 continue
             borough = prepared.boroughs_by_side[side]
+            result.details["borough"] = borough
             if borough is None:
                 if prepared.boundary_out_of_scope_by_side[side]:
                     result.status = "out_of_scope"
@@ -408,6 +455,7 @@ def build_collection_features(
                 result.status = "outside_schedule_area"
                 result.reason = "side-offset trace did not overlap a frequency polygon"
                 result.details["trace_length_feet"] = trace_length
+                result.unknown_geometry = geometry
                 continue
             invalid_matches = [frequency_row for frequency_row in match_rows if frequency_row in invalid_frequency_rows]
             if invalid_matches:
@@ -440,6 +488,14 @@ def build_collection_features(
                     "uncovered_trace_feet": uncovered_trace_feet,
                     "coverage_ratio": covered_trace_feet / trace_length,
                 })
+                covered_source = unary_union([
+                    matches[frequency_row].source_geometry
+                    for frequency_row in match_rows
+                ])
+                unknown_geometry = geometry.difference(covered_source)
+                unknown_parts = _line_parts(unknown_geometry)
+                if unknown_parts:
+                    result.unknown_geometry = combine_line_geometries(unknown_parts)
             overlap_details = [
                 {
                     "frequency_row": frequency_row,
@@ -450,10 +506,13 @@ def build_collection_features(
                         kind: list(parsed_schedules[frequency_row][kind])
                         for kind in SCHEDULE_FIELDS
                     },
+                    "schedule_states": parsed_schedule_states[frequency_row],
                 }
                 for frequency_row in match_rows
             ]
-            conflicting_overlaps = _conflicting_frequency_overlaps(matches, parsed_schedules)
+            conflicting_overlaps = _conflicting_frequency_overlaps(
+                matches, parsed_schedules, parsed_schedule_states
+            )
             if conflicting_overlaps:
                 result.status = "ambiguous"
                 result.reason = "conflicting frequency polygons overlap the same positive-length side trace"
@@ -464,11 +523,11 @@ def build_collection_features(
                     for frequency_row in match_rows
                 })
                 continue
-            rows_by_schedule: dict[tuple[tuple[str, tuple[str, ...]], ...], list[int]] = defaultdict(list)
+            rows_by_schedule: dict[tuple[tuple[object, ...], ...], list[int]] = defaultdict(list)
             for frequency_row in match_rows:
-                signature = tuple(
-                    (kind, parsed_schedules[frequency_row][kind])
-                    for kind in SCHEDULE_FIELDS
+                signature = _schedule_signature(
+                    parsed_schedules[frequency_row],
+                    parsed_schedule_states[frequency_row],
                 )
                 rows_by_schedule[signature].append(frequency_row)
             result.details["matched_schedule_components"] = len(rows_by_schedule)
@@ -496,7 +555,11 @@ def build_collection_features(
                     borough=borough,
                     side=side,
                     geometry=component_geometry,
-                    schedules={kind: days for kind, days in signature},
+                    schedules={kind: parsed_schedules[schedule_rows[0]][kind] for kind in SCHEDULE_FIELDS},
+                    schedule_states={
+                        kind: dict(parsed_schedule_states[schedule_rows[0]][kind])
+                        for kind in SCHEDULE_FIELDS
+                    },
                     frequency_rows=schedule_rows,
                     dsny_object_ids=matched_object_ids,
                     source_rows=tuple(sorted((source_row, *prepared.alias_source_rows))),
@@ -538,11 +601,11 @@ def build_collection_features(
             key=lambda candidate: (candidate.segment_id, candidate.result.source_row, candidate.side),
         )
         groups_by_identity: dict[
-            tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
+            tuple[str, tuple[tuple[object, ...], ...]],
             list[SideCandidate],
         ] = defaultdict(list)
         for candidate in origin_group:
-            signature = tuple((kind, candidate.schedules[kind]) for kind in SCHEDULE_FIELDS)
+            signature = _schedule_signature(candidate.schedules, candidate.schedule_states)
             groups_by_identity[(candidate.borough, signature)].append(candidate)
         if len(groups_by_identity) > 1:
             split_feature_groups += 1
@@ -601,6 +664,9 @@ def build_collection_features(
                 for candidate in group
             ]
             schedules = {kind: list(first.schedules[kind]) for kind in SCHEDULE_FIELDS}
+            schedule_states = {
+                kind: dict(first.schedule_states[kind]) for kind in SCHEDULE_FIELDS
+            }
             output_geometry = transform(to_wgs84.transform, combined_geometry)
             output_features.append({
                 "type": "Feature",
@@ -620,6 +686,9 @@ def build_collection_features(
                     "lion_components": lion_components,
                     "refuse_days": schedules["REFUSE"],
                     "schedules": schedules,
+                    "schedule_states": schedule_states,
+                    "identity_method": "LION_BLOCK_FACE_ID",
+                    "geometry_method": "DIRECT_SIDE_TRACE",
                     "dsny_object_ids": dsny_object_ids,
                     "dsny_sources": dsny_sources,
                     "source": "DSNY Frequencies",
@@ -627,7 +696,50 @@ def build_collection_features(
                 },
             })
 
-    payload = {"type": "FeatureCollection", "features": output_features}
+    unknown_features: list[dict[str, object]] = []
+    for result in side_results:
+        if result.status not in {
+            "non_addressable",
+            "outside_schedule_area",
+            "partially_outside_schedule_area",
+        } or result.unknown_geometry is None or result.unknown_geometry.is_empty:
+            continue
+        unknown_geometry = transform(to_wgs84.transform, result.unknown_geometry)
+        reason_code = {
+            "non_addressable": "INSUFFICIENT_ADDRESS_EVIDENCE",
+            "outside_schedule_area": "OUTSIDE_DSNY_COVERAGE",
+            "partially_outside_schedule_area": "PARTIAL_GEOMETRY_GAP",
+        }[result.status]
+        unknown_id = f"UNKNOWN:{result.source_row}:{result.side}:{reason_code}"
+        unknown_features.append({
+            "type": "Feature",
+            "geometry": mapping(unknown_geometry),
+            "properties": {
+                "unknown_id": unknown_id,
+                "technical_identity": result.details.get("technical_identity"),
+                "segment_id": result.segment_id,
+                "side": result.side,
+                "street_name": result.details.get("street_name") or "Unknown street",
+                "borough": result.details.get("borough"),
+                "reason_code": reason_code,
+                "reason": result.reason,
+                "identity_method": (
+                    "UNRESOLVED" if reason_code == "INSUFFICIENT_ADDRESS_EVIDENCE"
+                    else "LION_BLOCK_FACE_ID"
+                ),
+                "geometry_method": "DIRECT_SIDE_TRACE_UNRESOLVED",
+                "evidence": {
+                    key: value for key, value in result.details.items()
+                    if key not in {"street_name", "borough"}
+                },
+            },
+        })
+    payload = {
+        "type": "FeatureCollection",
+        "schema_revision": 3,
+        "features": output_features,
+        "unknown_features": unknown_features,
+    }
     audit = _build_audit(
         source_rows=source_rows,
         frequency_rows=len(frequencies_working),
@@ -646,6 +758,8 @@ def build_collection_features(
         source_row_outcomes=source_row_outcomes,
         lion_preparation=lion_preparation,
         frequency_schedule_empty_rows=frequency_schedule_empty_rows,
+        parsed_schedule_states=parsed_schedule_states,
+        unknown_features=len(unknown_features),
         split_feature_groups=split_feature_groups,
         split_output_features=split_output_features,
         borough_split_feature_groups=borough_split_feature_groups,
@@ -1086,10 +1200,12 @@ def _parse_frequency_rows(
     frequency_id_field: str,
 ) -> tuple[
     dict[int, dict[str, tuple[str, ...]]],
+    dict[int, dict[str, dict[str, object]]],
     dict[int, list[str]],
     dict[int, str],
 ]:
     parsed: dict[int, dict[str, tuple[str, ...]]] = {}
+    parsed_states: dict[int, dict[str, dict[str, object]]] = {}
     invalid: dict[int, list[str]] = {}
     object_ids: dict[int, str] = {}
     rows_by_object_id: dict[str, list[int]] = defaultdict(list)
@@ -1105,22 +1221,69 @@ def _parse_frequency_rows(
         if geometry is None or geometry.is_empty or not geometry.is_valid or geometry.geom_type not in {"Polygon", "MultiPolygon"}:
             errors.append("frequency geometry must be a valid non-empty Polygon or MultiPolygon")
         schedules: dict[str, tuple[str, ...]] = {}
+        states: dict[str, dict[str, object]] = {}
         for collection_type, field_name in SCHEDULE_FIELDS.items():
             value = row.get(field_name)
             if _is_missing(value) or (isinstance(value, str) and not value.strip()):
                 if collection_type == "REFUSE":
                     errors.append(f"{field_name}: missing explicit schedule")
                 schedules[collection_type] = ()
+                states[collection_type] = {
+                    "state": "UNKNOWN_SOURCE_BLANK",
+                    "source_field": field_name,
+                    "raw_value": None,
+                    "rule_id": None,
+                    "source_policy_conflict": False,
+                    "provenance": "DSNY source field is blank",
+                }
                 continue
             try:
                 schedules[collection_type] = tuple(normalize_days(value))
+                states[collection_type] = {
+                    "state": "SOURCE_EXPLICIT",
+                    "source_field": field_name,
+                    "raw_value": str(value).strip(),
+                    "rule_id": None,
+                    "source_policy_conflict": False,
+                    "provenance": "DSNY Frequencies source value",
+                }
             except ValueError as error:
                 errors.append(f"{field_name}: {error}")
                 schedules[collection_type] = ()
+                states[collection_type] = {
+                    "state": "UNKNOWN_SOURCE_BLANK",
+                    "source_field": field_name,
+                    "raw_value": str(value),
+                    "rule_id": None,
+                    "source_policy_conflict": False,
+                    "provenance": "Invalid DSNY source value",
+                }
+        organics = states["ORGANICS"]
+        recycling = states["RECYCLING"]
+        if (
+            organics["state"] == "UNKNOWN_SOURCE_BLANK"
+            and recycling["state"] == "SOURCE_EXPLICIT"
+        ):
+            schedules["ORGANICS"] = schedules["RECYCLING"]
+            states["ORGANICS"] = {
+                "state": "POLICY_DERIVED",
+                "source_field": SCHEDULE_FIELDS["ORGANICS"],
+                "raw_value": None,
+                "rule_id": ORGANICS_POLICY_RULE_ID,
+                "source_policy_conflict": False,
+                "provenance": ORGANICS_POLICY_PROVENANCE,
+            }
+        elif (
+            organics["state"] == "SOURCE_EXPLICIT"
+            and recycling["state"] == "SOURCE_EXPLICIT"
+            and schedules["ORGANICS"] != schedules["RECYCLING"]
+        ):
+            states["ORGANICS"]["source_policy_conflict"] = True
         if errors:
             invalid[int(position)] = errors
         else:
             parsed[int(position)] = schedules
+            parsed_states[int(position)] = states
     for object_id, positions in rows_by_object_id.items():
         if len(positions) <= 1:
             continue
@@ -1129,7 +1292,26 @@ def _parse_frequency_rows(
                 f"duplicate DSNY source OBJECTID {object_id!r} appears in rows {positions}"
             )
             parsed.pop(position, None)
-    return parsed, invalid, object_ids
+            parsed_states.pop(position, None)
+    return parsed, parsed_states, invalid, object_ids
+
+
+def _schedule_signature(
+    schedules: dict[str, tuple[str, ...]],
+    states: dict[str, dict[str, object]],
+) -> tuple[tuple[object, ...], ...]:
+    """Keep equal weekdays with different evidence in separate semantic groups."""
+
+    return tuple(
+        (
+            collection_type,
+            schedules[collection_type],
+            states[collection_type]["state"],
+            states[collection_type].get("rule_id"),
+            bool(states[collection_type].get("source_policy_conflict")),
+        )
+        for collection_type in SCHEDULE_FIELDS
+    )
 
 
 def _frequency_schedule_empty_rows(frequencies: gpd.GeoDataFrame) -> dict[str, int]:
@@ -1497,13 +1679,14 @@ def _line_parts(geometry: BaseGeometry) -> list[LineString]:
 def _conflicting_frequency_overlaps(
     matches: dict[int, FrequencyTraceMatch],
     schedules: dict[int, dict[str, tuple[str, ...]]],
+    states: dict[int, dict[str, dict[str, object]]],
 ) -> list[tuple[int, int]]:
     rows = sorted(matches)
     conflicting: list[tuple[int, int]] = []
     for offset, left_row in enumerate(rows):
-        left_signature = tuple((kind, schedules[left_row][kind]) for kind in SCHEDULE_FIELDS)
+        left_signature = _schedule_signature(schedules[left_row], states[left_row])
         for right_row in rows[offset + 1:]:
-            right_signature = tuple((kind, schedules[right_row][kind]) for kind in SCHEDULE_FIELDS)
+            right_signature = _schedule_signature(schedules[right_row], states[right_row])
             if left_signature == right_signature:
                 continue
             try:
@@ -1528,12 +1711,12 @@ def _frequency_id_field(columns: Iterable[object]) -> str | None:
 def _split_feature_key(
     origin_block_face_id: str,
     borough: str,
-    schedule_signature: tuple[tuple[str, tuple[str, ...]], ...],
+    schedule_signature: tuple[tuple[object, ...], ...],
 ) -> str:
     encoded = json.dumps(
         {
             "borough": borough,
-            "schedules": {kind: list(days) for kind, days in schedule_signature},
+            "schedule_signature": schedule_signature,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1608,6 +1791,8 @@ def _build_audit(
     source_row_outcomes: dict[str, int],
     lion_preparation: dict[str, object],
     frequency_schedule_empty_rows: dict[str, int],
+    parsed_schedule_states: dict[int, dict[str, dict[str, object]]],
+    unknown_features: int,
     split_feature_groups: int,
     split_output_features: int,
     borough_split_feature_groups: int,
@@ -1670,8 +1855,22 @@ def _build_audit(
         )
     ]
     records.extend(unused_frequency_records)
+    schedule_state_counts = {
+        collection_type: {
+            state: sum(
+                row_states[collection_type]["state"] == state
+                for row_states in parsed_schedule_states.values()
+            )
+            for state in sorted(SCHEDULE_STATES)
+        }
+        for collection_type in SCHEDULE_FIELDS
+    }
+    policy_conflicts = sum(
+        bool(row_states["ORGANICS"].get("source_policy_conflict"))
+        for row_states in parsed_schedule_states.values()
+    )
     return {
-        "audit_version": 2,
+        "audit_version": 3,
         "generated_at": datetime.now(UTC).isoformat(),
         "working_crs": WORKING_CRS,
         "side_offset_feet": side_offset_feet,
@@ -1735,6 +1934,14 @@ def _build_audit(
         },
         "frequency_outcomes": frequency_outcomes,
         "frequency_schedule_empty_rows": frequency_schedule_empty_rows,
+        "schedule_state_counts": schedule_state_counts,
+        "policy_conflicts": policy_conflicts,
+        "policy_rule_version": ORGANICS_POLICY_RULE_ID,
+        "policy_rule_reviewed_on": ORGANICS_POLICY_REVIEWED_ON.isoformat(),
+        "policy_rule_warn_after": ORGANICS_POLICY_WARN_AFTER.isoformat(),
+        "policy_rule_block_after": ORGANICS_POLICY_BLOCK_AFTER.isoformat(),
+        "unknown_features": unknown_features,
+        "quality_status": "verified_with_known_gaps",
         "valid_frequency_rows": len(valid_frequency_rows),
         "used_valid_frequency_rows": len(used_valid_rows),
         "unused_valid_frequency_rows": len(unused_valid_rows),

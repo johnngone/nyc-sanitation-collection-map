@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import zipfile
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,11 +29,23 @@ from scripts.release_validation import (
     validate_tile_build_report,
     validate_tileset,
 )
+from backend.app.releases import MANIFEST_VERSION
+from scripts.recovery_shadow import (
+    GEOMETRY_RULE_VERSION,
+    identity_shadow_report,
+    metadata_release_identifier,
+    source_release_identifier,
+)
 
 LOGGER = logging.getLogger("run_refresh")
 DSNY_LAYER = "https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0"
 DSNY_QUERY = f"{DSNY_LAYER}/query"
 LION_URL = "https://data.cityofnewyork.us/download/2v4z-66xt/application/zip"
+PAD_URL = "https://data.cityofnewyork.us/download/bc8t-ecyu/application/zip"
+ADDRESSPOINT_METADATA_URL = "https://data.cityofnewyork.us/api/views/6xyb-j5pk"
+LION_METADATA_URL = "https://data.cityofnewyork.us/api/views/2v4z-66xt"
+PAD_METADATA_URL = "https://data.cityofnewyork.us/api/views/bc8t-ecyu"
+CSCL_METADATA_URL = "https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/cscl/FeatureServer/1"
 USER_AGENT = "nyc-sanitation-map/1.0"
 DOWNLOAD_PROGRESS_BYTES = 16 * 1024 * 1024
 DOWNLOAD_PROGRESS_SECONDS = 30.0
@@ -339,6 +352,23 @@ def _artifact(path: Path, **metadata: object) -> dict[str, object]:
     return {"path": path.name, "sha256": file_sha256(path), **metadata}
 
 
+def _remote_metadata(url: str) -> dict[str, object]:
+    with httpx.Client(timeout=60, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+        response = client.get(url, params={"f": "json"} if "FeatureServer" in url else None)
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"source metadata is not an object url={url}")
+    return {
+        key: payload.get(key)
+        for key in (
+            "id", "name", "description", "blobFilename", "blobFileSize",
+            "rowsUpdatedAt", "dataUpdatedAt", "lastEditDate", "editingInfo",
+        )
+        if key in payload
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--status", action="store_true")
@@ -394,6 +424,7 @@ def main() -> None:
         bundle.mkdir()
         dsny = bundle / "dsny_frequencies.geojson"
         lion_zip = bundle / "lion.zip"
+        pad_zip = bundle / "pad.zip"
         LOGGER.info("Stage 1/8: downloading complete DSNY frequency layer")
         dsny_source_audit = download_dsny(dsny)
         LOGGER.info(
@@ -404,8 +435,25 @@ def main() -> None:
         LOGGER.info("Stage 2/8: downloading complete LION archive")
         lion_source_audit = download_file(LION_URL, lion_zip)
         LOGGER.info("Stage 2/8 complete: LION archive bytes=%s", _format_bytes(int(lion_source_audit["bytes"])))
+        LOGGER.info("Stage 2/8: downloading complete PAD archive for shadow identity audit")
+        pad_source_audit = download_file(PAD_URL, pad_zip)
+        LOGGER.info("Stage 2/8 complete: PAD archive bytes=%s", _format_bytes(int(pad_source_audit["bytes"])))
         LOGGER.info("Stage 3/8: hashing and extracting LION archive")
-        input_hashes = {"dsny": file_sha256(dsny), "lion": file_sha256(lion_zip)}
+        input_hashes = {
+            "dsny": file_sha256(dsny),
+            "lion": file_sha256(lion_zip),
+            "pad": file_sha256(pad_zip),
+        }
+        lion_metadata = _remote_metadata(LION_METADATA_URL)
+        pad_metadata = _remote_metadata(PAD_METADATA_URL)
+        with zipfile.ZipFile(lion_zip) as archive:
+            lion_release = source_release_identifier(archive.namelist(), "lion")
+        with zipfile.ZipFile(pad_zip) as archive:
+            pad_release = source_release_identifier(archive.namelist(), "pad")
+        lion_catalog_release = metadata_release_identifier(lion_metadata)
+        pad_catalog_release = metadata_release_identifier(pad_metadata)
+        addresspoint_before = _remote_metadata(ADDRESSPOINT_METADATA_URL)
+        cscl_metadata = _remote_metadata(CSCL_METADATA_URL)
         extracted = staging / "lion-extracted"
         shutil.unpack_archive(lion_zip, extracted)
         geodatabases = sorted(extracted.rglob("*.gdb"))
@@ -441,9 +489,76 @@ def main() -> None:
         stage_started = monotonic()
         subprocess.run(command, check=True)
         LOGGER.info("Stage 4/8 complete elapsed_s=%.1f", monotonic() - stage_started)
+        addresspoint_after = _remote_metadata(ADDRESSPOINT_METADATA_URL)
+        identity_report = identity_shadow_report(
+            lion_release=lion_release,
+            pad_release=pad_release,
+            addresspoint_metadata_before=addresspoint_before,
+            addresspoint_metadata_after=addresspoint_after,
+        )
+        addresspoint_report = {
+            "report_version": 1,
+            "mode": "shadow",
+            "dataset": "6xyb-j5pk",
+            "metadata_before": addresspoint_before,
+            "metadata_after": addresspoint_after,
+            "requested_candidate_count": 0,
+            "returned_count": 0,
+            "object_ids": [],
+            "count_verified": True,
+            "object_id_set_verified": True,
+            "pagination_verified": True,
+            "skipped_reason": identity_report["blocking_reasons"][0],
+        }
+        cscl_report = {
+            "report_version": 1,
+            "rule_version": GEOMETRY_RULE_VERSION,
+            "mode": "shadow",
+            "source_metadata": cscl_metadata,
+            "candidate_count": 0,
+            "evaluated_count": 0,
+            "evaluation_status": "PENDING_STABILITY_AND_MANUAL_REVIEW",
+            "promoted_count": 0,
+            "promotion_enabled": False,
+            "blocking_reasons": ["TWO_STABLE_SHADOW_BUILDS_REQUIRED", "BOROUGH_STRATIFIED_REVIEW_REQUIRED"],
+        }
+        recovery_report = {
+            "report_version": 1,
+            "identity": identity_report,
+            "geometry": cscl_report,
+            "fully_outside_promotion_enabled": False,
+            "fully_outside_blocking_reason": "NO_DOCUMENTED_PUBLIC_DSNY_ADDRESS_LOOKUP_CONTRACT",
+        }
+        atomic_json(bundle / "addresspoint_query_report.json", addresspoint_report)
+        atomic_json(bundle / "cscl_alignment_report.json", cscl_report)
+        atomic_json(bundle / "recovery_shadow_report.json", recovery_report)
         LOGGER.info("Stage 5/8: validating audited GeoJSON and provenance")
         stage_started = monotonic()
         processed_summary = validate_processed_geojson(processed)
+        processed_payload = json.loads(processed.read_text(encoding="utf-8"))
+        unknown_records = processed_payload.get("unknown_features", [])
+        if not isinstance(unknown_records, list):
+            raise RuntimeError("processed unknown_features must be a list")
+        unknown_reason_counts: dict[str, int] = {}
+        for feature in unknown_records:
+            properties = feature.get("properties") if isinstance(feature, dict) else None
+            if not isinstance(properties, dict):
+                raise RuntimeError("processed unknown feature is malformed")
+            reason_code = str(properties.get("reason_code", ""))
+            unknown_reason_counts[reason_code] = unknown_reason_counts.get(reason_code, 0) + 1
+        identity_report["candidate_count"] = unknown_reason_counts.get(
+            "INSUFFICIENT_ADDRESS_EVIDENCE", 0
+        )
+        cscl_report["candidate_count"] = unknown_reason_counts.get("PARTIAL_GEOMETRY_GAP", 0)
+        addresspoint_report["shadow_input_candidate_count"] = identity_report["candidate_count"]
+        recovery_report["unknown_reason_counts"] = unknown_reason_counts
+        atomic_json(bundle / "addresspoint_query_report.json", addresspoint_report)
+        atomic_json(bundle / "cscl_alignment_report.json", cscl_report)
+        atomic_json(bundle / "recovery_shadow_report.json", recovery_report)
+        atomic_json(
+            bundle / "unknown_block_faces.geojson",
+            {"type": "FeatureCollection", "features": processed_payload.get("unknown_features", [])},
+        )
         ingestion_audit = validate_ingestion_audit(
             staged_audit,
             expected_processed_sha256=processed_summary["sha256"],
@@ -556,7 +671,28 @@ def main() -> None:
                 "lion": {
                     "url": LION_URL,
                     "sha256": input_hashes["lion"],
+                    "release_identifier": lion_release,
+                    "catalog_release_identifier": lion_catalog_release,
+                    "metadata": lion_metadata,
                     **lion_source_audit,
+                },
+                "pad": {
+                    "url": PAD_URL,
+                    "sha256": input_hashes["pad"],
+                    "release_identifier": pad_release,
+                    "catalog_release_identifier": pad_catalog_release,
+                    "metadata": pad_metadata,
+                    **pad_source_audit,
+                },
+                "addresspoint": {
+                    "url": ADDRESSPOINT_METADATA_URL,
+                    "metadata": addresspoint_after,
+                    "queried_records": 0,
+                },
+                "cscl": {
+                    "url": CSCL_METADATA_URL,
+                    "metadata": cscl_metadata,
+                    "queried_records": 0,
                 },
             },
         }
@@ -574,9 +710,39 @@ def main() -> None:
             "schedule_groups": database_summary["schedule_group_count"],
             "schedule_rows_by_type": database_summary["schedule_counts"],
             "tile_features": tile_report["feature_count"],
+            "unknown_features": database_summary["unknown_feature_count"],
         }
+        recovery_counts = {
+            "identity_candidates": identity_report["candidate_count"],
+            "identity_promoted": 0,
+            "geometry_candidates": cscl_report["candidate_count"],
+            "geometry_promoted": 0,
+        }
+        previous_dataset_version = None
+        previous_recovery_counts: dict[str, object] = {}
+        try:
+            previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(previous_manifest, dict):
+                previous_dataset_version = previous_manifest.get("dataset_version")
+                raw_previous_counts = previous_manifest.get("recovery_counts")
+                if isinstance(raw_previous_counts, dict):
+                    previous_recovery_counts = raw_previous_counts
+        except FileNotFoundError:
+            pass
+        recovery_diff = {
+            "report_version": 1,
+            "dataset_version": dataset_version,
+            "previous_dataset_version": previous_dataset_version,
+            "previous": previous_recovery_counts,
+            "current": recovery_counts,
+            "promoted_identity_delta": -int(previous_recovery_counts.get("identity_promoted", 0)),
+            "promoted_geometry_delta": -int(previous_recovery_counts.get("geometry_promoted", 0)),
+            "publication_action": "SHADOW_ONLY_NO_PROMOTIONS",
+        }
+        recovery_diff_path = bundle / "recovery_diff.json"
+        atomic_json(recovery_diff_path, recovery_diff)
         manifest = {
-            "manifest_version": 2,
+            "manifest_version": MANIFEST_VERSION,
             "dataset_version": dataset_version,
             "release_path": f"releases/{dataset_version}",
             "processed_at": processed_at,
@@ -585,6 +751,13 @@ def main() -> None:
             "counts": counts,
             "block_faces": database_summary["block_faces"],
             "schedule_counts": database_summary["schedule_counts"],
+            "source_versions": {
+                "lion_artifact": lion_release,
+                "pad_artifact": pad_release,
+                "lion_catalog": lion_catalog_release,
+                "pad_catalog": pad_catalog_release,
+            },
+            "recovery_counts": recovery_counts,
             "database": database_summary,
             "tileset": tileset_summary,
             "ingestion_audit": {
@@ -624,6 +797,12 @@ def main() -> None:
                 "ingestion_failures": _artifact(failures),
                 "source_dsny": _artifact(dsny, record_count=ingestion_audit["frequency_rows"]),
                 "source_lion": _artifact(lion_zip, record_count=ingestion_audit["source_rows"]),
+                "source_pad": _artifact(pad_zip, release_identifier=pad_release),
+                "unknown_geojson": _artifact(bundle / "unknown_block_faces.geojson", feature_count=database_summary["unknown_feature_count"]),
+                "addresspoint_query_report": _artifact(bundle / "addresspoint_query_report.json"),
+                "cscl_alignment_report": _artifact(bundle / "cscl_alignment_report.json"),
+                "recovery_shadow_report": _artifact(bundle / "recovery_shadow_report.json"),
+                "recovery_diff": _artifact(recovery_diff_path),
             },
         }
         atomic_json(bundle / "release_manifest.json", manifest)

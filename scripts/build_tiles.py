@@ -37,7 +37,9 @@ from shapely.ops import transform
 
 LOGGER = logging.getLogger("build_tiles")
 SOURCE_LAYER = "collection_streets"
-TILE_SCHEMA_REVISION = 2
+UNKNOWN_SOURCE_LAYER = "collection_unknowns"
+UNKNOWN_MIN_ZOOM = 16
+TILE_SCHEMA_REVISION = 3
 DEFAULT_MIN_ZOOM = 12
 DEFAULT_MAX_ZOOM = 17
 DEFAULT_BUFFER_PIXELS = 16.0
@@ -72,6 +74,7 @@ class TileBlockFace:
 @dataclass(frozen=True)
 class SourceSnapshot:
     block_faces: list[TileBlockFace]
+    unknown_faces: list[TileBlockFace]
     bounds: tuple[float, float, float, float]
     content_digest: str
     data_updated: str | None
@@ -79,6 +82,7 @@ class SourceSnapshot:
     source_schedule_count: int
     source_schedule_group_count: int
     optional_source_id_fields: tuple[str, ...]
+    schedule_state_counts: dict[str, dict[str, int]]
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,8 @@ class BuildReport:
     feature_count: int
     geometry_count: int
     maxzoom_feature_count: int
+    unknown_feature_count: int
+    maxzoom_unknown_feature_count: int
     tile_feature_count: int
     bounds: tuple[float, float, float, float]
     minzoom: int
@@ -116,6 +122,8 @@ class BuildReport:
             "feature_count": self.feature_count,
             "geometry_count": self.geometry_count,
             "maxzoom_feature_count": self.maxzoom_feature_count,
+            "unknown_feature_count": self.unknown_feature_count,
+            "maxzoom_unknown_feature_count": self.maxzoom_unknown_feature_count,
             "tile_feature_count": self.tile_feature_count,
             "bounds": list(self.bounds),
             "minzoom": self.minzoom,
@@ -164,6 +172,22 @@ def _validate_source(connection: sqlite3.Connection) -> tuple[int, int, int]:
                GROUP BY block_face_id, collection_type
            )"""
     ).fetchone()[0]
+    state_rows = connection.execute("SELECT COUNT(*) FROM block_face_collection_states").fetchone()[0]
+    if state_rows != block_faces * len(VALID_TYPES):
+        raise RuntimeError(
+            "source database must contain exactly four collection states per block face: "
+            f"expected={block_faces * len(VALID_TYPES)} actual={state_rows}"
+        )
+    invalid_state_faces = connection.execute(
+        """SELECT COUNT(*) FROM (
+               SELECT block_face_id, COUNT(*) AS count
+               FROM block_face_collection_states
+               GROUP BY block_face_id
+               HAVING count != 4
+           )"""
+    ).fetchone()[0]
+    if invalid_state_faces:
+        raise RuntimeError(f"source database has block faces with incomplete state rows: {invalid_state_faces}")
     return block_faces, schedules, schedule_groups
 
 
@@ -367,6 +391,48 @@ def _load_features(
             f"expected={source_schedule_count} actual={actual_schedule_count}"
         )
 
+    state_counts: dict[str, dict[str, int]] = {kind: {} for kind in VALID_TYPES}
+    state_rows = connection.execute(
+        """SELECT block_face_id, collection_type, effective_days_json, state, rule_id,
+                  source_policy_conflict, provenance
+           FROM block_face_collection_states
+           ORDER BY block_face_id, collection_type"""
+    )
+    actual_state_rows = 0
+    for row in state_rows:
+        actual_state_rows += 1
+        block_face_id = str(row["block_face_id"])
+        collection_type = str(row["collection_type"])
+        state = str(row["state"])
+        if block_face_id not in block_faces_by_id or collection_type not in VALID_TYPES:
+            raise RuntimeError("collection state references an invalid face or collection type")
+        try:
+            effective_days = json.loads(str(row["effective_days_json"]))
+        except json.JSONDecodeError as error:
+            raise RuntimeError("collection state has invalid effective_days_json") from error
+        expected_days = block_faces_by_id[block_face_id].properties[DAY_FIELDS[collection_type]]
+        if not isinstance(effective_days, list) or ",".join(effective_days) != expected_days:
+            raise RuntimeError(f"collection state does not match effective schedule id={block_face_id}")
+        if state == "UNKNOWN_SOURCE_BLANK" and effective_days:
+            raise RuntimeError(f"unknown collection state has effective days id={block_face_id}")
+        if state == "POLICY_DERIVED" and row["rule_id"] != "dsny-organics-on-recycling-day-v1":
+            raise RuntimeError(f"derived collection state has an invalid rule id={block_face_id}")
+        prefix = collection_type.lower()
+        properties = block_faces_by_id[block_face_id].properties
+        properties[f"{prefix}_status"] = state
+        properties[f"{prefix}_rule"] = "" if row["rule_id"] is None else str(row["rule_id"])
+        properties[f"{prefix}_conflict"] = "1" if int(row["source_policy_conflict"]) else "0"
+        properties[f"{prefix}_provenance"] = str(row["provenance"])
+        state_counts[collection_type][state] = state_counts[collection_type].get(state, 0) + 1
+    if actual_state_rows != source_block_face_count * len(VALID_TYPES):
+        raise RuntimeError("collection state query lost rows")
+    for block_face in block_faces_by_id.values():
+        block_face.properties["identity_method"] = "LION_BLOCK_FACE_ID"
+        block_face.properties["geometry_method"] = "DIRECT_SIDE_TRACE"
+        content_hash.update(
+            json.dumps(block_face.properties, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+
     block_faces = list(block_faces_by_id.values())
     if len(block_faces) != source_block_face_count or finalized_schedule_faces != source_block_face_count:
         raise RuntimeError(
@@ -376,8 +442,44 @@ def _load_features(
         )
     data_updated_row = connection.execute("SELECT MAX(retrieved_at) FROM collection_schedules").fetchone()
     data_updated = str(data_updated_row[0]) if data_updated_row and data_updated_row[0] else None
+    unknown_faces: list[TileBlockFace] = []
+    unknown_ids: set[str] = set()
+    for row in connection.execute(
+        """SELECT unknown_id, technical_identity, segment_id, borough, street_name, side,
+                  reason_code, reason, identity_method, geometry_method, geometry_wkt
+           FROM unknown_block_faces ORDER BY unknown_id"""
+    ):
+        unknown_id = str(row["unknown_id"])
+        if unknown_id in unknown_ids:
+            raise RuntimeError(f"duplicate unknown feature id={unknown_id}")
+        unknown_ids.add(unknown_id)
+        geometry_wgs84 = force_2d(wkt.loads(row["geometry_wkt"]))
+        if geometry_wgs84.is_empty or geometry_wgs84.geom_type not in {"LineString", "MultiLineString"}:
+            raise RuntimeError(f"unknown feature has invalid geometry id={unknown_id}")
+        projected = transform(projector.transform, geometry_wgs84)
+        properties = {
+            "id": unknown_id,
+            "technical_identity": "" if row["technical_identity"] is None else str(row["technical_identity"]),
+            "segment_id": str(row["segment_id"]),
+            "borough": "" if row["borough"] is None else str(row["borough"]),
+            "street_name": str(row["street_name"]),
+            "side": str(row["side"]),
+            "reason_code": str(row["reason_code"]),
+            "reason": str(row["reason"]),
+            "identity_method": str(row["identity_method"]),
+            "geometry_method": str(row["geometry_method"]),
+        }
+        if any(key.endswith("_days") or key.endswith("_status") for key in properties):
+            raise RuntimeError("unknown tile feature contains schedule properties")
+        unknown_faces.append(TileBlockFace(geometry=projected, properties=properties))
+        min_x, min_y, max_x, max_y = geometry_wgs84.bounds
+        west, south = min(west, min_x), min(south, min_y)
+        east, north = max(east, max_x), max(north, max_y)
+        content_hash.update(geometry_wgs84.wkb)
+        content_hash.update(json.dumps(properties, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     return SourceSnapshot(
         block_faces=block_faces,
+        unknown_faces=unknown_faces,
         bounds=(west, south, east, north),
         content_digest=content_hash.hexdigest(),
         data_updated=data_updated,
@@ -385,6 +487,7 @@ def _load_features(
         source_schedule_count=source_schedule_count,
         source_schedule_group_count=source_schedule_group_count,
         optional_source_id_fields=optional_source_id_fields,
+        schedule_state_counts=state_counts,
     )
 
 
@@ -459,6 +562,7 @@ def _metadata_rows(
     source_schedule_count: int,
     source_schedule_group_count: int,
     feature_count: int,
+    unknown_feature_count: int,
     maxzoom_feature_count: int,
     bounds: tuple[float, float, float, float],
     minzoom: int,
@@ -488,9 +592,33 @@ def _metadata_rows(
                     "bulk_days": "String",
                     "source": "String",
                     "retrieved_at": "String",
+                    "refuse_status": "String",
+                    "recycling_status": "String",
+                    "organics_status": "String",
+                    "bulk_status": "String",
+                    "identity_method": "String",
+                    "geometry_method": "String",
                     **{field: "String" for field in optional_source_id_fields},
                 },
-            }
+            },
+            {
+                "id": UNKNOWN_SOURCE_LAYER,
+                "description": "Unresolved block-face evidence; contains no collection weekdays",
+                "minzoom": min(maxzoom, max(minzoom, UNKNOWN_MIN_ZOOM)),
+                "maxzoom": maxzoom,
+                "fields": {
+                    "id": "String",
+                    "technical_identity": "String",
+                    "segment_id": "String",
+                    "borough": "String",
+                    "street_name": "String",
+                    "side": "String",
+                    "reason_code": "String",
+                    "reason": "String",
+                    "identity_method": "String",
+                    "geometry_method": "String",
+                },
+            },
         ]
     }
     rows = [
@@ -505,9 +633,13 @@ def _metadata_rows(
         ("source_schedule_count", str(source_schedule_count)),
         ("source_schedule_group_count", str(source_schedule_group_count)),
         ("feature_count", str(feature_count)),
+        ("unknown_feature_count", str(unknown_feature_count)),
+        ("maxzoom_unknown_feature_count", str(unknown_feature_count)),
         ("geometry_count", str(feature_count)),
         ("maxzoom_feature_count", str(maxzoom_feature_count)),
         ("source_layer", SOURCE_LAYER),
+        ("unknown_source_layer", UNKNOWN_SOURCE_LAYER),
+        ("unknown_minzoom", str(min(maxzoom, max(minzoom, UNKNOWN_MIN_ZOOM)))),
         ("minzoom", str(minzoom)),
         ("maxzoom", str(maxzoom)),
         ("bounds", ",".join(f"{value:.7f}" for value in bounds)),
@@ -678,6 +810,9 @@ def build_tiles(
     version = version or snapshot.content_digest[:20]
     data_updated = data_updated or snapshot.data_updated
     block_faces = snapshot.block_faces
+    unknown_faces = snapshot.unknown_faces
+    if unknown_faces and maxzoom < UNKNOWN_MIN_ZOOM:
+        raise ValueError(f"maxzoom must be at least {UNKNOWN_MIN_ZOOM} when unknown features exist")
     feature_count = len(block_faces)
     bounds = snapshot.bounds
     tile_size_limits = {
@@ -702,6 +837,7 @@ def build_tiles(
     tile_count = 0
     tile_feature_count = 0
     represented_at_maxzoom: set[int] = set()
+    represented_unknown_at_maxzoom: set[int] = set()
     sizes_by_zoom: dict[int, list[tuple[int, int]]] = defaultdict(list)
     try:
         with closing(sqlite3.connect(temporary_path)) as archive:
@@ -717,22 +853,36 @@ def build_tiles(
                     else block_face.geometry
                     for block_face in block_faces
                 ]
+                simplified_unknowns = [
+                    unknown.geometry.simplify(simplify_tolerance, preserve_topology=True)
+                    if simplify_tolerance
+                    else unknown.geometry
+                    for unknown in unknown_faces
+                ] if zoom >= UNKNOWN_MIN_ZOOM else []
                 tile_members: dict[tuple[int, int], list[int]] = defaultdict(list)
                 for index, geometry in enumerate(simplified):
                     x_values, y_values = _tile_range(geometry.bounds, zoom, buffer_distance)
                     for x in x_values:
                         for y in y_values:
                             tile_members[(x, y)].append(index)
+                unknown_tile_members: dict[tuple[int, int], list[int]] = defaultdict(list)
+                for index, geometry in enumerate(simplified_unknowns):
+                    x_values, y_values = _tile_range(geometry.bounds, zoom, buffer_distance)
+                    for x in x_values:
+                        for y in y_values:
+                            unknown_tile_members[(x, y)].append(index)
 
                 LOGGER.info(
                     "Encoding vector tiles zoom=%s candidate_tiles=%s source_features=%s",
                     zoom,
-                    len(tile_members),
+                    len(set(tile_members) | set(unknown_tile_members)),
                     feature_count,
                 )
                 zoom_tiles = 0
                 last_progress_at = monotonic()
-                for candidate_number, ((x, y), indexes) in enumerate(sorted(tile_members.items()), start=1):
+                candidate_tiles = sorted(set(tile_members) | set(unknown_tile_members))
+                for candidate_number, (x, y) in enumerate(candidate_tiles, start=1):
+                    indexes = tile_members.get((x, y), [])
                     min_x, min_y, max_x, max_y = _tile_bounds(zoom, x, y)
                     clip_bounds = (
                         min_x - buffer_distance,
@@ -754,10 +904,25 @@ def build_tiles(
                         encoded_features.append(
                             {"geometry": clipped, "properties": block_faces[index].properties}
                         )
-                    if not encoded_features:
+                    encoded_unknowns = []
+                    for index in unknown_tile_members.get((x, y), []):
+                        clipped = _linear_parts(simplified_unknowns[index].intersection(clipping_box))
+                        if clipped is None or not _survives_quantization(clipped, (min_x, min_y, max_x, max_y)):
+                            continue
+                        if zoom == maxzoom:
+                            represented_unknown_at_maxzoom.add(index)
+                        encoded_unknowns.append(
+                            {"geometry": clipped, "properties": unknown_faces[index].properties}
+                        )
+                    if not encoded_features and not encoded_unknowns:
                         continue
+                    layers = []
+                    if encoded_features:
+                        layers.append({"name": SOURCE_LAYER, "features": encoded_features})
+                    if encoded_unknowns:
+                        layers.append({"name": UNKNOWN_SOURCE_LAYER, "features": encoded_unknowns})
                     tile = mapbox_vector_tile.encode(
-                        {"name": SOURCE_LAYER, "features": encoded_features},
+                        layers,
                         default_options={
                             "quantize_bounds": (min_x, min_y, max_x, max_y),
                             "extents": MVT_EXTENT,
@@ -787,7 +952,7 @@ def build_tiles(
                     )
                     zoom_tiles += 1
                     tile_count += 1
-                    tile_feature_count += len(encoded_features)
+                    tile_feature_count += len(encoded_features) + len(encoded_unknowns)
                     sizes_by_zoom[zoom].append((compressed_size, uncompressed_size))
                     now = monotonic()
                     if now - last_progress_at >= TILE_PROGRESS_EVERY_SECONDS:
@@ -795,7 +960,7 @@ def build_tiles(
                             "Tile encoding progress zoom=%s candidates=%s/%s emitted_tiles=%s elapsed_s=%.1f",
                             zoom,
                             candidate_number,
-                            len(tile_members),
+                            len(candidate_tiles),
                             zoom_tiles,
                             now - zoom_started,
                         )
@@ -819,6 +984,12 @@ def build_tiles(
                     "tile build did not represent every source block face at max zoom: "
                     f"zoom={maxzoom} expected={len(block_faces)} actual={len(represented_at_maxzoom)}"
                 )
+            if len(represented_unknown_at_maxzoom) != len(unknown_faces):
+                raise RuntimeError(
+                    "tile build did not represent every unknown face at max zoom: "
+                    f"zoom={maxzoom} expected={len(unknown_faces)} "
+                    f"actual={len(represented_unknown_at_maxzoom)}"
+                )
             if tile_count == 0:
                 raise RuntimeError("tile build produced no tiles")
             tile_size_metrics = _tile_size_metrics(sizes_by_zoom, minzoom)
@@ -832,6 +1003,7 @@ def build_tiles(
                     source_schedule_count=snapshot.source_schedule_count,
                     source_schedule_group_count=snapshot.source_schedule_group_count,
                     feature_count=feature_count,
+                    unknown_feature_count=len(unknown_faces),
                     maxzoom_feature_count=len(represented_at_maxzoom),
                     bounds=bounds,
                     minzoom=minzoom,
@@ -867,6 +1039,8 @@ def build_tiles(
         feature_count=feature_count,
         geometry_count=feature_count,
         maxzoom_feature_count=len(represented_at_maxzoom),
+        unknown_feature_count=len(unknown_faces),
+        maxzoom_unknown_feature_count=len(represented_unknown_at_maxzoom),
         tile_feature_count=tile_feature_count,
         bounds=bounds,
         minzoom=minzoom,

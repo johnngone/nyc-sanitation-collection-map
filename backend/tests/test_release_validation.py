@@ -114,6 +114,8 @@ def _audit(processed_sha256: str) -> dict[str, object]:
 def _processed_payload() -> dict[str, object]:
     return {
         "type": "FeatureCollection",
+        "schema_revision": 3,
+        "unknown_features": [],
         "features": [
             {
                 "type": "Feature",
@@ -133,6 +135,17 @@ def _processed_payload() -> dict[str, object]:
                     "refuse_days": ["MON"],
                     "schedules": {
                         collection_type: ["MON"]
+                        for collection_type in ("REFUSE", "RECYCLING", "ORGANICS", "BULK")
+                    },
+                    "schedule_states": {
+                        collection_type: {
+                            "state": "SOURCE_EXPLICIT",
+                            "source_field": f"FREQ_{collection_type}",
+                            "raw_value": "MON",
+                            "rule_id": None,
+                            "source_policy_conflict": False,
+                            "provenance": "DSNY test fixture",
+                        }
                         for collection_type in ("REFUSE", "RECYCLING", "ORGANICS", "BULK")
                     },
                     "dsny_object_ids": ["101"],
@@ -209,6 +222,14 @@ def _database(
                    VALUES ('face-1', ?, 'MON', 'DSNY', '2026-08-19', 'AUDITED_SIDE_OFFSET')""",
                 (collection_type,),
             )
+            connection.execute(
+                """INSERT INTO block_face_collection_states
+                   (block_face_id, collection_type, effective_days_json, state,
+                    source_field, raw_value, rule_id, source_policy_conflict, provenance)
+                   VALUES ('face-1', ?, '["MON"]', 'SOURCE_EXPLICIT', ?,
+                           'MON', NULL, 0, 'DSNY test fixture')""",
+                (collection_type, f"FREQ_{collection_type}"),
+            )
         connection.executemany(
             "INSERT INTO dataset_metadata(key, value) VALUES (?, ?)",
             {
@@ -269,6 +290,18 @@ def _bundle(tmp_path, version: str):
     dsny.write_text('{"type":"FeatureCollection","features":[]}', encoding="utf-8")
     lion = bundle / "lion.zip"
     lion.write_bytes(b"test-lion-snapshot")
+    pad = bundle / "pad.zip"
+    pad.write_bytes(b"test-pad-snapshot")
+    unknown = bundle / "unknown_block_faces.geojson"
+    atomic_json(unknown, {"type": "FeatureCollection", "features": []})
+    addresspoint_report = bundle / "addresspoint_query_report.json"
+    atomic_json(addresspoint_report, {"report_version": 1, "returned_count": 0})
+    cscl_report = bundle / "cscl_alignment_report.json"
+    atomic_json(cscl_report, {"report_version": 1, "promoted_count": 0})
+    recovery_report = bundle / "recovery_shadow_report.json"
+    atomic_json(recovery_report, {"report_version": 1, "mode": "shadow"})
+    recovery_diff = bundle / "recovery_diff.json"
+    atomic_json(recovery_diff, {"report_version": 1, "publication_action": "SHADOW_ONLY_NO_PROMOTIONS"})
     failures = bundle / "ingestion_failures.jsonl"
     failures.write_text("", encoding="utf-8")
     source_report_path = bundle / "source_report.json"
@@ -278,6 +311,7 @@ def _bundle(tmp_path, version: str):
         "sources": {
             "dsny": {"sha256": file_sha256(dsny), "record_count": 1},
             "lion": {"sha256": file_sha256(lion), "record_count": 1},
+            "pad": {"sha256": file_sha256(pad), "release_identifier": "26B"},
         },
     }
     atomic_json(source_report_path, source_report)
@@ -288,7 +322,7 @@ def _bundle(tmp_path, version: str):
         expected_database_path=database,
     )
     manifest = {
-        "manifest_version": 2,
+        "manifest_version": 3,
         "dataset_version": version,
         "release_path": f"releases/{version}",
         "processed_at": "2026-08-19T12:00:00+00:00",
@@ -304,6 +338,7 @@ def _bundle(tmp_path, version: str):
             "schedule_groups": 4,
             "schedule_rows_by_type": database_summary["schedule_counts"],
             "tile_features": 1,
+            "unknown_features": 0,
         },
         "block_faces": 1,
         "schedule_counts": database_summary["schedule_counts"],
@@ -349,6 +384,12 @@ def _bundle(tmp_path, version: str):
             "ingestion_failures": _artifact(failures),
             "source_dsny": _artifact(dsny, record_count=1),
             "source_lion": _artifact(lion, record_count=1),
+            "source_pad": _artifact(pad, release_identifier="26B"),
+            "unknown_geojson": _artifact(unknown, feature_count=0),
+            "addresspoint_query_report": _artifact(addresspoint_report),
+            "cscl_alignment_report": _artifact(cscl_report),
+            "recovery_shadow_report": _artifact(recovery_report),
+            "recovery_diff": _artifact(recovery_diff),
         },
     }
     atomic_json(bundle / "release_manifest.json", manifest)

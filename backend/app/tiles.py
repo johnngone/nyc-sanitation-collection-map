@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 SOURCE_LAYER = "collection_streets"
+UNKNOWN_SOURCE_LAYER = "collection_unknowns"
 VECTOR_TILE_MEDIA_TYPE = "application/vnd.mapbox-vector-tile"
 VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -22,6 +23,8 @@ class TilesetMetadata:
     version: str
     tile_schema_revision: int
     source_layer: str
+    unknown_source_layer: str | None
+    unknown_minzoom: int | None
     minzoom: int
     maxzoom: int
     bounds: tuple[float, float, float, float]
@@ -77,6 +80,7 @@ def _cached_metadata(path_string: str, mtime_ns: int, size: int) -> TilesetMetad
 
     source_layer = values.get("source_layer", SOURCE_LAYER)
     vector_metadata = values.get("json")
+    layer_ids: set[object] = set()
     if vector_metadata:
         try:
             layers = json.loads(vector_metadata).get("vector_layers", [])
@@ -87,11 +91,24 @@ def _cached_metadata(path_string: str, mtime_ns: int, size: int) -> TilesetMetad
             raise ValueError("tileset metadata does not describe its source layer")
     if source_layer != SOURCE_LAYER:
         raise ValueError(f"tileset source layer must be {SOURCE_LAYER}")
+    unknown_source_layer = values.get("unknown_source_layer") or None
+    unknown_minzoom: int | None = None
+    if tile_schema_revision >= 3:
+        if unknown_source_layer != UNKNOWN_SOURCE_LAYER or unknown_source_layer not in layer_ids:
+            raise ValueError("v3 tileset metadata does not describe its unknown source layer")
+        try:
+            unknown_minzoom = int(values["unknown_minzoom"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("v3 tileset metadata has invalid unknown minimum zoom") from error
+        if not minzoom <= unknown_minzoom <= maxzoom:
+            raise ValueError("v3 unknown minimum zoom is outside tileset bounds")
 
     return TilesetMetadata(
         version=version,
         tile_schema_revision=tile_schema_revision,
         source_layer=source_layer,
+        unknown_source_layer=unknown_source_layer,
+        unknown_minzoom=unknown_minzoom,
         minzoom=minzoom,
         maxzoom=maxzoom,
         bounds=(west, south, east, north),
