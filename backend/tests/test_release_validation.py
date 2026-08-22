@@ -298,6 +298,8 @@ def _bundle(tmp_path, version: str):
     atomic_json(addresspoint_report, {"report_version": 1, "returned_count": 0})
     cscl_report = bundle / "cscl_alignment_report.json"
     atomic_json(cscl_report, {"report_version": 1, "promoted_count": 0})
+    cscl_subset = bundle / "cscl_alignment_subset.geojson"
+    atomic_json(cscl_subset, {"type": "FeatureCollection", "features": []})
     recovery_report = bundle / "recovery_shadow_report.json"
     atomic_json(recovery_report, {"report_version": 1, "mode": "shadow"})
     recovery_diff = bundle / "recovery_diff.json"
@@ -388,6 +390,7 @@ def _bundle(tmp_path, version: str):
             "unknown_geojson": _artifact(unknown, feature_count=0),
             "addresspoint_query_report": _artifact(addresspoint_report),
             "cscl_alignment_report": _artifact(cscl_report),
+            "cscl_alignment_subset": _artifact(cscl_subset, feature_count=0),
             "recovery_shadow_report": _artifact(recovery_report),
             "recovery_diff": _artifact(recovery_diff),
         },

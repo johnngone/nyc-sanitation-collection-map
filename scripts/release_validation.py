@@ -97,6 +97,7 @@ RELEASE_FILENAMES = {
     "unknown_geojson": "unknown_block_faces.geojson",
     "addresspoint_query_report": "addresspoint_query_report.json",
     "cscl_alignment_report": "cscl_alignment_report.json",
+    "cscl_alignment_subset": "cscl_alignment_subset.geojson",
     "recovery_shadow_report": "recovery_shadow_report.json",
     "recovery_diff": "recovery_diff.json",
 }
@@ -1463,6 +1464,12 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
             key.endswith("_days") or key == "schedules" for key in properties
         ):
             raise RuntimeError("unknown GeoJSON contains schedule data")
+    cscl_subset = read_json_object(paths["cscl_alignment_subset"], "CSCL alignment subset")
+    cscl_features = cscl_subset.get("features")
+    if cscl_subset.get("type") != "FeatureCollection" or not isinstance(cscl_features, list):
+        raise RuntimeError("CSCL alignment subset must be a FeatureCollection")
+    if artifacts["cscl_alignment_subset"].get("feature_count") != len(cscl_features):
+        raise RuntimeError("CSCL alignment subset count does not match its descriptor")
     _require_exact_fields(
         artifacts["database"],
         {
@@ -1567,6 +1574,15 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
             },
             f"{artifact_name} artifact descriptor",
         )
+    _require_exact_fields(
+        artifacts["cscl_alignment_subset"],
+        {
+            "path": RELEASE_FILENAMES["cscl_alignment_subset"],
+            "sha256": artifacts["cscl_alignment_subset"]["sha256"],
+            "feature_count": len(cscl_features),
+        },
+        "CSCL alignment subset artifact descriptor",
+    )
 
     counts = manifest.get("counts")
     expected_counts = {

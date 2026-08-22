@@ -78,6 +78,7 @@ data/
       unknown_block_faces.geojson
       addresspoint_query_report.json
       cscl_alignment_report.json
+      cscl_alignment_subset.geojson
       recovery_shadow_report.json
       recovery_diff.json
       release_manifest.json

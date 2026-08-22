@@ -366,6 +366,7 @@ def build_collection_features(
                 "street_name": street_name,
                 "technical_identity": f"LION:{segment_id}:{side}" if segment_id else None,
                 "source_block_face_id": raw_block_face_id or None,
+                "physical_id": _clean_identifier(_first_present(row, "PhysicalID", "PHYSICALID")) or None,
             })
 
             if used_fallback_id:

@@ -369,6 +369,95 @@ def _remote_metadata(url: str) -> dict[str, object]:
     }
 
 
+def download_cscl_subset(physical_ids: set[str], output: Path) -> dict[str, object]:
+    """Fetch exactly the CSCL rows for shadow candidates and verify the OID set."""
+
+    numeric_ids = sorted({int(value) for value in physical_ids if value.isdigit()})
+    if not numeric_ids:
+        atomic_json(output, {"type": "FeatureCollection", "features": []})
+        return {
+            "requested_physical_ids": 0,
+            "returned_object_ids": 0,
+            "returned_features": 0,
+            "object_id_set_verified": True,
+            "source_metadata_stable": True,
+        }
+    query_url = f"{CSCL_METADATA_URL}/query"
+    with httpx.Client(timeout=180, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+        before = _arcgis_json(client, CSCL_METADATA_URL, {"f": "json"})
+        oid_field = _object_id_field(before)
+        if not oid_field:
+            raise RuntimeError("CSCL metadata does not declare an object ID field")
+        object_id_set: set[int] = set()
+        for physical_offset in range(0, len(numeric_ids), 500):
+            physical_batch = numeric_ids[physical_offset:physical_offset + 500]
+            where = f"PHYSICALID IN ({','.join(str(value) for value in physical_batch)})"
+            ids_payload = _arcgis_post_json(
+                client, query_url, {"where": where, "returnIdsOnly": "true", "f": "json"}
+            )
+            batch_ids = ids_payload.get("objectIds")
+            if not isinstance(batch_ids, list) or any(not isinstance(value, int) for value in batch_ids):
+                raise RuntimeError("CSCL object-ID query returned an invalid ID set")
+            if object_id_set & set(batch_ids):
+                raise RuntimeError("CSCL object-ID batches returned duplicate IDs")
+            object_id_set.update(batch_ids)
+        object_ids = sorted(object_id_set)
+        expected_oids = set(object_ids)
+        features: list[dict[str, object]] = []
+        batch_size = int(before.get("maxRecordCount") or 1000)
+        for offset in range(0, len(object_ids), batch_size):
+            batch = object_ids[offset:offset + batch_size]
+            payload = _arcgis_post_json(
+                client,
+                query_url,
+                {
+                    "objectIds": ",".join(str(value) for value in batch),
+                    "outFields": "*",
+                    "returnGeometry": "true",
+                    "outSR": 4326,
+                    "f": "geojson",
+                },
+            )
+            batch_features = payload.get("features")
+            if not isinstance(batch_features, list):
+                raise RuntimeError("CSCL feature query returned an invalid feature array")
+            features.extend(batch_features)
+        returned_oids = {
+            int(feature["properties"][oid_field])
+            for feature in features
+            if isinstance(feature, dict)
+            and isinstance(feature.get("properties"), dict)
+            and feature["properties"].get(oid_field) is not None
+        }
+        if returned_oids != expected_oids or len(features) != len(returned_oids):
+            raise RuntimeError(
+                "CSCL subset lost, duplicated, or invented object IDs "
+                f"expected={len(expected_oids)} returned={len(returned_oids)} features={len(features)}"
+            )
+        after = _arcgis_json(client, CSCL_METADATA_URL, {"f": "json"})
+    before_editing = before.get("editingInfo")
+    after_editing = after.get("editingInfo")
+    if before_editing != after_editing:
+        raise RuntimeError("CSCL source metadata changed during subset retrieval")
+    returned_physical_ids = {
+        int(feature["properties"]["PHYSICALID"])
+        for feature in features
+    }
+    if not returned_physical_ids.issubset(set(numeric_ids)):
+        raise RuntimeError("CSCL subset returned an unrequested PHYSICALID")
+    atomic_json(output, {"type": "FeatureCollection", "features": features})
+    return {
+        "requested_physical_ids": len(numeric_ids),
+        "returned_physical_ids": len(returned_physical_ids),
+        "returned_object_ids": len(returned_oids),
+        "returned_features": len(features),
+        "object_id_field": oid_field,
+        "object_id_set_verified": True,
+        "source_metadata_stable": True,
+        "missing_physical_ids": sorted(set(numeric_ids) - returned_physical_ids),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--status", action="store_true")
@@ -540,16 +629,27 @@ def main() -> None:
         if not isinstance(unknown_records, list):
             raise RuntimeError("processed unknown_features must be a list")
         unknown_reason_counts: dict[str, int] = {}
+        cscl_physical_ids: set[str] = set()
         for feature in unknown_records:
             properties = feature.get("properties") if isinstance(feature, dict) else None
             if not isinstance(properties, dict):
                 raise RuntimeError("processed unknown feature is malformed")
             reason_code = str(properties.get("reason_code", ""))
             unknown_reason_counts[reason_code] = unknown_reason_counts.get(reason_code, 0) + 1
+            evidence = properties.get("evidence")
+            if reason_code == "PARTIAL_GEOMETRY_GAP" and isinstance(evidence, dict):
+                physical_id = str(evidence.get("physical_id") or "")
+                if physical_id:
+                    cscl_physical_ids.add(physical_id)
         identity_report["candidate_count"] = unknown_reason_counts.get(
             "INSUFFICIENT_ADDRESS_EVIDENCE", 0
         )
         cscl_report["candidate_count"] = unknown_reason_counts.get("PARTIAL_GEOMETRY_GAP", 0)
+        cscl_subset_path = bundle / "cscl_alignment_subset.geojson"
+        cscl_query_audit = download_cscl_subset(cscl_physical_ids, cscl_subset_path)
+        cscl_report["query_audit"] = cscl_query_audit
+        cscl_report["evaluated_count"] = 0
+        cscl_report["evaluation_status"] = "SUBSET_VERIFIED_PROMOTION_BLOCKED_PENDING_REVIEW"
         addresspoint_report["shadow_input_candidate_count"] = identity_report["candidate_count"]
         recovery_report["unknown_reason_counts"] = unknown_reason_counts
         atomic_json(bundle / "addresspoint_query_report.json", addresspoint_report)
@@ -801,6 +901,7 @@ def main() -> None:
                 "unknown_geojson": _artifact(bundle / "unknown_block_faces.geojson", feature_count=database_summary["unknown_feature_count"]),
                 "addresspoint_query_report": _artifact(bundle / "addresspoint_query_report.json"),
                 "cscl_alignment_report": _artifact(bundle / "cscl_alignment_report.json"),
+                "cscl_alignment_subset": _artifact(cscl_subset_path, feature_count=cscl_query_audit["returned_features"]),
                 "recovery_shadow_report": _artifact(bundle / "recovery_shadow_report.json"),
                 "recovery_diff": _artifact(recovery_diff_path),
             },
