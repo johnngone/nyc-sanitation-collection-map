@@ -424,11 +424,6 @@ label input[type="checkbox"] {
   margin: .45rem 0 .3rem;
 }
 
-.unresolved-explanations small {
-  color: #6d7882;
-  font-size: .78rem;
-}
-
 .modal-close {
   position: absolute;
   top: .65rem;
