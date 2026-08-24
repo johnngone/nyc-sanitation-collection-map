@@ -82,6 +82,7 @@ export function App() {
   const [dataUpdated, setDataUpdated] = useState<string | null>(null);
   const [showInfo, setShowInfo] = useState(false);
   const [showUnknowns, setShowUnknowns] = useState(true);
+  const [unknownLayerAvailable, setUnknownLayerAvailable] = useState(false);
   const [mobileSheetOpen, setMobileSheetOpen] = useState(true);
   const [brandExpanded, setBrandExpanded] = useState(false);
   const [isMobileViewport, setIsMobileViewport] = useState(
@@ -227,6 +228,10 @@ export function App() {
 
           tilesInitialized = true;
           const tileSchemaRevision = config.tile_schema_revision as 2 | 3;
+          const hasUnknownLayer = tileSchemaRevision >= 3
+            && Boolean(config.unknown_source_layer)
+            && typeof config.unknown_minzoom === "number";
+          setUnknownLayerAvailable(hasUnknownLayer);
           // Below the archive's minimum zoom the collection overlay would be
           // blank while the legend still looked authoritative. Keep the map in
           // the range where a validated collection layer can be rendered.
@@ -506,11 +511,11 @@ export function App() {
               if (event.key === "Escape") setBrandExpanded(false);
             }}
           >
+            <img className="brand-logo" src="/logo.png" alt="" draggable="false" />
             <span className="brand-copy">
               <strong>NYC Sanitation – Collection Map</strong>
               <small>See curbside collection schedules by street, weekday, and service type.</small>
             </span>
-            <img className="brand-logo" src="/logo.png" alt="" draggable="false" />
           </button>
         </div>
         <aside className={`map-overlay ${mobileSheetOpen ? "is-open" : "is-collapsed"}`} aria-label="Map controls">
@@ -541,13 +546,13 @@ export function App() {
             </div>
             <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-label={day} aria-pressed={selectedDay === day}>{dayShortLabel(day)}</button>)}</div>
             <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
-            <label className="unknown-toggle"><input type="checkbox" checked={showUnknowns} onChange={() => setShowUnknowns((current) => !current)} /> Show source gaps at high zoom</label>
+            {unknownLayerAvailable && <label className="unknown-toggle"><input type="checkbox" checked={showUnknowns} onChange={() => setShowUnknowns((current) => !current)} /> Show source gaps at high zoom</label>}
             <dl className="status-summary" aria-live="polite">
               <div><dt>Backend</dt><dd><i className={`status-dot ${backendConnection}`} aria-hidden="true" />{backendConnectionLabel(backendConnection)}</dd></div>
               <div><dt>Mapped</dt><dd>{mappedFeatureCount === null ? "Waiting for data" : `${mappedFeatureCount.toLocaleString()} street features`}</dd></div>
               <div><dt>Status</dt><dd>{mapStatus}</dd></div>
+              <div><dt>Last Updated</dt><dd><time dateTime={dataUpdated ?? undefined}>{formatDataUpdated(dataUpdated)}</time></dd></div>
             </dl>
-            <small className="data-updated"><span>Data updated</span><time dateTime={dataUpdated ?? undefined}>{formatDataUpdated(dataUpdated)}</time></small>
           </div>
         </aside>
       </section>

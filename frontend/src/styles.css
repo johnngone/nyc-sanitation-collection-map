@@ -86,10 +86,10 @@ input:focus-visible {
   height: 62px;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 0;
   padding: 5px;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid rgba(255, 255, 255, .78);
   border-radius: 31px;
   background: rgba(255, 255, 255, .88);
@@ -131,7 +131,6 @@ input:focus-visible {
   width: 52px;
   height: 52px;
   flex: 0 0 52px;
-  border-radius: 50%;
   user-select: none;
   transition: transform 300ms cubic-bezier(.22, 1, .36, 1);
 }
@@ -139,7 +138,7 @@ input:focus-visible {
 .brand-lockup.is-expanded .brand-copy,
 .brand-button:focus-visible .brand-copy {
   width: min(20rem, calc(100vw - 5.6rem));
-  margin: 0 .65rem 0 .8rem;
+  margin: 0 .8rem 0 .65rem;
   opacity: 1;
   transform: translateX(0);
 }
@@ -272,7 +271,7 @@ label input[type="checkbox"] {
 
 .status-summary > div {
   display: grid;
-  grid-template-columns: 4.2rem minmax(0, 1fr);
+  grid-template-columns: 5.3rem minmax(0, 1fr);
   gap: .55rem;
   align-items: start;
   font-size: .76rem;
@@ -303,20 +302,6 @@ label input[type="checkbox"] {
 .status-dot.connected { background: #2b9b55; }
 .status-dot.verifying { background: #d28b16; }
 .status-dot.unavailable { background: #d14343; }
-
-.data-updated {
-  display: flex;
-  justify-content: space-between;
-  gap: .75rem;
-  padding-top: .1rem;
-  color: #687681;
-  font-size: .72rem;
-}
-
-.data-updated time {
-  color: #35434f;
-  font-weight: 600;
-}
 
 .modal-backdrop {
   position: fixed;
@@ -398,6 +383,7 @@ label input[type="checkbox"] {
   .brand-button:focus-visible .brand-copy {
     width: min(20rem, calc(100vw - 6.25rem));
     margin-left: .65rem;
+    margin-right: .65rem;
   }
 
   .brand-copy strong { font-size: .82rem; }
