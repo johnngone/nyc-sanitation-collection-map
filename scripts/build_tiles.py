@@ -38,7 +38,7 @@ from shapely.ops import transform
 LOGGER = logging.getLogger("build_tiles")
 SOURCE_LAYER = "collection_streets"
 UNKNOWN_SOURCE_LAYER = "collection_unknowns"
-UNKNOWN_MIN_ZOOM = 16
+UNKNOWN_MIN_ZOOM = 15
 TILE_SCHEMA_REVISION = 3
 DEFAULT_MIN_ZOOM = 12
 DEFAULT_MAX_ZOOM = 17

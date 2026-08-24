@@ -522,15 +522,22 @@ def test_v3_unknown_layer_has_no_schedule_properties_and_survives_maxzoom(tmp_pa
                        -74.0, 40.6, -73.99, 40.61, '{}')"""
         )
 
-    report = build_tiles(database, archive, minzoom=16, maxzoom=16)
+    report = build_tiles(database, archive, minzoom=15, maxzoom=16)
 
     assert report.unknown_feature_count == report.maxzoom_unknown_feature_count == 1
     decoded_unknowns = []
+    decoded_unknowns_at_zoom_15 = []
     with sqlite3.connect(archive) as connection:
-        for (tile_data,) in connection.execute("SELECT tile_data FROM tiles"):
+        metadata = dict(connection.execute("SELECT name, value FROM metadata"))
+        for zoom, tile_data in connection.execute("SELECT zoom_level, tile_data FROM tiles"):
             decoded = mapbox_vector_tile.decode(gzip.decompress(tile_data))
-            decoded_unknowns.extend(decoded.get("collection_unknowns", {}).get("features", []))
+            unknowns = decoded.get("collection_unknowns", {}).get("features", [])
+            decoded_unknowns.extend(unknowns)
+            if zoom == 15:
+                decoded_unknowns_at_zoom_15.extend(unknowns)
+    assert metadata["unknown_minzoom"] == "15"
     assert decoded_unknowns
+    assert decoded_unknowns_at_zoom_15
     properties = decoded_unknowns[0]["properties"]
     assert properties["reason_code"] == "OUTSIDE_DSNY_COVERAGE"
     assert not any(key.endswith("_days") or key.endswith("_status") for key in properties)

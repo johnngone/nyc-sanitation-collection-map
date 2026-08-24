@@ -71,7 +71,8 @@ export function App() {
   const sheetGestureHandledRef = useRef(false);
   const selectedDayRef = useRef<Weekday>(dayFromCode(new URLSearchParams(window.location.search).get("day")));
   const selectedTypesRef = useRef<CollectionType[]>(["REFUSE"]);
-  const showUnknownsRef = useRef(true);
+  const showCoverageGapsRef = useRef(true);
+  const showInsufficientAddressRef = useRef(true);
   const updateTileStatusRef = useRef<(() => void) | null>(null);
   const tileErrorRef = useRef<string | null>(null);
   const [selectedDay, setSelectedDay] = useState<Weekday>(selectedDayRef.current);
@@ -81,7 +82,8 @@ export function App() {
   const [selectedTypes, setSelectedTypes] = useState<CollectionType[]>(selectedTypesRef.current);
   const [dataUpdated, setDataUpdated] = useState<string | null>(null);
   const [showInfo, setShowInfo] = useState(false);
-  const [showUnknowns, setShowUnknowns] = useState(true);
+  const [showCoverageGaps, setShowCoverageGaps] = useState(true);
+  const [showInsufficientAddress, setShowInsufficientAddress] = useState(true);
   const [unknownLayerAvailable, setUnknownLayerAvailable] = useState(false);
   const [mobileSheetOpen, setMobileSheetOpen] = useState(true);
   const [brandExpanded, setBrandExpanded] = useState(false);
@@ -288,7 +290,7 @@ export function App() {
                 type: "line",
                 source: sourceId,
                 "source-layer": config.source_layer,
-                minzoom: config.unknown_minzoom ?? 16,
+                minzoom: 16,
                 filter: ["==", ["get", `${type.toLowerCase()}_status`], "UNKNOWN_SOURCE_BLANK"],
                 layout: { visibility },
                 paint: {
@@ -310,14 +312,14 @@ export function App() {
               id: unknownLayerIds[0], type: "line", source: sourceId,
               "source-layer": config.unknown_source_layer, minzoom: config.unknown_minzoom,
               filter: ["in", ["get", "reason_code"], ["literal", ["OUTSIDE_DSNY_COVERAGE", "PARTIAL_GEOMETRY_GAP"]]],
-              layout: { visibility: showUnknownsRef.current ? "visible" : "none" },
+              layout: { visibility: showCoverageGapsRef.current ? "visible" : "none" },
               paint: { "line-color": "#d68a00", "line-width": 3, "line-dasharray": [2, 2], "line-opacity": 0.9, "line-offset": unknownSideOffset },
             });
             map.addLayer({
               id: unknownLayerIds[1], type: "line", source: sourceId,
-              "source-layer": config.unknown_source_layer, minzoom: 17,
+              "source-layer": config.unknown_source_layer, minzoom: 16,
               filter: ["==", ["get", "reason_code"], "INSUFFICIENT_ADDRESS_EVIDENCE"],
-              layout: { visibility: showUnknownsRef.current ? "visible" : "none" },
+              layout: { visibility: showInsufficientAddressRef.current ? "visible" : "none" },
               paint: { "line-color": "#687078", "line-width": 3, "line-dasharray": [1, 2], "line-opacity": 0.9, "line-offset": unknownSideOffset },
             });
           }
@@ -438,13 +440,18 @@ export function App() {
   }, [selectedDay, selectedTypes]);
 
   useEffect(() => {
-    showUnknownsRef.current = showUnknowns;
+    showCoverageGapsRef.current = showCoverageGaps;
     const map = mapRef.current;
-    if (!map) return;
-    for (const id of unknownLayerIds) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", showUnknowns ? "visible" : "none");
-    }
-  }, [showUnknowns]);
+    const layerId = unknownLayerIds[0];
+    if (map?.getLayer(layerId)) map.setLayoutProperty(layerId, "visibility", showCoverageGaps ? "visible" : "none");
+  }, [showCoverageGaps]);
+
+  useEffect(() => {
+    showInsufficientAddressRef.current = showInsufficientAddress;
+    const map = mapRef.current;
+    const layerId = unknownLayerIds[1];
+    if (map?.getLayer(layerId)) map.setLayoutProperty(layerId, "visibility", showInsufficientAddress ? "visible" : "none");
+  }, [showInsufficientAddress]);
 
   function selectDay(day: Weekday) {
     setSelectedDay(day);
@@ -514,7 +521,7 @@ export function App() {
             <img className="brand-logo" src="/logo.png" alt="" draggable="false" />
             <span className="brand-copy">
               <strong>NYC Sanitation – Collection Map</strong>
-              <small>See curbside collection schedules by street, weekday, and service type.</small>
+              <small>See collection schedules by street and day.</small>
             </span>
           </button>
         </div>
@@ -541,12 +548,12 @@ export function App() {
             aria-hidden={isMobileViewport && !mobileSheetOpen}
           >
             <div className="controls-heading">
-              <strong>Collection schedule</strong>
+              <strong>Filters</strong>
               <button ref={infoButtonRef} className="info-button" type="button" aria-label="About this data" onClick={() => setShowInfo(true)}>i</button>
             </div>
             <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-label={day} aria-pressed={selectedDay === day}>{dayShortLabel(day)}</button>)}</div>
             <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
-            {unknownLayerAvailable && <label className="unknown-toggle"><input type="checkbox" checked={showUnknowns} onChange={() => setShowUnknowns((current) => !current)} /> Show source gaps at high zoom</label>}
+            {unknownLayerAvailable && <fieldset className="unknown-controls"><legend>Unresolved street segments <span>(zoomed-in only)</span></legend><label><input type="checkbox" checked={showCoverageGaps} onChange={() => setShowCoverageGaps((current) => !current)} /><i className="unknown-swatch coverage" aria-hidden="true" />Source coverage gaps</label><label><input type="checkbox" checked={showInsufficientAddress} onChange={() => setShowInsufficientAddress((current) => !current)} /><i className="unknown-swatch address" aria-hidden="true" />Insufficient address evidence</label></fieldset>}
             <dl className="status-summary" aria-live="polite">
               <div><dt>Backend</dt><dd><i className={`status-dot ${backendConnection}`} aria-hidden="true" />{backendConnectionLabel(backendConnection)}</dd></div>
               <div><dt>Mapped</dt><dd>{mappedFeatureCount === null ? "Waiting for data" : `${mappedFeatureCount.toLocaleString()} street features`}</dd></div>
@@ -556,7 +563,7 @@ export function App() {
           </div>
         </aside>
       </section>
-      {showInfo && <div className="modal-backdrop" role="presentation" onClick={closeInfo}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button ref={modalCloseRef} className="modal-close" type="button" aria-label="Close information" onClick={closeInfo}>×</button><h2 id="data-info-title">About this map</h2><p>This map shows NYC sanitation collection schedules by street, making them easier to explore at a glance.</p><p>The city's <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">collection schedule lookup</a> provides results for one address at a time. This map brings those schedules together so you can see collection patterns across a neighborhood or the whole city.</p><p>It combines the Department of City Planning's <a href="https://www.nyc.gov/site/planning/data-maps/open-data/dwn-lion.page" target="_blank" rel="noreferrer">LION street data</a> with DSNY's official <a href="https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0" target="_blank" rel="noreferrer">collection-frequency data</a> for refuse, recycling, organics, and bulk pick-up. Records are matched to individual block faces, meaning each side of a street, then converted into map tiles for fast viewing.</p><p>Only matches that pass the project's validation checks are shown as scheduled street lines. Source records that cannot be matched reliably are kept separate instead of being assigned a potentially incorrect schedule. Data is refreshed periodically from these official NYC sources.</p><h3>Disclaimer</h3><p>This is an independent project and is not affiliated with, endorsed by, or operated by the City of New York or the NYC Department of Sanitation. NYC and DSNY names and trademarks belong to their respective owners.</p><p>This map uses public NYC data that has been processed and modified from its original sources. It is provided for informational purposes only, without warranties of accuracy, completeness, or availability. Collection schedules may change due to holidays, weather, emergencies, or other service changes. Always confirm your schedule through the official <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">DSNY collection schedule lookup</a> or by calling 311 before setting items out.</p></section></div>}
+      {showInfo && <div className="modal-backdrop" role="presentation" onClick={closeInfo}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button ref={modalCloseRef} className="modal-close" type="button" aria-label="Close information" onClick={closeInfo}>×</button><h2 id="data-info-title">About this map</h2><p>This map shows NYC sanitation collection schedules by street, making them easier to explore at a glance.</p><p>The city's <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">collection schedule lookup</a> provides results for one address at a time. This map brings those schedules together so you can see collection patterns across a neighborhood or the whole city.</p><p>It combines the Department of City Planning's <a href="https://www.nyc.gov/site/planning/data-maps/open-data/dwn-lion.page" target="_blank" rel="noreferrer">LION street data</a> with DSNY's official <a href="https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0" target="_blank" rel="noreferrer">collection-frequency data</a> for refuse, recycling, organics, and bulk pick-up. Records are matched to individual block faces, meaning each side of a street, then converted into map tiles for fast viewing.</p><p>Only matches that pass the project's validation checks are shown as scheduled street lines. Source records that cannot be matched reliably are kept separate instead of being assigned a potentially incorrect schedule. Data is refreshed periodically from these official NYC sources.</p><h3>Unresolved street segments</h3><div className="unresolved-explanations"><article><div className="unresolved-explanation-heading"><i className="unknown-swatch coverage" aria-hidden="true" /><strong>Source coverage gap</strong></div><p>The LION street side has a valid block-face identity, but its side trace is not completely covered by a DSNY frequency polygon.</p><small>Orange dashed line, from zoom 15</small></article><article><div className="unresolved-explanation-heading"><i className="unknown-swatch address" aria-hidden="true" /><strong>Insufficient address evidence</strong></div><p>LION does not provide a usable block-face ID for that side. An address range alone is not considered strong enough evidence to assign a schedule.</p><small>Gray dashed line, from zoom 16</small></article></div><h3>Disclaimer</h3><p>This is an independent project and is not affiliated with, endorsed by, or operated by the City of New York or the NYC Department of Sanitation. NYC and DSNY names and trademarks belong to their respective owners.</p><p>This map uses public NYC data that has been processed and modified from its original sources. It is provided for informational purposes only, without warranties of accuracy, completeness, or availability. Collection schedules may change due to holidays, weather, emergencies, or other service changes. Always confirm your schedule through the official <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">DSNY collection schedule lookup</a> or by calling 311 before setting items out.</p></section></div>}
     </main>
   );
 }
