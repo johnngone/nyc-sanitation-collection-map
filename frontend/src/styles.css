@@ -333,6 +333,11 @@ label input[type="checkbox"] {
   font-size: 1.1rem;
 }
 
+.info-modal h3 {
+  margin: 1.25rem 0 .75rem;
+  font-size: .95rem;
+}
+
 .info-modal p {
   margin: .75rem 0;
   color: #596773;
