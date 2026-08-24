@@ -10,6 +10,21 @@ from app.database import initialize
 from app.main import app
 
 
+def test_runtime_tile_contract_rejects_unsupported_declared_revision() -> None:
+    assert api._expected_tile_schema_revision(
+        {
+            "manifest_version": 3,
+            "artifacts": {"tileset": {"tile_schema_revision": 4}},
+        }
+    ) == 4
+    assert api._expected_tile_schema_revision(
+        {
+            "manifest_version": 3,
+            "artifacts": {"tileset": {"tile_schema_revision": 5}},
+        }
+    ) is None
+
+
 def test_invalid_day_returns_422(tmp_path, monkeypatch) -> None:
     database = tmp_path / "app.sqlite3"
     initialize(database)

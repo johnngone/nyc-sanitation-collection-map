@@ -1,9 +1,12 @@
 """Download official sources, build a staged citywide dataset, and promote it atomically."""
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import logging
 import os
+import platform
 import shutil
 import sqlite3
 import subprocess
@@ -18,18 +21,25 @@ from time import monotonic
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.load_processed import load_prepared_payload
 from scripts.release_validation import (
+    EXPECTED_TILE_SCHEMA_REVISION,
+    PrevalidatedReleaseComponents,
+    RELEASE_FILENAMES,
     atomic_json,
     file_sha256,
     publish_release,
+    read_json_object,
     validate_database,
     validate_ingestion_audit,
+    validate_and_prepare_processed_geojson,
     validate_processed_database_semantics,
-    validate_processed_geojson,
+    validate_release_bundle,
+    validate_regression_gates,
     validate_tile_build_report,
     validate_tileset,
 )
-from backend.app.releases import MANIFEST_VERSION
+from backend.app.releases import MANIFEST_VERSION, read_current_release
 from scripts.recovery_shadow import (
     GEOMETRY_RULE_VERSION,
     identity_shadow_report,
@@ -49,6 +59,252 @@ CSCL_METADATA_URL = "https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/se
 USER_AGENT = "nyc-sanitation-map/1.0"
 DOWNLOAD_PROGRESS_BYTES = 16 * 1024 * 1024
 DOWNLOAD_PROGRESS_SECONDS = 30.0
+REFRESH_FINGERPRINT_VERSION = 1
+PROCESSING_CODE_PATHS = (
+    "backend/app/database.py",
+    "backend/app/releases.py",
+    "scripts/build_pilot.py",
+    "scripts/build_tiles.py",
+    "scripts/load_processed.py",
+    "scripts/recovery_shadow.py",
+    "scripts/release_validation.py",
+    "scripts/run_refresh.py",
+)
+PROCESSING_DISTRIBUTIONS = (
+    "geopandas",
+    "httpx",
+    "mapbox-vector-tile",
+    "numpy",
+    "pandas",
+    "pyogrio",
+    "pyproj",
+    "shapely",
+)
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def processing_fingerprint(
+    *,
+    tile_minzoom: int,
+    tile_maxzoom: int,
+    side_offset_feet: float,
+    tile_max_compressed_bytes: int | None = None,
+    tile_max_uncompressed_bytes: int | None = None,
+) -> dict[str, object]:
+    """Bind a release to every local input that can change generated data."""
+
+    repository = Path(__file__).resolve().parents[1]
+    if tile_max_compressed_bytes is None:
+        tile_max_compressed_bytes = int(
+            os.getenv("TILE_MAX_COMPRESSED_BYTES", "512000")
+        )
+    if tile_max_uncompressed_bytes is None:
+        tile_max_uncompressed_bytes = int(
+            os.getenv("TILE_MAX_UNCOMPRESSED_BYTES", "5242880")
+        )
+    code_sha256 = {
+        relative: file_sha256(repository / relative)
+        for relative in PROCESSING_CODE_PATHS
+    }
+    runtime_versions: dict[str, str] = {}
+    for distribution in PROCESSING_DISTRIBUTIONS:
+        try:
+            runtime_versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            runtime_versions[distribution] = "unavailable"
+    inputs: dict[str, object] = {
+        "configuration": {
+            "side_offset_feet": side_offset_feet,
+            "tile_minzoom": tile_minzoom,
+            "tile_maxzoom": tile_maxzoom,
+            "tile_max_compressed_bytes": tile_max_compressed_bytes,
+            "tile_max_uncompressed_bytes": tile_max_uncompressed_bytes,
+        },
+        "schemas": {
+            "manifest_version": MANIFEST_VERSION,
+            "processed_geojson_revision": 3,
+            "tile_schema_revision": EXPECTED_TILE_SCHEMA_REVISION,
+        },
+        "code_sha256": code_sha256,
+        "runtime": {
+            "python_implementation": platform.python_implementation(),
+            "python_version": platform.python_version(),
+            "platform_system": platform.system(),
+            "platform_machine": platform.machine(),
+            "sqlite_version": sqlite3.sqlite_version,
+            "distributions": runtime_versions,
+        },
+    }
+    return {
+        "fingerprint_version": REFRESH_FINGERPRINT_VERSION,
+        "sha256": _canonical_sha256(inputs),
+        "inputs": inputs,
+    }
+
+
+def source_fingerprint(
+    *,
+    input_sha256: dict[str, str],
+    dsny_source_audit: dict[str, object],
+    lion_source_audit: dict[str, object],
+    pad_source_audit: dict[str, object],
+    lion_release: str | None,
+    pad_release: str | None,
+    lion_catalog_release: str | None,
+    pad_catalog_release: str | None,
+    lion_metadata: dict[str, object],
+    pad_metadata: dict[str, object],
+    addresspoint_metadata_before: dict[str, object],
+    addresspoint_metadata_after: dict[str, object],
+    cscl_metadata_before: dict[str, object],
+    cscl_metadata_after: dict[str, object],
+) -> dict[str, object]:
+    """Return the exact public-source content and revision identity."""
+
+    inputs: dict[str, object] = {
+        "input_sha256": dict(input_sha256),
+        "dsny": dict(dsny_source_audit),
+        "lion": {
+            "transfer": {
+                key: lion_source_audit.get(key)
+                for key in ("bytes", "etag", "last_modified")
+            },
+            "archive_release": lion_release,
+            "catalog_release": lion_catalog_release,
+            "metadata": lion_metadata,
+        },
+        "pad": {
+            "transfer": {
+                key: pad_source_audit.get(key)
+                for key in ("bytes", "etag", "last_modified")
+            },
+            "archive_release": pad_release,
+            "catalog_release": pad_catalog_release,
+            "metadata": pad_metadata,
+        },
+        "addresspoint": {
+            "metadata_before": addresspoint_metadata_before,
+            "metadata_after": addresspoint_metadata_after,
+        },
+        "cscl": {
+            "metadata_before": cscl_metadata_before,
+            "metadata_after": cscl_metadata_after,
+        },
+    }
+    return {
+        "fingerprint_version": REFRESH_FINGERPRINT_VERSION,
+        "sha256": _canonical_sha256(inputs),
+        "inputs": inputs,
+    }
+
+
+def refresh_fingerprint(
+    processing: dict[str, object],
+    sources: dict[str, object],
+) -> dict[str, object]:
+    inputs = {"processing": processing, "sources": sources}
+    return {
+        "fingerprint_version": REFRESH_FINGERPRINT_VERSION,
+        "sha256": _canonical_sha256(inputs),
+        **inputs,
+    }
+
+
+def unchanged_release(
+    manifest_path: Path,
+    candidate_fingerprint: dict[str, object],
+    *,
+    regression_gate: dict[str, object],
+) -> dict[str, object] | None:
+    """Return the committed manifest only when it is safe to reuse exactly."""
+
+    current_release = read_current_release(manifest_path)
+    if current_release is None:
+        return None
+    current = current_release.manifest
+    if current.get("refresh_fingerprint") != candidate_fingerprint:
+        return None
+
+    source_inputs = candidate_fingerprint.get("sources")
+    if not isinstance(source_inputs, dict):
+        return None
+    raw_source_inputs = source_inputs.get("inputs")
+    if not isinstance(raw_source_inputs, dict):
+        return None
+    input_sha256 = raw_source_inputs.get("input_sha256")
+    if current.get("input_sha256") != input_sha256 or not isinstance(input_sha256, dict):
+        return None
+    artifacts = current.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return None
+    for source, artifact_name in (
+        ("dsny", "source_dsny"),
+        ("lion", "source_lion"),
+        ("pad", "source_pad"),
+    ):
+        descriptor = artifacts.get(artifact_name)
+        if not isinstance(descriptor, dict) or descriptor.get("sha256") != input_sha256.get(source):
+            return None
+
+    version = current.get("dataset_version")
+    release_path = current.get("release_path")
+    if not isinstance(version, str) or release_path != f"releases/{version}":
+        return None
+    release_candidate = manifest_path.parent / "releases" / version
+    if release_candidate.is_symlink() or not release_candidate.is_dir():
+        return None
+    release_dir = release_candidate.resolve()
+    if release_dir.parent != (manifest_path.parent / "releases").resolve():
+        return None
+    installed_manifest = release_dir / "release_manifest.json"
+    if installed_manifest.is_symlink() or not installed_manifest.is_file():
+        return None
+    try:
+        installed = read_json_object(installed_manifest, "installed release manifest")
+    except RuntimeError:
+        return None
+    # Promotion adds release history only to the atomic pointer. Everything
+    # else in the installed manifest is immutable and must still match it.
+    installed_binding = dict(installed)
+    installed_binding.pop("previous_releases", None)
+    current_binding = dict(current)
+    current_binding.pop("previous_releases", None)
+    if installed_binding != current_binding:
+        return None
+    if set(artifacts) != set(RELEASE_FILENAMES):
+        return None
+    for name, filename in RELEASE_FILENAMES.items():
+        descriptor = artifacts.get(name)
+        artifact = release_dir / filename
+        expected_sha256 = descriptor.get("sha256") if isinstance(descriptor, dict) else None
+        if (
+            not isinstance(descriptor, dict)
+            or descriptor.get("path") != filename
+            or not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
+            or artifact.is_symlink()
+            or not artifact.is_file()
+        ):
+            return None
+        try:
+            if file_sha256(artifact) != expected_sha256:
+                return None
+        except OSError:
+            return None
+    counts = current.get("counts")
+    if not isinstance(counts, dict):
+        return None
+    validate_regression_gates(counts, current, **regression_gate)
+    return current
 
 
 def _format_bytes(value: int) -> str:
@@ -464,7 +720,7 @@ def main() -> None:
     parser.add_argument("--allow-large-run", action="store_true")
     parser.add_argument("--manifest", type=Path, default=Path(os.getenv("DATA_MANIFEST_PATH", "data/data_manifest.json")))
     parser.add_argument("--tile-minzoom", type=int, default=int(os.getenv("TILE_MIN_ZOOM", "12")))
-    parser.add_argument("--tile-maxzoom", type=int, default=int(os.getenv("TILE_MAX_ZOOM", "17")))
+    parser.add_argument("--tile-maxzoom", type=int, default=int(os.getenv("TILE_MAX_ZOOM", "16")))
     parser.add_argument("--side-offset-feet", type=float, default=25.0)
     parser.add_argument(
         "--release-retention",
@@ -505,6 +761,12 @@ def main() -> None:
         raise SystemExit("--release-retention must be at least 2")
     if not 0 <= args.max_count_drop_percent < 100:
         raise SystemExit("--max-count-drop-percent must be at least 0 and below 100")
+    regression_gate = {
+        "min_lion_rows": args.min_lion_rows,
+        "min_dsny_rows": args.min_dsny_rows,
+        "min_output_features": args.min_output_features,
+        "max_drop_fraction": args.max_count_drop_percent / 100,
+    }
     manifest_path = args.manifest.resolve()
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".nyc-refresh-", dir=manifest_path.parent) as temporary:
@@ -543,6 +805,53 @@ def main() -> None:
         pad_catalog_release = metadata_release_identifier(pad_metadata)
         addresspoint_before = _remote_metadata(ADDRESSPOINT_METADATA_URL)
         cscl_metadata = _remote_metadata(CSCL_METADATA_URL)
+        processing_identity = processing_fingerprint(
+            tile_minzoom=args.tile_minzoom,
+            tile_maxzoom=args.tile_maxzoom,
+            side_offset_feet=args.side_offset_feet,
+        )
+        # A fast refresh still observes the shadow-source freshness gates. Two
+        # metadata reads prevent a changing AddressPoint/CSCL revision from
+        # making an old release look current merely because its primary inputs
+        # are unchanged.
+        addresspoint_probe_after = _remote_metadata(ADDRESSPOINT_METADATA_URL)
+        cscl_probe_after = _remote_metadata(CSCL_METADATA_URL)
+        candidate_source_identity = source_fingerprint(
+            input_sha256=input_hashes,
+            dsny_source_audit=dsny_source_audit,
+            lion_source_audit=lion_source_audit,
+            pad_source_audit=pad_source_audit,
+            lion_release=lion_release,
+            pad_release=pad_release,
+            lion_catalog_release=lion_catalog_release,
+            pad_catalog_release=pad_catalog_release,
+            lion_metadata=lion_metadata,
+            pad_metadata=pad_metadata,
+            addresspoint_metadata_before=addresspoint_before,
+            addresspoint_metadata_after=addresspoint_probe_after,
+            cscl_metadata_before=cscl_metadata,
+            cscl_metadata_after=cscl_probe_after,
+        )
+        if (
+            addresspoint_before == addresspoint_probe_after
+            and cscl_metadata == cscl_probe_after
+        ):
+            reusable = unchanged_release(
+                manifest_path,
+                refresh_fingerprint(processing_identity, candidate_source_identity),
+                regression_gate=regression_gate,
+            )
+            if reusable is not None:
+                LOGGER.info(
+                    "Sources and processing fingerprint unchanged; retaining dataset version=%s "
+                    "and skipping extraction plus stages 4-8",
+                    reusable["dataset_version"],
+                )
+                return
+        else:
+            LOGGER.info(
+                "Shadow source metadata changed during freshness probe; full refresh required"
+            )
         extracted = staging / "lion-extracted"
         shutil.unpack_archive(lion_zip, extracted)
         geodatabases = sorted(extracted.rglob("*.gdb"))
@@ -623,11 +932,9 @@ def main() -> None:
         atomic_json(bundle / "recovery_shadow_report.json", recovery_report)
         LOGGER.info("Stage 5/8: validating audited GeoJSON and provenance")
         stage_started = monotonic()
-        processed_summary = validate_processed_geojson(processed)
-        processed_payload = json.loads(processed.read_text(encoding="utf-8"))
-        unknown_records = processed_payload.get("unknown_features", [])
-        if not isinstance(unknown_records, list):
-            raise RuntimeError("processed unknown_features must be a list")
+        processed_validation = validate_and_prepare_processed_geojson(processed)
+        processed_summary = processed_validation.summary
+        unknown_records = processed_validation.unknown_features
         unknown_reason_counts: dict[str, int] = {}
         cscl_physical_ids: set[str] = set()
         for feature in unknown_records:
@@ -657,7 +964,7 @@ def main() -> None:
         atomic_json(bundle / "recovery_shadow_report.json", recovery_report)
         atomic_json(
             bundle / "unknown_block_faces.geojson",
-            {"type": "FeatureCollection", "features": processed_payload.get("unknown_features", [])},
+            {"type": "FeatureCollection", "features": unknown_records},
         )
         ingestion_audit = validate_ingestion_audit(
             staged_audit,
@@ -679,7 +986,7 @@ def main() -> None:
         staged_db = bundle / "app.sqlite3"
         LOGGER.info("Stage 6/8: loading audited GeoJSON into SQLite")
         stage_started = monotonic()
-        subprocess.run([sys.executable, "scripts/load_processed.py", str(processed), "--database", str(staged_db)], check=True)
+        load_prepared_payload(processed_validation.prepared, staged_db)
         _bind_database_metadata(
             staged_db,
             dataset_version=dataset_version,
@@ -705,6 +1012,10 @@ def main() -> None:
             database_summary["schedule_count"],
             monotonic() - stage_started,
         )
+        # The semantic hash maps remain in processed_summary for the final
+        # cross-artifact gate; the much larger geometry/provenance objects are
+        # no longer needed after their independently reconciled SQLite load.
+        del processed_validation, unknown_records
 
         staged_tileset = bundle / "collection_streets.mbtiles"
         tile_report_path = bundle / "tile_build_report.json"
@@ -761,6 +1072,27 @@ def main() -> None:
             monotonic() - stage_started,
         )
 
+        cscl_after = _remote_metadata(CSCL_METADATA_URL)
+        release_source_identity = source_fingerprint(
+            input_sha256=input_hashes,
+            dsny_source_audit=dsny_source_audit,
+            lion_source_audit=lion_source_audit,
+            pad_source_audit=pad_source_audit,
+            lion_release=lion_release,
+            pad_release=pad_release,
+            lion_catalog_release=lion_catalog_release,
+            pad_catalog_release=pad_catalog_release,
+            lion_metadata=lion_metadata,
+            pad_metadata=pad_metadata,
+            addresspoint_metadata_before=addresspoint_before,
+            addresspoint_metadata_after=addresspoint_after,
+            cscl_metadata_before=cscl_metadata,
+            cscl_metadata_after=cscl_after,
+        )
+        release_refresh_fingerprint = refresh_fingerprint(
+            processing_identity,
+            release_source_identity,
+        )
         audit_summary = {key: value for key, value in ingestion_audit.items() if key != "records"}
         lion_source_audit["record_count"] = ingestion_audit["source_rows"]
         source_report = {
@@ -855,6 +1187,7 @@ def main() -> None:
             "dataset_version": dataset_version,
             "release_path": f"releases/{dataset_version}",
             "processed_at": processed_at,
+            "refresh_fingerprint": release_refresh_fingerprint,
             "sources": source_report["sources"],
             "input_sha256": input_hashes,
             "counts": counts,
@@ -918,16 +1251,22 @@ def main() -> None:
         atomic_json(bundle / "release_manifest.json", manifest)
         LOGGER.info("Stage 8/8: validating release bundle and publishing atomically")
         stage_started = monotonic()
+        validated_bundle = validate_release_bundle(
+            bundle,
+            prevalidated_components=PrevalidatedReleaseComponents(
+                processed=processed_summary,
+                audit=ingestion_audit,
+                database=database_summary,
+                tileset=tileset_summary,
+                tile_report=tile_report,
+            ),
+        )
         published = publish_release(
             bundle,
             manifest_path,
             retention=args.release_retention,
-            regression_gate={
-                "min_lion_rows": args.min_lion_rows,
-                "min_dsny_rows": args.min_dsny_rows,
-                "min_output_features": args.min_output_features,
-                "max_drop_fraction": args.max_count_drop_percent / 100,
-            },
+            regression_gate=regression_gate,
+            validated_bundle=validated_bundle,
         )
         LOGGER.info(
             "Stage 8/8 complete: promoted audited dataset version=%s block_faces=%s tiles=%s elapsed_s=%.1f",

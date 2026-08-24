@@ -23,23 +23,22 @@ FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not en
 
 ## Vector-tile contract
 
-The default v3 archive is an MBTiles SQLite file covering zooms 12–17. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 15–17. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 15. The runtime continues to read retained v2 releases during rollout.
+The default v4 archive is an MBTiles SQLite file covering zooms 12–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 15–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 15. The runtime continues to read retained v2 and v3 releases during rollout.
 
 | Property | Meaning |
 |---|---|
 | `id` | Unique stored feature key |
 | `origin_block_face_id` | Original LION block-face ID when that column is present |
-| `name`, `street_name` | Display street name |
+| `street_name` | Display street name |
 | `borough`, `side` | Borough and `LEFT`/`RIGHT` side |
 | `refuse_days` | Comma-separated weekday codes |
 | `recycling_days` | Comma-separated weekday codes |
 | `organics_days` | Comma-separated weekday codes |
 | `bulk_days` | Comma-separated weekday codes |
 | `source`, `retrieved_at` | Schedule provenance |
-| `*_status`, `*_rule`, `*_conflict`, `*_provenance` | Per-type evidence state and policy provenance |
-| `identity_method`, `geometry_method` | How identity and geometry were validated |
+| `*_status`, `*_conflict` | Per-type evidence state and whether an explicit source schedule conflicts with the general policy relationship |
 
-Blank day lists with `UNKNOWN_SOURCE_BLANK` mean the official source schedule is unavailable, never that service does not exist. Every known block face has exactly four state rows. Unknown-layer features contain no weekday or status properties.
+Blank day lists with `UNKNOWN_SOURCE_BLANK` mean the official source schedule is unavailable, never that service does not exist. Every known block face has exactly four state rows. Unknown-layer features contain only `street_name`, `side`, `reason_code`, and `reason`; detailed audit lineage remains in SQLite and release reports instead of being repeated in every tile placement.
 
 A line crossing a tile boundary is clipped into each intersecting tile. `feature_count` is the unique source count; `tile_feature_count` includes these per-tile placements.
 
@@ -88,7 +87,9 @@ data/
 
 The dataset version combines the processing timestamp and processed-data digest. Each artifact descriptor carries a SHA-256 checksum and relevant count/version bindings.
 
-The background refresh builds in a temporary directory on the same volume, validates the complete bundle, installs a new immutable release directory, and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. Malformed committed v2 or v3 pointers fail closed instead of falling back to loose legacy files.
+Every attempt downloads and hashes the authoritative source snapshots first. If those bytes and revisions, the processing code/runtime, and the relevant build configuration exactly match the committed release, the refresh reruns the regression floors and then skips extraction, processing, SQLite loading, and tile generation.
+
+For a changed release, processed GeoJSON is parsed and normalized once; the same validated objects feed semantic hashing and SQLite loading. The final bundle gate reuses those in-process Stage 5-7 results while rechecking every artifact hash and cross-artifact binding. It then atomically renames the private directory into `releases/` on the same filesystem—without copying the multi-gigabyte bundle—and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. Malformed committed v2 or v3 manifest pointers fail closed instead of falling back to loose legacy files.
 
 On first access to a new production-sized release, the app hashes the committed database and tileset once on a background worker. While this single-flight check is running, `/api/health` returns HTTP `503` with `Committed artifact checksums are verifying`, and `/api/map-config` reports `available: false`; the frontend retries both after 0.5 seconds and exponentially backs off to a 15-second cap. Verified results are cached against the artifact path, size, modification time, and expected digest. `HEALTH_SYNC_HASH_MAX_BYTES` is the maximum total artifact size verified inline (16 MiB by default). Lowering it moves more checks to the background; raising it can make a health request block on more I/O. Every artifact is still hashed.
 

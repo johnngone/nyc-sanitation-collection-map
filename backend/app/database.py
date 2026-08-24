@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Iterator
 
@@ -149,7 +150,7 @@ def connect(database_path: str | Path) -> sqlite3.Connection:
 
 def initialize(database_path: str | Path) -> None:
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
-    with connect(database_path) as connection:
+    with closing(connect(database_path)) as connection:
         connection.executescript(SCHEMA)
         columns = {
             str(row[1])
@@ -165,6 +166,7 @@ def initialize(database_path: str | Path) -> None:
             "CREATE INDEX IF NOT EXISTS idx_block_face_origin "
             "ON block_faces(origin_block_face_id)"
         )
+        connection.commit()
 
 
 def iter_rows(connection: sqlite3.Connection, query: str, parameters: tuple[object, ...] = ()) -> Iterator[sqlite3.Row]:

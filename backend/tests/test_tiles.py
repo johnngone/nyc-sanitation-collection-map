@@ -11,7 +11,11 @@ from fastapi.testclient import TestClient
 from app import api
 from app.database import initialize
 from app.main import app
-from scripts.build_tiles import _tile_geometry_with_source_fallback, build_tiles
+from scripts.build_tiles import (
+    DEFAULT_MAX_ZOOM,
+    _tile_geometry_with_source_fallback,
+    build_tiles,
+)
 
 
 def _write_mbtiles(
@@ -225,7 +229,8 @@ def test_builder_writes_one_feature_per_geometry_with_size_and_source_binding(tm
     )
 
     assert report.version == "source-v7"
-    assert report.tile_schema_revision == 3
+    assert report.tile_schema_revision == 4
+    assert DEFAULT_MAX_ZOOM == 16
     assert report.feature_count == 1
     assert report.geometry_count == 1
     assert report.maxzoom_feature_count == 1
@@ -243,7 +248,7 @@ def test_builder_writes_one_feature_per_geometry_with_size_and_source_binding(tm
         tile_rows = connection.execute("SELECT tile_data FROM tiles").fetchall()
     assert metadata["format"] == "pbf"
     assert metadata["version"] == "source-v7"
-    assert metadata["tile_schema_revision"] == "3"
+    assert metadata["tile_schema_revision"] == "4"
     assert metadata["source_database_sha256"] == report.source_database_sha256
     assert metadata["source_database_version"] == "database-v3"
     assert metadata["source_block_face_count"] == "1"
@@ -279,22 +284,29 @@ def test_builder_writes_one_feature_per_geometry_with_size_and_source_binding(tm
     assert all("collection_type" not in item and "days" not in item for item in properties)
     assert all(item["source"] == "DSNY" for item in properties)
     assert all(item["retrieved_at"] == "2026-08-19" for item in properties)
-    assert all(
-        {
-            "id",
-            "name",
-            "street_name",
-            "borough",
-            "side",
-            "refuse_days",
-            "recycling_days",
-            "organics_days",
-            "bulk_days",
-            "source",
-            "retrieved_at",
-        }.issubset(item)
-        for item in properties
-    )
+    expected_fields = {
+        "id",
+        "origin_block_face_id",
+        "street_name",
+        "borough",
+        "side",
+        "refuse_days",
+        "recycling_days",
+        "organics_days",
+        "bulk_days",
+        "source",
+        "retrieved_at",
+        "refuse_status",
+        "recycling_status",
+        "organics_status",
+        "bulk_status",
+        "refuse_conflict",
+        "recycling_conflict",
+        "organics_conflict",
+        "bulk_conflict",
+    }
+    assert all(set(item) == expected_fields for item in properties)
+    assert set(json.loads(metadata["json"])["vector_layers"][0]["fields"]) == expected_fields
     assert report.tile_feature_count == len(properties)
     assert report.tile_size_metrics["max_compressed_tile_bytes"] == max(compressed_sizes)
     assert report.tile_size_metrics["max_uncompressed_tile_bytes"] == max(uncompressed_sizes)
@@ -467,14 +479,14 @@ def test_builder_reconciles_subgrid_unknown_without_fabricating_geometry(tmp_pat
     }
     assert 0 < nonrenderable["projected_length_meters"] < 0.001
     with sqlite3.connect(archive) as connection:
-        decoded_unknown_ids = {
-            feature["properties"]["id"]
+        decoded_unknown_streets = {
+            feature["properties"]["street_name"]
             for (tile_data,) in connection.execute("SELECT tile_data FROM tiles")
             for feature in mapbox_vector_tile.decode(gzip.decompress(tile_data))
             .get("collection_unknowns", {})
             .get("features", [])
         }
-    assert "unknown-tiny" not in decoded_unknown_ids
+    assert "TINY GAP" not in decoded_unknown_streets
 
 
 def test_builder_rejects_buffer_smaller_than_frontend_style_reach(tmp_path) -> None:
@@ -505,7 +517,7 @@ def test_builder_rejects_raising_hard_tile_size_ceilings(tmp_path) -> None:
         )
 
 
-def test_v3_unknown_layer_has_no_schedule_properties_and_survives_maxzoom(tmp_path) -> None:
+def test_v4_unknown_layer_has_only_frontend_properties_and_survives_maxzoom(tmp_path) -> None:
     database = tmp_path / "app.sqlite3"
     archive = tmp_path / "collection.mbtiles"
     _source_database(database)
@@ -538,6 +550,86 @@ def test_v3_unknown_layer_has_no_schedule_properties_and_survives_maxzoom(tmp_pa
     assert metadata["unknown_minzoom"] == "15"
     assert decoded_unknowns
     assert decoded_unknowns_at_zoom_15
+    assert {feature["id"] for feature in decoded_unknowns} == {1}
     properties = decoded_unknowns[0]["properties"]
-    assert properties["reason_code"] == "OUTSIDE_DSNY_COVERAGE"
-    assert not any(key.endswith("_days") or key.endswith("_status") for key in properties)
+    assert properties == {
+        "street_name": "UNKNOWN STREET",
+        "side": "LEFT",
+        "reason_code": "OUTSIDE_DSNY_COVERAGE",
+        "reason": "No exact polygon coverage",
+    }
+    unknown_fields = json.loads(metadata["json"])["vector_layers"][1]["fields"]
+    assert set(unknown_fields) == set(properties)
+
+
+def test_v4_unknown_mvt_ids_are_compact_stable_and_unique(tmp_path) -> None:
+    database = tmp_path / "app.sqlite3"
+    first_archive = tmp_path / "first.mbtiles"
+    second_archive = tmp_path / "second.mbtiles"
+    _source_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            """INSERT INTO unknown_block_faces
+               (unknown_id, technical_identity, segment_id, borough, street_name, side,
+                reason_code, reason, identity_method, geometry_method, geometry_wkt,
+                min_x, min_y, max_x, max_y, evidence_json)
+               VALUES (?, ?, ?, 'BROOKLYN', ?, ?, 'OUTSIDE_DSNY_COVERAGE',
+                       'No exact polygon coverage', 'UNRESOLVED',
+                       'DIRECT_SIDE_TRACE_UNRESOLVED', ?, ?, ?, ?, ?, '{}')""",
+            [
+                (
+                    "unknown-z",
+                    "LION:2:RIGHT",
+                    "2",
+                    "ZULU UNKNOWN",
+                    "RIGHT",
+                    "LINESTRING (-73.98 40.62, -73.97 40.63)",
+                    -73.98,
+                    40.62,
+                    -73.97,
+                    40.63,
+                ),
+                (
+                    "unknown-a",
+                    "LION:1:LEFT",
+                    "1",
+                    "ALPHA UNKNOWN",
+                    "LEFT",
+                    "LINESTRING (-74.0 40.6, -73.99 40.61)",
+                    -74.0,
+                    40.6,
+                    -73.99,
+                    40.61,
+                ),
+            ],
+        )
+
+    build_tiles(database, first_archive, minzoom=15, maxzoom=16)
+    build_tiles(database, second_archive, minzoom=15, maxzoom=16)
+
+    def decoded_ids_by_street(path):
+        ids_by_street: dict[str, set[int]] = {}
+        with sqlite3.connect(path) as connection:
+            rows = connection.execute(
+                """SELECT tile_data FROM tiles
+                   ORDER BY zoom_level, tile_column, tile_row"""
+            )
+            for (tile_data,) in rows:
+                unknowns = mapbox_vector_tile.decode(gzip.decompress(tile_data)).get(
+                    "collection_unknowns", {}
+                ).get("features", [])
+                for feature in unknowns:
+                    assert set(feature["properties"]) == {
+                        "street_name",
+                        "side",
+                        "reason_code",
+                        "reason",
+                    }
+                    ids_by_street.setdefault(feature["properties"]["street_name"], set()).add(
+                        feature["id"]
+                    )
+        return ids_by_street
+
+    expected = {"ALPHA UNKNOWN": {1}, "ZULU UNKNOWN": {2}}
+    assert decoded_ids_by_street(first_archive) == expected
+    assert decoded_ids_by_street(second_archive) == expected

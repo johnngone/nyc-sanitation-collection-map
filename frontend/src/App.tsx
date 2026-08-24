@@ -209,7 +209,7 @@ export function App() {
             !config.tiles_url
             || !config.version
             || !config.source_layer
-            || ![2, 3].includes(config.tile_schema_revision ?? 0)
+            || ![2, 3, 4].includes(config.tile_schema_revision ?? 0)
             || typeof config.minzoom !== "number"
             || typeof config.maxzoom !== "number"
             || !Number.isInteger(config.minzoom)
@@ -226,7 +226,7 @@ export function App() {
           }
 
           tilesInitialized = true;
-          const tileSchemaRevision = config.tile_schema_revision as 2 | 3;
+          const tileSchemaRevision = config.tile_schema_revision as 2 | 3 | 4;
           const hasUnknownLayer = tileSchemaRevision >= 3
             && Boolean(config.unknown_source_layer)
             && typeof config.unknown_minzoom === "number";

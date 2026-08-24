@@ -11,9 +11,11 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import time
 import zlib
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import mapbox_vector_tile
@@ -24,9 +26,18 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 
 from backend.app.releases import MANIFEST_VERSION, VERSION_PATTERN, read_current_release
+from scripts.load_processed import (
+    PreparedPayload,
+    ValidatedFeature,
+    ValidatedUnknownFeature,
+    prepare_features,
+    prepare_payload,
+    prepare_unknown_features,
+)
 
 
 LOGGER = logging.getLogger("release_validation")
+_PROMOTION_THREAD_LOCK = threading.Lock()
 VALID_COLLECTION_TYPES = {"REFUSE", "RECYCLING", "ORGANICS", "BULK"}
 AUDIT_OUTCOMES = {
     "matched",
@@ -48,7 +59,8 @@ SOURCE_ROW_OUTCOMES = {
 }
 FATAL_SIDE_OUTCOMES = {"ambiguous", "invalid", "conflicts"}
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-EXPECTED_TILE_SCHEMA_REVISION = 3
+EXPECTED_TILE_SCHEMA_REVISION = 4
+SUPPORTED_TILE_SCHEMA_REVISIONS = {3, EXPECTED_TILE_SCHEMA_REVISION}
 MAX_RELEASE_COMPRESSED_TILE_BYTES = 512_000
 MAX_RELEASE_UNCOMPRESSED_TILE_BYTES = 5_242_880
 TILE_SOURCE_LAYER = "collection_streets"
@@ -56,10 +68,9 @@ TILE_UNKNOWN_SOURCE_LAYER = "collection_unknowns"
 MVT_EXTENT = 4096
 WEB_MERCATOR_HALF_WORLD = 20_037_508.342789244
 MIN_RENDER_BUFFER_PIXELS = 16.0
-TILE_REQUIRED_PROPERTIES = {
+TILE_V4_REQUIRED_PROPERTIES = {
     "id",
     "origin_block_face_id",
-    "name",
     "street_name",
     "borough",
     "side",
@@ -73,13 +84,70 @@ TILE_REQUIRED_PROPERTIES = {
     "recycling_status",
     "organics_status",
     "bulk_status",
+    "refuse_conflict",
+    "recycling_conflict",
+    "organics_conflict",
+    "bulk_conflict",
+}
+TILE_OPTIONAL_PROPERTIES = {"source_block_face_id"}
+TILE_V3_STATE_PROPERTIES = {
+    f"{kind}_{suffix}"
+    for kind in ("refuse", "recycling", "organics", "bulk")
+    for suffix in ("rule", "conflict", "provenance")
+}
+TILE_V3_REQUIRED_PROPERTIES = (
+    TILE_V4_REQUIRED_PROPERTIES
+    - {
+        "refuse_conflict",
+        "recycling_conflict",
+        "organics_conflict",
+        "bulk_conflict",
+    }
+    | {
+        "name",
+        "identity_method",
+        "geometry_method",
+    }
+    | TILE_V3_STATE_PROPERTIES
+)
+UNKNOWN_TILE_V4_REQUIRED_PROPERTIES = {
+    "street_name",
+    "side",
+    "reason_code",
+    "reason",
+}
+UNKNOWN_TILE_V3_REQUIRED_PROPERTIES = {
+    "id",
+    "technical_identity",
+    "segment_id",
+    "borough",
+    "street_name",
+    "side",
+    "reason_code",
+    "reason",
     "identity_method",
     "geometry_method",
 }
-UNKNOWN_TILE_REQUIRED_PROPERTIES = {
-    "id", "technical_identity", "segment_id", "borough", "street_name", "side",
-    "reason_code", "reason", "identity_method", "geometry_method",
-}
+
+
+@dataclass(frozen=True)
+class ValidatedProcessedSnapshot:
+    """Processed data normalized once for semantic hashing and SQLite loading."""
+
+    summary: dict[str, object]
+    prepared: PreparedPayload
+    unknown_features: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class PrevalidatedReleaseComponents:
+    """Trusted Stage 5-7 results for the final structural release gate."""
+
+    processed: dict[str, object]
+    audit: dict[str, object]
+    database: dict[str, object]
+    tileset: dict[str, object]
+    tile_report: dict[str, object]
 VALID_DAYS = {"MON", "TUE", "WED", "THU", "FRI", "SAT"}
 DAY_ORDER = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
 COLLECTION_DAY_FIELDS = {
@@ -363,6 +431,12 @@ def validate_tileset(
             )
         minzoom = _metadata_int(metadata, "minzoom")
         maxzoom = _metadata_int(metadata, "maxzoom")
+        tile_schema_revision = _metadata_int(metadata, "tile_schema_revision")
+        if tile_schema_revision not in SUPPORTED_TILE_SCHEMA_REVISIONS:
+            raise RuntimeError(
+                "staged tileset schema revision is unsupported "
+                f"actual={tile_schema_revision}"
+            )
         simplify_pixels = _metadata_float(metadata, "simplify_pixels", minimum=0)
         buffer_pixels = _metadata_float(
             metadata, "buffer_pixels", minimum=MIN_RENDER_BUFFER_PIXELS
@@ -384,6 +458,7 @@ def validate_tileset(
             metadata,
             minzoom=minzoom,
             maxzoom=maxzoom,
+            tile_schema_revision=tile_schema_revision,
         )
     if tile_count <= 0:
         raise RuntimeError("staged tileset contains no tiles")
@@ -414,10 +489,10 @@ def validate_tileset(
             if key in {"source_database_sha256", "source_database_version"}
             else _metadata_int(metadata, key)
         )
-    if binding["tile_schema_revision"] != EXPECTED_TILE_SCHEMA_REVISION:
+    if binding["tile_schema_revision"] not in SUPPORTED_TILE_SCHEMA_REVISIONS:
         raise RuntimeError(
-            "staged tileset schema revision mismatch "
-            f"expected={EXPECTED_TILE_SCHEMA_REVISION} actual={binding['tile_schema_revision']}"
+            "staged tileset schema revision is unsupported "
+            f"actual={binding['tile_schema_revision']}"
         )
     if binding["source_database_sha256"] is None or not SHA256_PATTERN.fullmatch(
         str(binding["source_database_sha256"])
@@ -455,13 +530,18 @@ def validate_tileset(
         raise RuntimeError(
             "staged tileset decoded unknown maxzoom ID coverage does not match metadata"
         )
+    if tile_schema_revision == 4:
+        decoded_unknown_ids = set(payload_validation["unknown_properties_by_id"])
+        allowed_unknown_ids = set(range(1, int(binding["unknown_feature_count"]) + 1))
+        if not decoded_unknown_ids.issubset(allowed_unknown_ids):
+            raise RuntimeError("staged tileset contains an out-of-range unknown MVT ID")
     maxzoom_nonrenderable_features: list[dict[str, object]] = []
     maxzoom_nonrenderable_unknowns: list[dict[str, object]] = []
     if expected_database is not None:
         if expected_database_path is None:
             raise RuntimeError("database path is required for semantic tile validation")
         expected_bindings = {
-            "tile_schema_revision": EXPECTED_TILE_SCHEMA_REVISION,
+            "tile_schema_revision": binding["tile_schema_revision"],
             "source_database_sha256": expected_database["sha256"],
             "source_database_version": expected_database["metadata"]["dataset_version"],
             "source_block_face_count": expected_database["block_faces"],
@@ -473,10 +553,20 @@ def validate_tileset(
         }
         _require_equal_fields(binding, expected_bindings, "MBTiles/database binding")
         database_path = Path(expected_database_path)
-        expected_properties = _expected_tile_properties(database_path)
+        expected_properties = _expected_tile_properties(
+            database_path,
+            tile_schema_revision=int(binding["tile_schema_revision"]),
+        )
         expected_geometries = _expected_tile_geometries(database_path)
-        expected_unknown_properties, expected_unknown_geometries = (
-            _expected_unknown_tile_records(database_path)
+        (
+            expected_unknown_properties,
+            expected_unknown_geometries,
+            unknown_source_ids,
+        ) = (
+            _expected_unknown_tile_records(
+                database_path,
+                tile_schema_revision=int(binding["tile_schema_revision"]),
+            )
         )
         maxzoom_nonrenderable_features = _validated_nonrenderable_records(
             expected_properties,
@@ -497,6 +587,7 @@ def validate_tileset(
             maxzoom=maxzoom,
             buffer_pixels=buffer_pixels,
             unknown=True,
+            source_ids_by_id=unknown_source_ids,
         )
         # Compare the union from every zoom, not only maxzoom.  A stale or
         # invented feature present solely in an initial-view tile must fail.
@@ -505,9 +596,18 @@ def validate_tileset(
         actual_properties = payload_validation["properties_by_id"]
         actual_unknown_properties = payload_validation["unknown_properties_by_id"]
         allowed_missing = {record["id"] for record in maxzoom_nonrenderable_features}
-        allowed_unknown_missing = {
+        allowed_unknown_source_ids = {
             record["id"] for record in maxzoom_nonrenderable_unknowns
         }
+        allowed_unknown_missing = (
+            allowed_unknown_source_ids
+            if unknown_source_ids is None
+            else {
+                feature_id
+                for feature_id, source_id in unknown_source_ids.items()
+                if source_id in allowed_unknown_source_ids
+            }
+        )
         missing_ids = set(expected_properties) - set(actual_properties)
         unexpected_ids = set(actual_properties) - set(expected_properties)
         mismatched_ids = {
@@ -571,6 +671,7 @@ def _validate_tile_payloads(
     *,
     minzoom: int,
     maxzoom: int,
+    tile_schema_revision: int,
 ) -> dict[str, object]:
     if metadata.get("source_layer") != TILE_SOURCE_LAYER:
         raise RuntimeError(f"staged tileset source layer must be {TILE_SOURCE_LAYER}")
@@ -600,9 +701,19 @@ def _validate_tile_payloads(
     sizes_by_zoom: dict[int, list[tuple[int, int]]] = {}
     ids_by_zoom: dict[int, set[str]] = {}
     maxzoom_ids: set[str] = set()
-    maxzoom_unknown_ids: set[str] = set()
+    known_required_properties = (
+        TILE_V4_REQUIRED_PROPERTIES
+        if tile_schema_revision == 4
+        else TILE_V3_REQUIRED_PROPERTIES
+    )
+    unknown_required_properties = (
+        UNKNOWN_TILE_V4_REQUIRED_PROPERTIES
+        if tile_schema_revision == 4
+        else UNKNOWN_TILE_V3_REQUIRED_PROPERTIES
+    )
+    maxzoom_unknown_ids: set[str | int] = set()
     properties_by_id: dict[str, dict[str, object]] = {}
-    unknown_properties_by_id: dict[str, dict[str, object]] = {}
+    unknown_properties_by_id: dict[str | int, dict[str, object]] = {}
     decoded_feature_count = 0
     rows = connection.execute(
         "SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles "
@@ -643,12 +754,23 @@ def _validate_tile_payloads(
             properties = feature.get("properties")
             if not isinstance(properties, dict):
                 raise RuntimeError("staged tile feature is missing properties")
-            missing_properties = TILE_REQUIRED_PROPERTIES - set(properties)
+            missing_properties = known_required_properties - set(properties)
             if missing_properties:
                 raise RuntimeError(
                     f"staged tile feature is missing properties: {sorted(missing_properties)}"
                 )
-            _validate_tile_properties(properties)
+            unexpected_properties = (
+                set(properties) - known_required_properties - TILE_OPTIONAL_PROPERTIES
+            )
+            if unexpected_properties:
+                raise RuntimeError(
+                    "staged tile feature has unexpected properties: "
+                    f"{sorted(unexpected_properties)}"
+                )
+            _validate_tile_properties(
+                properties,
+                tile_schema_revision=tile_schema_revision,
+            )
             feature_id = str(properties["id"])
             if feature_id in tile_ids:
                 raise RuntimeError(f"staged tile contains duplicate feature ID {feature_id!r}")
@@ -672,14 +794,42 @@ def _validate_tile_payloads(
         unknown_features = unknown_layer.get("features") if isinstance(unknown_layer, dict) else None
         if not isinstance(unknown_features, list):
             raise RuntimeError("staged tile has invalid unknown layer")
-        unknown_tile_ids: set[str] = set()
+        unknown_tile_ids: set[str | int] = set()
         for feature in unknown_features:
             properties = feature.get("properties") if isinstance(feature, dict) else None
-            if not isinstance(properties, dict) or not UNKNOWN_TILE_REQUIRED_PROPERTIES.issubset(properties):
-                raise RuntimeError("staged unknown tile feature is missing required properties")
+            if not isinstance(properties, dict) or set(properties) != unknown_required_properties:
+                raise RuntimeError(
+                    "staged unknown tile feature has an invalid property contract"
+                )
             if any(key.endswith("_days") or key.endswith("_status") for key in properties):
                 raise RuntimeError("staged unknown tile feature contains schedule properties")
-            feature_id = str(properties["id"])
+            blankable_unknown_properties = (
+                {"technical_identity", "borough"}
+                if tile_schema_revision == 3
+                else set()
+            )
+            for key in unknown_required_properties:
+                if not isinstance(properties.get(key), str) or (
+                    key not in blankable_unknown_properties
+                    and not str(properties[key]).strip()
+                ):
+                    raise RuntimeError(
+                        f"staged unknown tile property {key!r} has an invalid string value"
+                    )
+            if properties["side"] not in {"LEFT", "RIGHT"}:
+                raise RuntimeError("staged unknown tile feature has an invalid side")
+            if tile_schema_revision == 4:
+                feature_id = feature.get("id") if isinstance(feature, dict) else None
+                if (
+                    not isinstance(feature_id, int)
+                    or isinstance(feature_id, bool)
+                    or feature_id <= 0
+                ):
+                    raise RuntimeError(
+                        "staged unknown tile feature must have a positive integer MVT ID"
+                    )
+            else:
+                feature_id = str(properties["id"])
             if feature_id in unknown_tile_ids:
                 raise RuntimeError(f"staged tile contains duplicate unknown ID {feature_id!r}")
             unknown_tile_ids.add(feature_id)
@@ -729,13 +879,28 @@ def _validate_tile_payloads(
     }
 
 
-def _validate_tile_properties(properties: dict[str, object]) -> None:
-    required_nonblank = TILE_REQUIRED_PROPERTIES - {
+def _validate_tile_properties(
+    properties: dict[str, object],
+    *,
+    tile_schema_revision: int,
+) -> None:
+    required_properties = (
+        TILE_V4_REQUIRED_PROPERTIES
+        if tile_schema_revision == 4
+        else TILE_V3_REQUIRED_PROPERTIES
+    )
+    blankable_properties = {
         "recycling_days",
         "organics_days",
         "bulk_days",
     }
-    for key in TILE_REQUIRED_PROPERTIES:
+    if tile_schema_revision == 3:
+        blankable_properties.update(
+            f"{kind}_rule"
+            for kind in ("refuse", "recycling", "organics", "bulk")
+        )
+    required_nonblank = required_properties - blankable_properties
+    for key in required_properties:
         if not isinstance(properties.get(key), str):
             raise RuntimeError(f"staged tile property {key!r} must be a string")
         if key in required_nonblank and not str(properties[key]).strip():
@@ -751,9 +916,16 @@ def _validate_tile_properties(properties: dict[str, object]) -> None:
         status = properties[f"{collection_type.lower()}_status"]
         if status not in {"SOURCE_EXPLICIT", "POLICY_DERIVED", "UNKNOWN_SOURCE_BLANK"}:
             raise RuntimeError("staged tile feature has an invalid schedule status")
+        conflict = properties[f"{collection_type.lower()}_conflict"]
+        if conflict not in {"0", "1"}:
+            raise RuntimeError("staged tile feature has an invalid source-policy conflict flag")
 
 
-def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
+def _expected_tile_properties(
+    database: Path,
+    *,
+    tile_schema_revision: int,
+) -> dict[str, dict[str, object]]:
     with closing(
         sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
     ) as connection:
@@ -776,11 +948,12 @@ def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
             feature_id = str(row["block_face_id"]).strip()
             properties: dict[str, object] = {
                 "id": feature_id,
-                "name": str(row["street_name"]).strip(),
                 "street_name": str(row["street_name"]).strip(),
                 "borough": str(row["borough"]).strip(),
                 "side": str(row["side"]).strip().upper(),
             }
+            if tile_schema_revision == 3:
+                properties["name"] = properties["street_name"]
             properties.update({field: str(row[field]).strip() for field in optional_ids})
             expected[feature_id] = properties
             day_sets[feature_id] = {kind: set() for kind in COLLECTION_DAY_FIELDS}
@@ -809,9 +982,12 @@ def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
             collection_type = str(row["collection_type"])
             prefix = collection_type.lower()
             expected[feature_id][f"{prefix}_status"] = str(row["state"])
-            expected[feature_id][f"{prefix}_rule"] = "" if row["rule_id"] is None else str(row["rule_id"])
             expected[feature_id][f"{prefix}_conflict"] = "1" if int(row["source_policy_conflict"]) else "0"
-            expected[feature_id][f"{prefix}_provenance"] = str(row["provenance"])
+            if tile_schema_revision == 3:
+                expected[feature_id][f"{prefix}_rule"] = (
+                    "" if row["rule_id"] is None else str(row["rule_id"])
+                )
+                expected[feature_id][f"{prefix}_provenance"] = str(row["provenance"])
 
     for feature_id, properties in expected.items():
         if len(sources[feature_id]) != 1 or len(retrieval_times[feature_id]) != 1:
@@ -824,8 +1000,9 @@ def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
             )
         properties["source"] = next(iter(sources[feature_id]))
         properties["retrieved_at"] = next(iter(retrieval_times[feature_id]))
-        properties["identity_method"] = "LION_BLOCK_FACE_ID"
-        properties["geometry_method"] = "DIRECT_SIDE_TRACE"
+        if tile_schema_revision == 3:
+            properties["identity_method"] = "LION_BLOCK_FACE_ID"
+            properties["geometry_method"] = "DIRECT_SIDE_TRACE"
     return expected
 
 
@@ -843,36 +1020,56 @@ def _expected_tile_geometries(database: Path) -> dict[str, BaseGeometry]:
 
 def _expected_unknown_tile_records(
     database: Path,
-) -> tuple[dict[str, dict[str, object]], dict[str, BaseGeometry]]:
-    properties_by_id: dict[str, dict[str, object]] = {}
-    geometries_by_id: dict[str, BaseGeometry] = {}
+    *,
+    tile_schema_revision: int,
+) -> tuple[
+    dict[str | int, dict[str, object]],
+    dict[str | int, BaseGeometry],
+    dict[int, str] | None,
+]:
+    properties_by_id: dict[str | int, dict[str, object]] = {}
+    geometries_by_id: dict[str | int, BaseGeometry] = {}
+    source_ids_by_id: dict[int, str] = {}
     with closing(
         sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
     ) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
-            """SELECT unknown_id, technical_identity, segment_id, borough, street_name, side,
-                      reason_code, reason, identity_method, geometry_method, geometry_wkt
-               FROM unknown_block_faces ORDER BY unknown_id"""
+            """SELECT unknown_id, technical_identity, segment_id, borough, street_name,
+                      side, reason_code, reason, identity_method, geometry_method, geometry_wkt
+               FROM unknown_block_faces ORDER BY unknown_id COLLATE BINARY"""
         )
-        for row in rows:
-            feature_id = str(row["unknown_id"])
-            properties_by_id[feature_id] = {
-                "id": feature_id,
-                "technical_identity": (
-                    "" if row["technical_identity"] is None else str(row["technical_identity"])
-                ),
-                "segment_id": str(row["segment_id"]),
-                "borough": "" if row["borough"] is None else str(row["borough"]),
+        for ordinal, row in enumerate(rows, start=1):
+            source_id = str(row["unknown_id"])
+            feature_id: str | int = ordinal if tile_schema_revision == 4 else source_id
+            if tile_schema_revision == 4:
+                source_ids_by_id[ordinal] = source_id
+            properties: dict[str, object] = {
                 "street_name": str(row["street_name"]),
                 "side": str(row["side"]),
                 "reason_code": str(row["reason_code"]),
                 "reason": str(row["reason"]),
-                "identity_method": str(row["identity_method"]),
-                "geometry_method": str(row["geometry_method"]),
             }
+            if tile_schema_revision == 3:
+                properties.update({
+                    "id": source_id,
+                    "technical_identity": (
+                        ""
+                        if row["technical_identity"] is None
+                        else str(row["technical_identity"])
+                    ),
+                    "segment_id": str(row["segment_id"]),
+                    "borough": "" if row["borough"] is None else str(row["borough"]),
+                    "identity_method": str(row["identity_method"]),
+                    "geometry_method": str(row["geometry_method"]),
+                })
+            properties_by_id[feature_id] = properties
             geometries_by_id[feature_id] = force_2d(wkt.loads(str(row["geometry_wkt"])))
-    return properties_by_id, geometries_by_id
+    return (
+        properties_by_id,
+        geometries_by_id,
+        source_ids_by_id if tile_schema_revision == 4 else None,
+    )
 
 
 def _render_tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
@@ -980,15 +1177,16 @@ def _renderability_id_set_sha256(feature_ids: set[str]) -> str:
 
 
 def _validated_nonrenderable_records(
-    properties_by_id: dict[str, dict[str, object]],
-    geometries_by_id: dict[str, BaseGeometry],
-    rendered_at_maxzoom: set[str],
+    properties_by_id: dict[str | int, dict[str, object]],
+    geometries_by_id: dict[str | int, BaseGeometry],
+    rendered_at_maxzoom: set[str] | set[int],
     *,
     declared_count: int,
     declared_sha256: str,
     maxzoom: int,
     buffer_pixels: float,
     unknown: bool,
+    source_ids_by_id: dict[int, str] | None = None,
 ) -> list[dict[str, object]]:
     expected_ids = set(properties_by_id)
     unexpected = rendered_at_maxzoom - expected_ids
@@ -1002,7 +1200,13 @@ def _validated_nonrenderable_records(
             "staged tileset nonrenderable count does not match missing maxzoom IDs "
             f"expected={declared_count} actual={len(missing)}"
         )
-    if _renderability_id_set_sha256(missing) != declared_sha256:
+    digest_ids = {
+        source_ids_by_id[feature_id]
+        if source_ids_by_id is not None and isinstance(feature_id, int)
+        else str(feature_id)
+        for feature_id in missing
+    }
+    if _renderability_id_set_sha256(digest_ids) != declared_sha256:
         raise RuntimeError("staged tileset nonrenderable ID digest does not match missing IDs")
 
     records: list[dict[str, object]] = []
@@ -1016,8 +1220,13 @@ def _validated_nonrenderable_records(
                 f"id={feature_id!r}"
             )
         properties = properties_by_id[feature_id]
+        report_id = (
+            source_ids_by_id[feature_id]
+            if source_ids_by_id is not None and isinstance(feature_id, int)
+            else feature_id
+        )
         record: dict[str, object] = {
-            "id": feature_id,
+            "id": report_id,
             "street_name": properties["street_name"],
             "side": properties["side"],
             "projected_length_meters": round(float(projected.length), 6),
@@ -1254,6 +1463,27 @@ def validate_processed_geojson(
     expected_semantic_sha256: str | None = None,
     expected_features: int | None = None,
 ) -> dict[str, object]:
+    """Validate processed GeoJSON and return its semantic summary."""
+
+    return validate_and_prepare_processed_geojson(
+        path,
+        known_sha256=known_sha256,
+        expected_sha256=expected_sha256,
+        expected_semantic_sha256=expected_semantic_sha256,
+        expected_features=expected_features,
+    ).summary
+
+
+def validate_and_prepare_processed_geojson(
+    path: str | Path,
+    *,
+    known_sha256: str | None = None,
+    expected_sha256: str | None = None,
+    expected_semantic_sha256: str | None = None,
+    expected_features: int | None = None,
+) -> ValidatedProcessedSnapshot:
+    """Parse, validate, normalize, and hash a processed snapshot in one pass."""
+
     processed = Path(path)
     payload = read_json_object(processed, "processed GeoJSON")
     if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
@@ -1268,17 +1498,21 @@ def validate_processed_geojson(
         raise RuntimeError(
             f"processed GeoJSON feature count mismatch expected={expected_features} actual={feature_count}"
         )
-    feature_hashes = _processed_feature_hashes(payload)
+    try:
+        prepared = prepare_payload(payload)
+    except ValueError as error:
+        raise RuntimeError(f"processed GeoJSON semantic validation failed: {error}") from error
+    feature_hashes = _prepared_feature_hashes(prepared.features)
     if len(feature_hashes) != feature_count:
         raise RuntimeError(
             "processed GeoJSON contains repeated block-face IDs that would be collapsed by the loader"
         )
     semantic_sha256 = _aggregate_feature_hashes(feature_hashes)
-    unknown_feature_hashes = _processed_unknown_feature_hashes(payload)
+    unknown_feature_hashes = _prepared_unknown_feature_hashes(prepared.unknown_features)
     unknown_semantic_sha256 = _aggregate_feature_hashes(unknown_feature_hashes)
     if expected_semantic_sha256 is not None and semantic_sha256 != expected_semantic_sha256:
         raise RuntimeError("processed GeoJSON semantic checksum does not match its binding")
-    return {
+    summary = {
         "sha256": checksum,
         "semantic_sha256": semantic_sha256,
         "feature_hashes": feature_hashes,
@@ -1288,6 +1522,18 @@ def validate_processed_geojson(
         "unknown_semantic_sha256": unknown_semantic_sha256,
         "bytes": processed.stat().st_size,
     }
+    raw_unknown_features = payload.get("unknown_features", [])
+    if not isinstance(raw_unknown_features, list) or any(
+        not isinstance(feature, dict) for feature in raw_unknown_features
+    ):
+        # prepare_payload should already reject this. Keep the returned type
+        # honest if that validator ever changes independently.
+        raise RuntimeError("processed unknown_features must contain GeoJSON objects")
+    return ValidatedProcessedSnapshot(
+        summary=summary,
+        prepared=prepared,
+        unknown_features=tuple(raw_unknown_features),
+    )
 
 
 def validate_processed_database_semantics(
@@ -1340,12 +1586,16 @@ def _processed_feature_hashes(payload: dict[str, object]) -> dict[str, str]:
     # Importing the loader's input validator ensures the expected side uses the
     # exact documented aggregation/normalization contract.  The actual side
     # below is reconstructed independently from normalized relational rows.
-    from scripts.load_processed import prepare_features
-
     try:
         features = prepare_features(payload)
     except ValueError as error:
         raise RuntimeError(f"processed GeoJSON semantic validation failed: {error}") from error
+    return _prepared_feature_hashes(features)
+
+
+def _prepared_feature_hashes(
+    features: tuple[ValidatedFeature, ...] | list[ValidatedFeature],
+) -> dict[str, str]:
     records: dict[str, dict[str, object]] = {}
     for feature in features:
         records[feature.block_face_id] = {
@@ -1374,12 +1624,16 @@ def _processed_feature_hashes(payload: dict[str, object]) -> dict[str, str]:
 
 
 def _processed_unknown_feature_hashes(payload: dict[str, object]) -> dict[str, str]:
-    from scripts.load_processed import prepare_unknown_features
-
     try:
         features = prepare_unknown_features(payload)
     except ValueError as error:
         raise RuntimeError(f"processed unknown semantic validation failed: {error}") from error
+    return _prepared_unknown_feature_hashes(features)
+
+
+def _prepared_unknown_feature_hashes(
+    features: tuple[ValidatedUnknownFeature, ...] | list[ValidatedUnknownFeature],
+) -> dict[str, str]:
     return {
         feature.unknown_id: _canonical_record_sha256({
             "unknown_id": feature.unknown_id,
@@ -1682,7 +1936,20 @@ def validate_tile_build_report(
     return report
 
 
-def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object] | None = None) -> dict[str, object]:
+def validate_release_bundle(
+    release_dir: str | Path,
+    manifest: dict[str, object] | None = None,
+    *,
+    prevalidated_components: PrevalidatedReleaseComponents | None = None,
+) -> dict[str, object]:
+    """Validate a complete release, optionally reusing trusted Stage 5-7 results.
+
+    The prevalidated handoff is intentionally typed and internal. The final
+    gate still hashes every staged artifact and verifies all cross-artifact
+    bindings, but it does not parse/normalize GeoJSON or scan SQLite/PBF data a
+    second time when those exact components were already validated in-process.
+    """
+
     supplied_bundle = Path(release_dir)
     if supplied_bundle.is_symlink():
         raise RuntimeError(f"release bundle must not be a symlink: {supplied_bundle}")
@@ -1733,47 +2000,64 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
         verified_hashes[name] = actual
 
     processed_descriptor = artifacts["processed_geojson"]
-    processed = validate_processed_geojson(
-        paths["processed_geojson"],
-        known_sha256=verified_hashes["processed_geojson"],
-        expected_sha256=processed_descriptor["sha256"],
-        expected_semantic_sha256=processed_descriptor.get("semantic_sha256"),
-        expected_features=_nonnegative_int(processed_descriptor.get("feature_count"), "processed artifact feature_count"),
-    )
-    audit = validate_ingestion_audit(
-        paths["ingestion_audit"],
-        expected_processed_sha256=processed["sha256"],
-        expected_processed_features=processed["feature_count"],
-    )
     audit_hash = artifacts["ingestion_audit"]["sha256"]
-    database = validate_database(
-        paths["database"],
-        known_sha256=verified_hashes["database"],
-        expected_version=version,
-        expected_processed_sha256=processed["sha256"],
-        expected_processed_semantic_sha256=processed["semantic_sha256"],
-        expected_processed_features=processed["feature_count"],
-        expected_audit_sha256=audit_hash,
-    )
-    if database["block_faces"] != processed["feature_count"]:
-        raise RuntimeError(
-            "database/output feature count mismatch "
-            f"database={database['block_faces']} processed={processed['feature_count']}"
+    if prevalidated_components is None:
+        processed = validate_processed_geojson(
+            paths["processed_geojson"],
+            known_sha256=verified_hashes["processed_geojson"],
+            expected_sha256=processed_descriptor["sha256"],
+            expected_semantic_sha256=processed_descriptor.get("semantic_sha256"),
+            expected_features=_nonnegative_int(
+                processed_descriptor.get("feature_count"),
+                "processed artifact feature_count",
+            ),
         )
-    database.update(validate_processed_database_semantics(processed, paths["database"]))
-    tileset = validate_tileset(
-        paths["tileset"],
-        version,
-        known_sha256=verified_hashes["tileset"],
-        expected_database=database,
-        expected_database_path=paths["database"],
-    )
+        audit = validate_ingestion_audit(
+            paths["ingestion_audit"],
+            expected_processed_sha256=processed["sha256"],
+            expected_processed_features=processed["feature_count"],
+        )
+        database = validate_database(
+            paths["database"],
+            known_sha256=verified_hashes["database"],
+            expected_version=version,
+            expected_processed_sha256=processed["sha256"],
+            expected_processed_semantic_sha256=processed["semantic_sha256"],
+            expected_processed_features=processed["feature_count"],
+            expected_audit_sha256=audit_hash,
+        )
+        if database["block_faces"] != processed["feature_count"]:
+            raise RuntimeError(
+                "database/output feature count mismatch "
+                f"database={database['block_faces']} processed={processed['feature_count']}"
+            )
+        database.update(validate_processed_database_semantics(processed, paths["database"]))
+        tileset = validate_tileset(
+            paths["tileset"],
+            version,
+            known_sha256=verified_hashes["tileset"],
+            expected_database=database,
+            expected_database_path=paths["database"],
+        )
+    else:
+        processed, audit, database, tileset = _rebind_prevalidated_components(
+            prevalidated_components,
+            verified_hashes=verified_hashes,
+            version=version,
+            processed_descriptor=processed_descriptor,
+            audit_sha256=str(audit_hash),
+        )
     tile_report = validate_tile_build_report(
         paths["tile_build_report"],
         expected_version=version,
         database=database,
         tileset=tileset,
     )
+    if (
+        prevalidated_components is not None
+        and tile_report != prevalidated_components.tile_report
+    ):
+        raise RuntimeError("prevalidated tile report changed before the final release gate")
     source_report = read_json_object(paths["source_report"], "source report")
     _validate_source_report(source_report, version, artifacts, audit)
     unknown_geojson = read_json_object(paths["unknown_geojson"], "unknown GeoJSON")
@@ -1959,6 +2243,10 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
         "manifest": manifest,
         "version": version,
         "paths": paths,
+        "artifact_stats": {
+            name: _file_identity(path)
+            for name, path in paths.items()
+        },
         "processed": processed,
         "audit": audit,
         "database": database,
@@ -1967,6 +2255,102 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
         "source_report": source_report,
         "counts": expected_counts,
     }
+
+
+def _rebind_prevalidated_components(
+    components: PrevalidatedReleaseComponents,
+    *,
+    verified_hashes: dict[str, str],
+    version: str,
+    processed_descriptor: dict[str, object],
+    audit_sha256: str,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    """Bind trusted in-process validation summaries to the hashed artifacts."""
+
+    if not isinstance(components, PrevalidatedReleaseComponents):
+        raise TypeError("prevalidated_components must be PrevalidatedReleaseComponents")
+    values = (
+        components.processed,
+        components.audit,
+        components.database,
+        components.tileset,
+        components.tile_report,
+    )
+    if any(not isinstance(value, dict) for value in values):
+        raise RuntimeError("prevalidated release components must contain summary objects")
+    processed = dict(components.processed)
+    audit = dict(components.audit)
+    database = dict(components.database)
+    tileset = dict(components.tileset)
+
+    expected_feature_count = _nonnegative_int(
+        processed_descriptor.get("feature_count"),
+        "processed artifact feature_count",
+    )
+    _require_equal_fields(
+        processed,
+        {
+            "sha256": verified_hashes["processed_geojson"],
+            "semantic_sha256": processed_descriptor.get("semantic_sha256"),
+            "feature_count": expected_feature_count,
+        },
+        "prevalidated processed GeoJSON",
+    )
+    _require_equal_fields(
+        audit,
+        {
+            "processed_sha256": processed["sha256"],
+            "processed_feature_count": expected_feature_count,
+            "output_features": expected_feature_count,
+            "fatal_count": 0,
+            "reconciled": True,
+            "passed": True,
+        },
+        "prevalidated ingestion audit",
+    )
+    metadata = database.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("prevalidated database summary is missing metadata")
+    _require_equal_fields(
+        database,
+        {
+            "sha256": verified_hashes["database"],
+            "block_faces": expected_feature_count,
+            "semantic_sha256": processed["semantic_sha256"],
+            "semantic_feature_count": expected_feature_count,
+        },
+        "prevalidated database",
+    )
+    _require_equal_fields(
+        metadata,
+        {
+            "dataset_version": version,
+            "processed_sha256": processed["sha256"],
+            "processed_semantic_sha256": processed["semantic_sha256"],
+            "processed_feature_count": str(expected_feature_count),
+            "ingestion_audit_sha256": audit_sha256,
+        },
+        "prevalidated database metadata",
+    )
+    _require_equal_fields(
+        tileset,
+        {
+            "sha256": verified_hashes["tileset"],
+            "version": version,
+            "tile_schema_revision": EXPECTED_TILE_SCHEMA_REVISION,
+            "source_database_sha256": database["sha256"],
+            "source_database_version": version,
+            "feature_count": database["block_faces"],
+            "unknown_feature_count": database["unknown_feature_count"],
+        },
+        "prevalidated tileset",
+    )
+    return processed, audit, database, tileset
 
 
 def validate_regression_gates(
@@ -2046,34 +2430,37 @@ def _promotion_lock(data_root: Path):
 
     lock_path = data_root / ".release-promotion.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as handle:
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"\0")
-            handle.flush()
-        handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
+    # Windows byte-range locks do not reliably serialize sibling threads in
+    # one process, while the file lock is still required across processes.
+    with _PROMOTION_THREAD_LOCK:
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
 
-            while True:
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.1)
                 try:
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    time.sleep(0.1)
-            try:
-                yield
-            finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def publish_release(
@@ -2082,8 +2469,20 @@ def publish_release(
     *,
     retention: int = 2,
     regression_gate: dict[str, object] | None = None,
+    validated_bundle: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Install a validated immutable release, then atomically switch the pointer."""
+    """Install a validated immutable release, then atomically switch the pointer.
+
+    New releases must be staged on the manifest filesystem.  The complete
+    bundle is validated in its private staging directory and that directory is
+    renamed into ``releases/`` without copying its artifacts.  The manifest
+    pointer remains the last write, so a crash can leave only an unreferenced
+    complete release rather than a pointer to partial data.
+
+    ``validated_bundle`` is an internal hand-off for callers that already ran
+    :func:`validate_release_bundle` on the exact staging directory.  Its paths
+    and manifest are rebound below before it is trusted.
+    """
 
     if retention < 2:
         raise ValueError("release retention must be at least 2")
@@ -2097,62 +2496,137 @@ def publish_release(
     version = _manifest_version(release_manifest)
     pointer = Path(manifest_path).resolve()
     data_root = pointer.parent
-    releases_root = (data_root / "releases").resolve()
-    if releases_root != data_root and data_root not in releases_root.parents:
-        raise RuntimeError("release directory escapes the manifest data root")
-    releases_root.mkdir(parents=True, exist_ok=True)
     with _promotion_lock(data_root):
+        releases_candidate = data_root / "releases"
+        if releases_candidate.is_symlink():
+            raise RuntimeError("release directory must not be a symlink")
+        releases_candidate.mkdir(parents=True, exist_ok=True)
+        releases_root = releases_candidate.resolve()
+        if releases_root.parent != data_root:
+            raise RuntimeError("release directory escapes the manifest data root")
+        if staging.stat().st_dev != releases_root.stat().st_dev:
+            raise RuntimeError(
+                "release staging must be on the same filesystem as the releases directory"
+            )
         final_release = (releases_root / version).resolve()
         if final_release.parent != releases_root or not VERSION_PATTERN.fullmatch(version):
             raise RuntimeError("release destination is unsafe")
-        temporary: Path | None = None
-        try:
-            if final_release.exists():
-                validated = validate_release_bundle(final_release)
-                if validated["manifest"] != release_manifest:
+        if validated_bundle is None:
+            validated = validate_release_bundle(staging)
+        else:
+            validated = _validated_staging_result(
+                validated_bundle,
+                staging=staging,
+                manifest=release_manifest,
+            )
+        if validated["manifest"] != release_manifest:
+            raise RuntimeError("validated staging manifest does not match the release manifest")
+
+        current = _read_current_manifest(pointer)
+        if regression_gate is not None:
+            validate_regression_gates(
+                validated["counts"],
+                current,
+                **regression_gate,
+            )
+        if final_release.exists():
+            if staging != final_release:
+                installed_manifest = read_json_object(
+                    final_release / "release_manifest.json", "installed release manifest"
+                )
+                if installed_manifest != release_manifest:
                     raise RuntimeError(
                         f"immutable release already exists with different contents: {version}"
                     )
-            else:
-                temporary = Path(tempfile.mkdtemp(prefix=f".{version}.", dir=releases_root))
-                for child in staging.iterdir():
-                    if child.is_symlink():
-                        raise RuntimeError(f"release bundle contains a symlink: {child.name}")
-                    destination = temporary / child.name
-                    if child.is_dir():
-                        shutil.copytree(child, destination)
-                    else:
-                        shutil.copy2(child, destination)
-                validated = validate_release_bundle(temporary)
-                if validated["manifest"] != release_manifest:
-                    raise RuntimeError("staging release changed while it was being copied")
-
-            current = _read_current_manifest(pointer)
-            if regression_gate is not None:
-                validate_regression_gates(
-                    validated["counts"],
-                    current,
-                    **regression_gate,
-                )
-            if temporary is not None:
-                os.replace(temporary, final_release)
-                temporary = None
-            release_manifest["previous_releases"] = _previous_release_entries(
-                current,
-                new_version=version,
-                retention=retention,
-            )
-            atomic_json(pointer, release_manifest)
-            try:
-                _cleanup_old_releases(releases_root, release_manifest, retention)
-            except OSError:
-                # Cleanup is deliberately best-effort after commit.  A deletion
-                # error must not make operators think the switched release failed.
-                LOGGER.exception("Could not remove one or more expired releases")
-        finally:
-            if temporary is not None and temporary.exists():
-                shutil.rmtree(temporary)
+                # An existing destination may be an uncommitted residue from a
+                # prior crash. Validate that directory before allowing it to be
+                # selected by the pointer.
+                installed = validate_release_bundle(final_release)
+                if installed["manifest"] != release_manifest:
+                    raise RuntimeError(
+                        f"immutable release already exists with different contents: {version}"
+                    )
+        else:
+            _atomic_rename_directory(staging, final_release)
+            _fsync_directory(releases_root)
+        release_manifest["previous_releases"] = _previous_release_entries(
+            current,
+            new_version=version,
+            retention=retention,
+        )
+        atomic_json(pointer, release_manifest)
+        try:
+            _cleanup_old_releases(releases_root, release_manifest, retention)
+        except OSError:
+            # Cleanup is deliberately best-effort after commit.  A deletion
+            # error must not make operators think the switched release failed.
+            LOGGER.exception("Could not remove one or more expired releases")
     return release_manifest
+
+
+def _validated_staging_result(
+    validated: dict[str, object],
+    *,
+    staging: Path,
+    manifest: dict[str, object],
+) -> dict[str, object]:
+    """Rebind a prior full validation result to the exact staging directory."""
+
+    if not isinstance(validated, dict) or validated.get("manifest") != manifest:
+        raise RuntimeError("prevalidated release result does not match the staging manifest")
+    if validated.get("version") != manifest.get("dataset_version"):
+        raise RuntimeError("prevalidated release result has the wrong dataset version")
+    paths = validated.get("paths")
+    if not isinstance(paths, dict) or set(paths) != set(RELEASE_FILENAMES):
+        raise RuntimeError("prevalidated release result has an invalid artifact path set")
+    artifact_stats = validated.get("artifact_stats")
+    if not isinstance(artifact_stats, dict) or set(artifact_stats) != set(RELEASE_FILENAMES):
+        raise RuntimeError("prevalidated release result is missing artifact identities")
+    for name, filename in RELEASE_FILENAMES.items():
+        candidate = paths.get(name)
+        if not isinstance(candidate, Path) or candidate.resolve() != (staging / filename).resolve():
+            raise RuntimeError(
+                f"prevalidated release result is not bound to staging artifact {name!r}"
+            )
+        if artifact_stats.get(name) != _file_identity(candidate):
+            raise RuntimeError(
+                f"staging artifact {name!r} changed after release validation"
+            )
+    if not isinstance(validated.get("counts"), dict):
+        raise RuntimeError("prevalidated release result is missing validated counts")
+    return validated
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _atomic_rename_directory(source: Path, destination: Path) -> None:
+    """Rename atomically, tolerating short-lived Windows directory handles."""
+
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if os.name != "nt" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably order a directory rename where the platform supports it."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def activate_release(

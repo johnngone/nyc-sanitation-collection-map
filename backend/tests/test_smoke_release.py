@@ -39,7 +39,7 @@ def test_smoke_release_exercises_runtime_database_and_real_vector_tile(tmp_path,
     config = client.get("/api/map-config")
     assert config.status_code == 200
     assert config.json()["available"] is True
-    assert config.json()["tile_schema_revision"] == 3
+    assert config.json()["tile_schema_revision"] == 4
     assert config.json()["unknown_source_layer"] == "collection_unknowns"
     assert config.json()["bounds"] == fixture["bounds"]
 

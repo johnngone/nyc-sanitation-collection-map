@@ -7,7 +7,7 @@ The production image is a standalone container: it serves the compiled React/Map
 ## Why the map loads quickly
 
 - The MBTiles archive contains one vector feature per stored block face. Its four schedule fields are comma-separated weekday codes, so geometry is not repeated for every day or collection type.
-- Geometry is clipped and simplified by zoom (`12` through `17` by default), and each PBF tile is gzip-compressed.
+- Geometry is clipped and simplified by zoom (`12` through `16` by default), and each PBF tile is gzip-compressed.
 - MapLibre requests only the tiles needed for the current view and filters day/type in the browser.
 - Tile URLs include the immutable dataset version. Successful responses use a one-year immutable cache policy and an `ETag`.
 

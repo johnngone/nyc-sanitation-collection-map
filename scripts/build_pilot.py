@@ -20,11 +20,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
-from typing import Iterable
+from typing import Iterable, Protocol
 
 import geopandas as gpd
 import pandas as pd
-from pyproj import Transformer
+from pyproj import CRS, Transformer
 from shapely.errors import GEOSException
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, mapping
 from shapely.geometry.base import BaseGeometry
@@ -116,6 +116,33 @@ REQUIRED_LION_FIELDS = (
     "FromRight",
     "ToRight",
 )
+# Keep source reads narrow. These are the only LION attributes consulted by
+# scope classification, alias reconciliation, feature construction, or audit
+# provenance. GeoPandas adds the active geometry column automatically.
+LION_LOAD_FIELDS = tuple(dict.fromkeys((
+    *REQUIRED_LION_FIELDS,
+    "SAFStreetName",
+    "street_name",
+    "segment_id",
+    "PhysicalID",
+    "PHYSICALID",
+    "LocStatus",
+    "BoroBndry",
+    "SpecAddr",
+    "LLo_Hyphen",
+    "LHi_Hyphen",
+    "RLo_Hyphen",
+    "RHi_Hyphen",
+    "OBJECTID",
+    "ObjectID",
+    "objectid",
+    "GenericID",
+    "SegCount",
+    "L_LOW_HN",
+    "L_HIGH_HN",
+    "R_LOW_HN",
+    "R_HIGH_HN",
+)))
 OUTCOME_KEYS = (
     "matched",
     "out_of_scope",
@@ -177,13 +204,49 @@ class SideCandidate:
     source_records: tuple[dict[str, object], ...]
 
 
+class _PositionColumn(Protocol):
+    def __getitem__(self, position: int) -> object: ...
+
+
+class _ColumnarRow:
+    """A cheap positional row view that avoids constructing Pandas Series."""
+
+    __slots__ = ("_columns", "_geometry_field", "_position")
+
+    def __init__(
+        self,
+        columns: dict[str, _PositionColumn],
+        geometry_field: str,
+        position: int,
+    ) -> None:
+        self._columns = columns
+        self._geometry_field = geometry_field
+        self._position = position
+
+    def get(self, field_name: str, default: object = None) -> object:
+        column = self._columns.get(field_name)
+        return default if column is None else column[self._position]
+
+    @property
+    def geometry(self) -> BaseGeometry | None:
+        value = self.get(self._geometry_field)
+        return value if isinstance(value, BaseGeometry) else None
+
+
+class _RowLike(Protocol):
+    def get(self, field_name: str, default: object = None) -> object: ...
+
+    @property
+    def geometry(self) -> BaseGeometry | None: ...
+
+
 @dataclass
 class PreparedLionSegment:
     source_row: int
     source_index: object
     alias_source_rows: tuple[int, ...]
     source_indices: tuple[object, ...]
-    row: pd.Series
+    row: _RowLike
     segment_id: str
     street_names: tuple[str, ...]
     source_records: tuple[dict[str, object], ...]
@@ -232,6 +295,33 @@ def side_offset_trace(geometry: BaseGeometry, side: str, distance_feet: float) -
     return offset_lines[0] if len(offset_lines) == 1 else MultiLineString(offset_lines)
 
 
+def _to_working_crs(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Project only when necessary; return an equivalent working frame as-is."""
+
+    if CRS.from_user_input(frame.crs).equals(CRS.from_user_input(WORKING_CRS)):
+        return frame
+    return frame.to_crs(WORKING_CRS)
+
+
+def _has_default_range_index(frame: gpd.GeoDataFrame) -> bool:
+    return frame.index.equals(pd.RangeIndex(len(frame)))
+
+
+def _columnar_rows(frame: gpd.GeoDataFrame) -> tuple[_ColumnarRow, ...]:
+    """Materialize lightweight views while sharing each underlying column."""
+
+    columns: dict[str, _PositionColumn] = {
+        column: frame[column].array
+        for column in frame.columns
+        if isinstance(column, str)
+    }
+    geometry_field = str(frame.geometry.name)
+    return tuple(
+        _ColumnarRow(columns, geometry_field, position)
+        for position in range(len(frame))
+    )
+
+
 def build_collection_features(
     lion: gpd.GeoDataFrame,
     frequencies: gpd.GeoDataFrame,
@@ -265,18 +355,20 @@ def build_collection_features(
         len(frequencies),
         WORKING_CRS,
     )
-    lion_working = lion.to_crs(WORKING_CRS).copy()
-    frequencies_working = frequencies.to_crs(WORKING_CRS).copy()
+    lion_working = _to_working_crs(lion)
+    frequencies_working = _to_working_crs(frequencies)
     source_rows = len(lion_working)
     expected_sides = source_rows * 2
     source_indices = list(lion_working.index)
-    lion_working = lion_working.reset_index(drop=True)
-    frequencies_working = frequencies_working.reset_index(drop=True)
+    lion_rows = _columnar_rows(lion_working)
+    if not _has_default_range_index(frequencies_working):
+        frequencies_working = frequencies_working.reset_index(drop=True)
     side_results: list[SideResult] = []
     candidates: dict[str, list[SideCandidate]] = defaultdict(list)
     global_errors: list[dict[str, object]] = []
     prepared_segments, source_row_outcomes, lion_preparation = _prepare_lion_segments(
-        lion_working,
+        lion_working.columns,
+        lion_rows,
         source_indices,
         side_results,
         global_errors,
@@ -799,7 +891,8 @@ def combine_line_geometries(geometries: Iterable[BaseGeometry]) -> BaseGeometry:
 
 
 def _prepare_lion_segments(
-    lion: gpd.GeoDataFrame,
+    lion_columns: Iterable[object],
+    lion_rows: tuple[_ColumnarRow, ...],
     source_indices: list[object],
     side_results: list[SideResult],
     global_errors: list[dict[str, object]],
@@ -813,20 +906,21 @@ def _prepare_lion_segments(
         "deduplicated_alias": 0,
         "invalid": 0,
     }
-    missing_scope_fields = [field for field in REQUIRED_LION_FIELDS if field not in lion.columns]
+    available_columns = set(lion_columns)
+    missing_scope_fields = [field for field in REQUIRED_LION_FIELDS if field not in available_columns]
     if missing_scope_fields:
         global_errors.append({
             "kind": "missing_lion_scope_fields",
             "fields": missing_scope_fields,
             "message": "LION input is missing fields required for scope and curbside reconciliation",
         })
-        for source_row, row in lion.iterrows():
+        for source_row, row in enumerate(lion_rows):
             row_outcomes["invalid"] += 1
             _append_preclassified_sides(
                 side_results,
                 row,
-                int(source_row),
-                source_indices[int(source_row)],
+                source_row,
+                source_indices[source_row],
                 "invalid",
                 f"missing official LION scope fields: {', '.join(missing_scope_fields)}",
             )
@@ -836,17 +930,17 @@ def _prepare_lion_segments(
             "identity_conflict_groups": 0,
         }
 
-    LOGGER.info("Classifying official LION scope and curbside eligibility rows=%s", len(lion))
+    LOGGER.info("Classifying official LION scope and curbside eligibility rows=%s", len(lion_rows))
     grouped: dict[str, list[int]] = defaultdict(list)
-    for source_number, (source_row, row) in enumerate(lion.iterrows(), start=1):
-        if source_number % PROGRESS_EVERY_SOURCE_ROWS == 0 or source_number == len(lion):
+    for source_row, row in enumerate(lion_rows):
+        source_number = source_row + 1
+        if source_number % PROGRESS_EVERY_SOURCE_ROWS == 0 or source_number == len(lion_rows):
             LOGGER.info(
                 "LION scope progress rows=%s/%s physical_segment_ids=%s",
                 source_number,
-                len(lion),
+                len(lion_rows),
                 len(grouped),
             )
-        source_row = int(source_row)
         segment_type = _source_code(row.get("SegmentTyp"))
         feature_type = _source_code(row.get("FeatureTyp"))
         if segment_type not in IN_SCOPE_SEGMENT_TYPES or feature_type not in IN_SCOPE_FEATURE_TYPES:
@@ -904,7 +998,7 @@ def _prepare_lion_segments(
         identity_groups: dict[tuple[str, str, str], list[int]] = defaultdict(list)
         geometry_block_faces: dict[str, set[tuple[str, str]]] = defaultdict(set)
         for position in positions:
-            row = lion.iloc[position]
+            row = lion_rows[position]
             geometry_key = _exact_geometry_key(row.geometry, position)
             left_id = _clean_identifier(row.get("LBlockFaceID"))
             right_id = _clean_identifier(row.get("RBlockFaceID"))
@@ -936,7 +1030,7 @@ def _prepare_lion_segments(
             row_outcomes["invalid"] += 1
             _append_preclassified_sides(
                 side_results,
-                lion.iloc[source_row],
+                lion_rows[source_row],
                 source_row,
                 source_indices[source_row],
                 "invalid",
@@ -948,7 +1042,7 @@ def _prepare_lion_segments(
             identity_positions = sorted(identity_groups[identity_key])
             if any(position in conflicting_positions for position in identity_positions):
                 continue
-            boroughs_by_side, borough_conflicts = _alias_boroughs(lion, identity_positions)
+            boroughs_by_side, borough_conflicts = _alias_boroughs(lion_rows, identity_positions)
             if borough_conflicts:
                 identity_conflict_groups += 1
                 global_errors.append({
@@ -961,7 +1055,7 @@ def _prepare_lion_segments(
                     row_outcomes["invalid"] += 1
                     _append_preclassified_sides(
                         side_results,
-                        lion.iloc[source_row],
+                        lion_rows[source_row],
                         source_row,
                         source_indices[source_row],
                         "invalid",
@@ -970,7 +1064,7 @@ def _prepare_lion_segments(
                     )
                 continue
 
-            canonical_row = _canonical_alias_position(lion, identity_positions)
+            canonical_row = _canonical_alias_position(lion_rows, identity_positions)
             alias_rows = tuple(position for position in identity_positions if position != canonical_row)
             if alias_rows:
                 alias_groups += 1
@@ -979,7 +1073,7 @@ def _prepare_lion_segments(
                 row_outcomes["deduplicated_alias"] += 1
                 _append_preclassified_sides(
                     side_results,
-                    lion.iloc[alias_row],
+                    lion_rows[alias_row],
                     alias_row,
                     source_indices[alias_row],
                     "deduplicated_alias",
@@ -990,19 +1084,19 @@ def _prepare_lion_segments(
                         "segment_id": segment_id,
                     },
                 )
-            street_names = _lion_street_names(lion, identity_positions)
+            street_names = _lion_street_names(lion_rows, identity_positions)
             source_records = tuple(
-                _lion_source_record(lion.iloc[position], position, source_indices[position])
+                _lion_source_record(lion_rows[position], position, source_indices[position])
                 for position in identity_positions
             )
             address_ranges_by_side = _alias_address_ranges(
-                lion,
+                lion_rows,
                 identity_positions,
                 source_indices,
             )
             boundary_out_of_scope_by_side = {
                 side: all(
-                    _missing_borough_is_out_of_scope(lion.iloc[position], side)
+                    _missing_borough_is_out_of_scope(lion_rows[position], side)
                     for position in identity_positions
                 )
                 for side, _, _ in SIDE_FIELDS
@@ -1012,7 +1106,7 @@ def _prepare_lion_segments(
                 source_index=source_indices[canonical_row],
                 alias_source_rows=alias_rows,
                 source_indices=tuple(_json_scalar(source_indices[position]) for position in identity_positions),
-                row=lion.iloc[canonical_row],
+                row=lion_rows[canonical_row],
                 segment_id=segment_id,
                 street_names=street_names,
                 source_records=source_records,
@@ -1040,7 +1134,7 @@ def _prepare_lion_segments(
 
 def _append_preclassified_sides(
     side_results: list[SideResult],
-    row: pd.Series,
+    row: _RowLike,
     source_row: int,
     source_index: object,
     status: str,
@@ -1068,7 +1162,7 @@ def _exact_geometry_key(geometry: BaseGeometry | None, source_row: int) -> str:
     return geometry.wkb_hex
 
 
-def _curbside_exclusion(row: pd.Series) -> str | None:
+def _curbside_exclusion(row: _RowLike) -> str | None:
     status = _source_code(row.get("Status"))
     if status != "2":
         return f"official Generic segment is not constructed (Status={status or 'blank'})"
@@ -1078,34 +1172,41 @@ def _curbside_exclusion(row: pd.Series) -> str | None:
     return None
 
 
-def _canonical_alias_position(lion: gpd.GeoDataFrame, positions: list[int]) -> int:
+def _canonical_alias_position(lion_rows: tuple[_ColumnarRow, ...], positions: list[int]) -> int:
     base_rows = [
         position
         for position in positions
-        if not _clean_text(lion.iloc[position].get("SpecAddr"))
+        if not _clean_text(lion_rows[position].get("SpecAddr"))
     ]
     candidates = base_rows or positions
     return min(
         candidates,
         key=lambda position: (
-            _clean_text(_first_present(lion.iloc[position], "Street", "SAFStreetName", "street_name")),
+            _clean_text(
+                _first_present(
+                    lion_rows[position],
+                    "Street",
+                    "SAFStreetName",
+                    "street_name",
+                )
+            ),
             position,
         ),
     )
 
 
 def _alias_boroughs(
-    lion: gpd.GeoDataFrame,
+    lion_rows: tuple[_ColumnarRow, ...],
     positions: list[int],
 ) -> tuple[dict[str, str | None], list[str]]:
     boroughs_by_side: dict[str, str | None] = {}
     conflicts: list[str] = []
     for side, _, borough_field in SIDE_FIELDS:
         present_values = [
-            lion.iloc[position].get(borough_field)
+            lion_rows[position].get(borough_field)
             for position in positions
-            if not _is_missing(lion.iloc[position].get(borough_field))
-            and _clean_text(lion.iloc[position].get(borough_field))
+            if not _is_missing(lion_rows[position].get(borough_field))
+            and _clean_text(lion_rows[position].get(borough_field))
         ]
         values = {
             borough
@@ -1121,7 +1222,7 @@ def _alias_boroughs(
 
 
 def _alias_address_ranges(
-    lion: gpd.GeoDataFrame,
+    lion_rows: tuple[_ColumnarRow, ...],
     positions: list[int],
     source_indices: list[object],
 ) -> dict[str, tuple[dict[str, object], ...]]:
@@ -1131,7 +1232,7 @@ def _alias_address_ranges(
     for side, _, _ in SIDE_FIELDS:
         ranges: list[dict[str, object]] = []
         for position in positions:
-            row = lion.iloc[position]
+            row = lion_rows[position]
             if not _usable_address_range(row, side):
                 continue
             ranges.append({
@@ -1143,18 +1244,21 @@ def _alias_address_ranges(
     return ranges_by_side
 
 
-def _lion_street_names(lion: gpd.GeoDataFrame, positions: list[int]) -> tuple[str, ...]:
+def _lion_street_names(
+    lion_rows: tuple[_ColumnarRow, ...],
+    positions: list[int],
+) -> tuple[str, ...]:
     names = {
         cleaned
         for position in positions
         for field_name in ("Street", "SAFStreetName", "street_name")
-        if (cleaned := _clean_text(lion.iloc[position].get(field_name)))
+        if (cleaned := _clean_text(lion_rows[position].get(field_name)))
     }
     return tuple(sorted(names))
 
 
 def _lion_source_record(
-    row: pd.Series,
+    row: _RowLike,
     source_row: int,
     source_index: object,
 ) -> dict[str, object]:
@@ -1726,7 +1830,7 @@ def _split_feature_key(
     return f"{origin_block_face_id}~{digest}"
 
 
-def _missing_borough_is_out_of_scope(row: pd.Series, side: str) -> bool:
+def _missing_borough_is_out_of_scope(row: _RowLike, side: str) -> bool:
     if _source_code(row.get("SegmentTyp")) != "U":
         return False
     location_status = _source_code(row.get("LocStatus"))
@@ -2016,7 +2120,7 @@ def _source_code(value: object) -> str:
     return _clean_text(value).upper()
 
 
-def _first_present(row: pd.Series, *field_names: str) -> object:
+def _first_present(row: pd.Series | _RowLike, *field_names: str) -> object:
     for field_name in field_names:
         value = row.get(field_name)
         if not _is_missing(value) and str(value).strip():
@@ -2044,7 +2148,7 @@ def _is_non_addressable(value: object) -> bool:
         return False
 
 
-def _usable_address_range(row: pd.Series, side: str) -> bool:
+def _usable_address_range(row: _RowLike, side: str) -> bool:
     return any(
         _usable_address_value(row.get(field_name))
         for field_name in SIDE_ADDRESS_FIELDS[side]
@@ -2061,7 +2165,7 @@ def _usable_address_value(value: object) -> bool:
     return bool(digits) and any(digit != "0" for digit in digits)
 
 
-def _address_range_detail(row: pd.Series, side: str) -> dict[str, object]:
+def _address_range_detail(row: _RowLike, side: str) -> dict[str, object]:
     return {
         field_name: _json_scalar(row.get(field_name))
         for field_name in SIDE_ADDRESS_FIELDS[side]
@@ -2143,6 +2247,22 @@ def _atomic_write_many(files: list[tuple[Path, bytes]]) -> None:
                 temporary.unlink()
 
 
+def _read_lion_source(
+    path: Path,
+    layer: str,
+    *,
+    limit: int | None = None,
+) -> gpd.GeoDataFrame:
+    """Read only attributes used by ingestion, with an optional driver-side row limit."""
+
+    options: dict[str, object] = {"columns": list(LION_LOAD_FIELDS)}
+    if path.suffix.lower() == ".gdb" or path.is_dir():
+        options["layer"] = layer
+    if limit is not None:
+        options["rows"] = limit
+    return gpd.read_file(path, **options)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lion", type=Path, required=True, help="LION GeoJSON or File Geodatabase")
@@ -2167,16 +2287,15 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("limit must be positive")
+
     LOGGER.info("Reading LION source path=%s layer=%s", args.lion, args.lion_layer)
-    lion = gpd.read_file(args.lion, layer=args.lion_layer if args.lion.suffix.lower() == ".gdb" or args.lion.is_dir() else None)
+    lion = _read_lion_source(args.lion, args.lion_layer, limit=args.limit)
     LOGGER.info("Read LION source rows=%s columns=%s", len(lion), len(lion.columns))
     LOGGER.info("Reading DSNY frequency polygons path=%s", args.frequencies)
     frequencies = gpd.read_file(args.frequencies)
     LOGGER.info("Read DSNY frequency polygons rows=%s", len(frequencies))
-    if args.limit is not None:
-        if args.limit <= 0:
-            raise ValueError("limit must be positive")
-        lion = lion.head(args.limit).copy()
     if lion.empty:
         raise ValueError("LION input contains no rows")
 

@@ -10,6 +10,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -24,14 +25,14 @@ from scripts.release_validation import (
 )
 
 
-DEFAULT_VERSION = "ci-smoke-v3"
+DEFAULT_VERSION = "ci-smoke-v4"
 DATA_UPDATED = "2026-08-19T12:00:00+00:00"
 WEST, SOUTH, EAST, NORTH = -73.99, 40.70, -73.98, 40.71
 
 
 def _build_database(path: Path, version: str) -> None:
     initialize(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         connection.execute(
             """INSERT INTO block_faces
                (block_face_id, origin_block_face_id, segment_id, borough,
@@ -85,6 +86,7 @@ def _build_database(path: Path, version: str) -> None:
             "INSERT INTO dataset_metadata(key, value) VALUES ('dataset_version', ?)",
             (version,),
         )
+        connection.commit()
 
 
 def build_smoke_release(data_dir: str | Path, version: str = DEFAULT_VERSION) -> dict[str, object]:
@@ -122,7 +124,7 @@ def build_smoke_release(data_dir: str | Path, version: str = DEFAULT_VERSION) ->
         expected_database_path=database,
     )
 
-    with sqlite3.connect(tileset) as connection:
+    with closing(sqlite3.connect(tileset)) as connection:
         zoom, x, tms_y = connection.execute(
             """SELECT zoom_level, tile_column, tile_row
                FROM tiles ORDER BY zoom_level, tile_column, tile_row LIMIT 1"""
@@ -146,6 +148,7 @@ def build_smoke_release(data_dir: str | Path, version: str = DEFAULT_VERSION) ->
             "tileset": {
                 "path": tileset.name,
                 "sha256": tileset_summary["sha256"],
+                "tile_schema_revision": tile_report["tile_schema_revision"],
             },
         },
         "previous_releases": [],

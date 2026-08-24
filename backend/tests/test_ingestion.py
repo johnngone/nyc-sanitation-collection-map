@@ -1,5 +1,6 @@
 import hashlib
 import sqlite3
+from pathlib import Path
 
 import geopandas as gpd
 import pytest
@@ -7,8 +8,10 @@ from shapely import wkt
 from shapely.geometry import LineString, MultiLineString, box, mapping
 
 from scripts.build_pilot import (
+    LION_LOAD_FIELDS,
     _collect_frequency_parts,
     _map_offset_part_to_source,
+    _read_lion_source,
     _side_offset_pairs,
     bind_processed_sha256,
     build_collection_features,
@@ -131,6 +134,65 @@ def geojson_feature(
             "retrieved_at": "2026-08-19",
         },
     }
+
+
+def test_lion_source_read_projects_used_fields_and_applies_limit(monkeypatch) -> None:
+    expected = lion_frame([lion_row()])
+    observed: dict[str, object] = {}
+
+    def fake_read_file(path: Path, **options: object) -> gpd.GeoDataFrame:
+        observed["path"] = path
+        observed.update(options)
+        return expected
+
+    monkeypatch.setattr(gpd, "read_file", fake_read_file)
+
+    source = Path("official-lion.gdb")
+    result = _read_lion_source(source, "lion", limit=25)
+
+    assert result is expected
+    assert observed == {
+        "path": source,
+        "columns": list(LION_LOAD_FIELDS),
+        "layer": "lion",
+        "rows": 25,
+    }
+
+
+def test_working_crs_inputs_are_not_reprojected(monkeypatch) -> None:
+    lion = lion_frame([lion_row(right_id=0)])
+    frequencies = frequency_frame([{
+        "geometry": box(X - 10, Y + 1, X + 110, Y + 100),
+    }])
+
+    def unexpected_reprojection(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("EPSG:2263 input must not be reprojected")
+
+    monkeypatch.setattr(gpd.GeoDataFrame, "to_crs", unexpected_reprojection)
+
+    payload, audit = build_collection_features(lion, frequencies)
+
+    assert len(payload["features"]) == 1
+    assert audit["passed"] is True
+
+
+def test_non_default_lion_index_is_preserved_in_provenance() -> None:
+    lion = lion_frame([lion_row(right_id=0)])
+    lion.index = ["official-row-42"]
+    frequencies = frequency_frame([{
+        "geometry": box(X - 10, Y + 1, X + 110, Y + 100),
+    }])
+
+    payload, audit = build_collection_features(lion, frequencies)
+
+    component = payload["features"][0]["properties"]["lion_components"][0]
+    assert component["source_indices"] == ["official-row-42"]
+    assert component["source_records"][0]["source_index"] == "official-row-42"
+    assert any(
+        record["source_index"] == "official-row-42"
+        for record in audit["records"]
+        if record.get("segment_id") == "segment-1"
+    )
 
 
 def test_side_offset_join_resolves_left_and_right_independently() -> None:

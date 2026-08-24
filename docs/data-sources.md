@@ -87,7 +87,7 @@ The processed output retains the original block-face identity, contributing LION
 
 ## Preserved release evidence
 
-Every committed v3 release contains:
+Every committed release contains:
 
 - the exact raw DSNY GeoJSON, LION ZIP, and PAD ZIP;
 - AddressPoint query, CSCL alignment, recovery-shadow, and unknown-geometry reports;

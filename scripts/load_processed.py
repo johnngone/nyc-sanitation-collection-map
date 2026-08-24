@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import sys
 from collections import defaultdict
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +64,14 @@ class ValidatedUnknownFeature:
     geometry_method: str
     geometry: BaseGeometry
     evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PreparedPayload:
+    """The fully validated, normalized representation consumed by SQLite."""
+
+    features: tuple[ValidatedFeature, ...]
+    unknown_features: tuple[ValidatedUnknownFeature, ...]
 
 
 def prepare_features(payload: object) -> list[ValidatedFeature]:
@@ -146,16 +155,33 @@ def prepare_unknown_features(payload: object) -> list[ValidatedUnknownFeature]:
     return unknowns
 
 
+def prepare_payload(payload: object) -> PreparedPayload:
+    """Validate and normalize a processed snapshot exactly once."""
+
+    return PreparedPayload(
+        features=tuple(prepare_features(payload)),
+        unknown_features=tuple(prepare_unknown_features(payload)),
+    )
+
+
 def load_payload(payload: object, database: str | Path) -> int:
     """Atomically load a fully validated payload and return its feature count."""
 
-    features = prepare_features(payload)
-    unknown_features = prepare_unknown_features(payload)
+    return load_prepared_payload(prepare_payload(payload), database)
+
+
+def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> int:
+    """Load a payload already validated and normalized by :func:`prepare_payload`."""
+
+    if not isinstance(prepared, PreparedPayload):
+        raise TypeError("prepared must be a PreparedPayload")
+    features = prepared.features
+    unknown_features = prepared.unknown_features
     if not features:
         raise ValueError("input contains no features")
     LOGGER.info("Initializing SQLite and loading audited features=%s database=%s", len(features), database)
     initialize(database)
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         # SQLite cannot add a NOT NULL column without a table rebuild. Existing
         # databases receive a nullable migration column, then this full-snapshot
@@ -340,6 +366,7 @@ def load_payload(payload: object, database: str | Path) -> int:
             ],
         )
         LOGGER.info("SQLite unknown-feature load complete features=%s", len(unknown_features))
+        connection.commit()
     return len(features)
 
 

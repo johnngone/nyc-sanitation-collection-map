@@ -15,4 +15,4 @@ HEALTH_SYNC_HASH_MAX_BYTES = max(
 )
 TILESET_PATH = os.getenv("TILESET_PATH", "data/collection_streets.mbtiles")
 TILE_MIN_ZOOM = int(os.getenv("TILE_MIN_ZOOM", "12"))
-TILE_MAX_ZOOM = int(os.getenv("TILE_MAX_ZOOM", "17"))
+TILE_MAX_ZOOM = int(os.getenv("TILE_MAX_ZOOM", "16"))

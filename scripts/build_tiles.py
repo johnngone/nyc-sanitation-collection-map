@@ -39,9 +39,9 @@ LOGGER = logging.getLogger("build_tiles")
 SOURCE_LAYER = "collection_streets"
 UNKNOWN_SOURCE_LAYER = "collection_unknowns"
 UNKNOWN_MIN_ZOOM = 15
-TILE_SCHEMA_REVISION = 3
+TILE_SCHEMA_REVISION = 4
 DEFAULT_MIN_ZOOM = 12
-DEFAULT_MAX_ZOOM = 17
+DEFAULT_MAX_ZOOM = 16
 DEFAULT_BUFFER_PIXELS = 16.0
 # The frontend's widest styled line is offset 9 px with a 5 px stroke.  Keep
 # enough geometry outside each tile for that stroke (plus antialiasing/joins)
@@ -67,8 +67,10 @@ VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 @dataclass
 class TileBlockFace:
+    feature_id: str
     geometry: BaseGeometry
     properties: dict[str, str]
+    mvt_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -279,9 +281,9 @@ def _load_features(
     )
     for row in face_rows:
         street_name = str(row["street_name"]).strip()
+        block_face_id = str(row["block_face_id"]).strip()
         properties = {
-            "id": str(row["block_face_id"]).strip(),
-            "name": street_name,
+            "id": block_face_id,
             "street_name": street_name,
             "borough": str(row["borough"]).strip(),
             "side": str(row["side"]).strip().upper(),
@@ -328,6 +330,7 @@ def _load_features(
         if projected.is_empty or not all(math.isfinite(value) for value in projected.bounds):
             raise RuntimeError(f"tile feature projection failed id={properties['id']}")
         block_faces_by_id[properties["id"]] = TileBlockFace(
+            feature_id=block_face_id,
             geometry=projected,
             properties=properties,
         )
@@ -410,7 +413,7 @@ def _load_features(
     state_counts: dict[str, dict[str, int]] = {kind: {} for kind in VALID_TYPES}
     state_rows = connection.execute(
         """SELECT block_face_id, collection_type, effective_days_json, state, rule_id,
-                  source_policy_conflict, provenance
+                  source_policy_conflict
            FROM block_face_collection_states
            ORDER BY block_face_id, collection_type"""
     )
@@ -436,15 +439,11 @@ def _load_features(
         prefix = collection_type.lower()
         properties = block_faces_by_id[block_face_id].properties
         properties[f"{prefix}_status"] = state
-        properties[f"{prefix}_rule"] = "" if row["rule_id"] is None else str(row["rule_id"])
         properties[f"{prefix}_conflict"] = "1" if int(row["source_policy_conflict"]) else "0"
-        properties[f"{prefix}_provenance"] = str(row["provenance"])
         state_counts[collection_type][state] = state_counts[collection_type].get(state, 0) + 1
     if actual_state_rows != source_block_face_count * len(VALID_TYPES):
         raise RuntimeError("collection state query lost rows")
     for block_face in block_faces_by_id.values():
-        block_face.properties["identity_method"] = "LION_BLOCK_FACE_ID"
-        block_face.properties["geometry_method"] = "DIRECT_SIDE_TRACE"
         content_hash.update(
             json.dumps(block_face.properties, sort_keys=True, separators=(",", ":")).encode("utf-8")
         )
@@ -460,39 +459,46 @@ def _load_features(
     data_updated = str(data_updated_row[0]) if data_updated_row and data_updated_row[0] else None
     unknown_faces: list[TileBlockFace] = []
     unknown_ids: set[str] = set()
-    for row in connection.execute(
-        """SELECT unknown_id, technical_identity, segment_id, borough, street_name, side,
-                  reason_code, reason, identity_method, geometry_method, geometry_wkt
-           FROM unknown_block_faces ORDER BY unknown_id"""
-    ):
+    unknown_mvt_ids: set[int] = set()
+    unknown_rows = connection.execute(
+        """SELECT unknown_id, street_name, side, reason_code, reason, geometry_wkt
+           FROM unknown_block_faces ORDER BY unknown_id COLLATE BINARY"""
+    )
+    for mvt_id, row in enumerate(unknown_rows, start=1):
         unknown_id = str(row["unknown_id"])
         if unknown_id in unknown_ids:
             raise RuntimeError(f"duplicate unknown feature id={unknown_id}")
+        if mvt_id in unknown_mvt_ids:
+            raise RuntimeError(f"duplicate unknown MVT feature id={mvt_id}")
         unknown_ids.add(unknown_id)
+        unknown_mvt_ids.add(mvt_id)
         geometry_wgs84 = force_2d(wkt.loads(row["geometry_wkt"]))
         if geometry_wgs84.is_empty or geometry_wgs84.geom_type not in {"LineString", "MultiLineString"}:
             raise RuntimeError(f"unknown feature has invalid geometry id={unknown_id}")
         projected = transform(projector.transform, geometry_wgs84)
         properties = {
-            "id": unknown_id,
-            "technical_identity": "" if row["technical_identity"] is None else str(row["technical_identity"]),
-            "segment_id": str(row["segment_id"]),
-            "borough": "" if row["borough"] is None else str(row["borough"]),
             "street_name": str(row["street_name"]),
             "side": str(row["side"]),
             "reason_code": str(row["reason_code"]),
             "reason": str(row["reason"]),
-            "identity_method": str(row["identity_method"]),
-            "geometry_method": str(row["geometry_method"]),
         }
         if any(key.endswith("_days") or key.endswith("_status") for key in properties):
             raise RuntimeError("unknown tile feature contains schedule properties")
-        unknown_faces.append(TileBlockFace(geometry=projected, properties=properties))
+        unknown_faces.append(
+            TileBlockFace(
+                feature_id=unknown_id,
+                geometry=projected,
+                properties=properties,
+                mvt_id=mvt_id,
+            )
+        )
         min_x, min_y, max_x, max_y = geometry_wgs84.bounds
         west, south = min(west, min_x), min(south, min_y)
         east, north = max(east, max_x), max(north, max_y)
         content_hash.update(geometry_wgs84.wkb)
         content_hash.update(json.dumps(properties, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    if unknown_mvt_ids != set(range(1, len(unknown_faces) + 1)):
+        raise RuntimeError("unknown MVT feature IDs must be compact, unique, and 1-based")
     return SourceSnapshot(
         block_faces=block_faces,
         unknown_faces=unknown_faces,
@@ -605,7 +611,6 @@ def _metadata_rows(
                 "maxzoom": maxzoom,
                 "fields": {
                     "id": "String",
-                    "name": "String",
                     "street_name": "String",
                     "borough": "String",
                     "side": "String",
@@ -619,8 +624,10 @@ def _metadata_rows(
                     "recycling_status": "String",
                     "organics_status": "String",
                     "bulk_status": "String",
-                    "identity_method": "String",
-                    "geometry_method": "String",
+                    "refuse_conflict": "String",
+                    "recycling_conflict": "String",
+                    "organics_conflict": "String",
+                    "bulk_conflict": "String",
                     **{field: "String" for field in optional_source_id_fields},
                 },
             },
@@ -630,16 +637,10 @@ def _metadata_rows(
                 "minzoom": min(maxzoom, max(minzoom, UNKNOWN_MIN_ZOOM)),
                 "maxzoom": maxzoom,
                 "fields": {
-                    "id": "String",
-                    "technical_identity": "String",
-                    "segment_id": "String",
-                    "borough": "String",
                     "street_name": "String",
                     "side": "String",
                     "reason_code": "String",
                     "reason": "String",
-                    "identity_method": "String",
-                    "geometry_method": "String",
                 },
             },
         ]
@@ -784,10 +785,10 @@ def _nonrenderable_feature_records(
     unknown: bool,
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
-    for index in sorted(indexes, key=lambda item: features[item].properties["id"]):
+    for index in sorted(indexes, key=lambda item: features[item].feature_id):
         feature = features[index]
         record: dict[str, object] = {
-            "id": feature.properties["id"],
+            "id": feature.feature_id,
             "street_name": feature.properties["street_name"],
             "side": feature.properties["side"],
             "projected_length_meters": round(float(feature.geometry.length), 6),
@@ -1017,7 +1018,11 @@ def build_tiles(
                             if used_source_fallback:
                                 source_unknown_fallback_at_maxzoom.add(index)
                         encoded_unknowns.append(
-                            {"geometry": clipped, "properties": unknown_faces[index].properties}
+                            {
+                                "id": unknown_faces[index].mvt_id,
+                                "geometry": clipped,
+                                "properties": unknown_faces[index].properties,
+                            }
                         )
                     if not encoded_features and not encoded_unknowns:
                         continue

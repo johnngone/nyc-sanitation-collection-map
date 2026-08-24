@@ -31,6 +31,7 @@ router = APIRouter(prefix="/api")
 VALID_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
 VALID_TYPES = ("REFUSE", "RECYCLING", "ORGANICS", "BULK")
 LEGACY_FEATURE_LIMIT = 20_000
+SUPPORTED_RUNTIME_TILE_SCHEMA_REVISIONS = {2, 3, 4}
 
 
 def _read_only_database(path: str | Path) -> sqlite3.Connection:
@@ -74,6 +75,29 @@ def _unavailable_map_config() -> dict[str, object]:
     }
 
 
+def _expected_tile_schema_revision(manifest: dict[str, object]) -> int | None:
+    """Resolve the release contract only when this runtime can consume it."""
+
+    artifacts = manifest.get("artifacts")
+    tileset_descriptor = (
+        artifacts.get("tileset") if isinstance(artifacts, dict) else None
+    )
+    declared = (
+        tileset_descriptor.get("tile_schema_revision")
+        if isinstance(tileset_descriptor, dict)
+        else None
+    )
+    if declared is None:
+        declared = 3 if manifest.get("manifest_version") == 3 else 2
+    if (
+        not isinstance(declared, int)
+        or isinstance(declared, bool)
+        or declared not in SUPPORTED_RUNTIME_TILE_SCHEMA_REVISIONS
+    ):
+        return None
+    return declared
+
+
 @router.get("/map-config")
 def map_config() -> JSONResponse:
     try:
@@ -99,11 +123,22 @@ def map_config() -> JSONResponse:
     except (OSError, sqlite3.Error, ValueError):
         LOGGER.warning("Vector tileset is unavailable path=%s", tileset_path, exc_info=True)
         return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
-    if release is not None and metadata.version != release.dataset_version:
+    if release is not None:
+        expected_tile_revision = _expected_tile_schema_revision(release.manifest)
+        if (
+            metadata.version != release.dataset_version
+            or expected_tile_revision is None
+            or metadata.tile_schema_revision != expected_tile_revision
+        ):
+            LOGGER.error("Committed tileset does not match the runtime release contract")
+            return JSONResponse(
+                _unavailable_map_config(),
+                headers={"Cache-Control": "no-cache"},
+            )
+    elif metadata.tile_schema_revision not in SUPPORTED_RUNTIME_TILE_SCHEMA_REVISIONS:
         LOGGER.error(
-            "Committed tileset version does not match manifest expected=%s actual=%s",
-            release.dataset_version,
-            metadata.version,
+            "Legacy tileset schema revision is unsupported actual=%s",
+            metadata.tile_schema_revision,
         )
         return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
     return JSONResponse(
@@ -221,10 +256,10 @@ def health() -> dict[str, object]:
         except (FileNotFoundError, OSError, sqlite3.Error, ValueError):
             LOGGER.exception("Health check could not validate committed tileset metadata")
             raise HTTPException(status_code=503, detail="Committed tileset metadata is invalid") from None
-        manifest_version = release.manifest.get("manifest_version")
-        expected_tile_revision = 3 if manifest_version == 3 else 2
+        expected_tile_revision = _expected_tile_schema_revision(release.manifest)
         if (
-            tile_metadata.version != release.dataset_version
+            expected_tile_revision is None
+            or tile_metadata.version != release.dataset_version
             or tile_metadata.tile_schema_revision != expected_tile_revision
         ):
             raise HTTPException(status_code=503, detail="Committed tileset release binding is invalid")
