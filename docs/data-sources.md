@@ -96,7 +96,7 @@ Every committed v3 release contains:
 - `ingestion_failures.jsonl`, a line-oriented diagnostic view of non-success/fallback records;
 - the canonical processed GeoJSON, validated SQLite database, MBTiles archive, tile report, and checksummed release manifest.
 
-The database validation also requires foreign-key integrity, complete schedule/provenance coverage, all four collection types, and one RTree entry per block face. Independent semantic hashes compare each processed feature's identity, geometry, schedules, and provenance with SQLite. Tile validation decodes every zoom, reconciles every tile property with the database, reports per-zoom unique-feature coverage, and requires every database feature to survive at maximum zoom.
+The database validation also requires foreign-key integrity, complete schedule/provenance coverage, all four collection types, and one RTree entry per block face. Independent semantic hashes compare each processed feature's identity, geometry, schedules, and provenance with SQLite. Tile validation decodes every zoom, reconciles every tile property with the database, and reports per-zoom unique-feature coverage. At maximum zoom, every database feature must either appear in the decoded tiles or be explicitly identified and independently proven too small to survive vector-tile quantization. These sub-grid exceptions remain in the database and audit artifacts; any other omission fails the release.
 
 ## Interpretation limits
 

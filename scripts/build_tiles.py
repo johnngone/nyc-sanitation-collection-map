@@ -98,13 +98,21 @@ class BuildReport:
     feature_count: int
     geometry_count: int
     maxzoom_feature_count: int
+    maxzoom_nonrenderable_feature_count: int
+    maxzoom_nonrenderable_feature_ids_sha256: str
     unknown_feature_count: int
     maxzoom_unknown_feature_count: int
+    maxzoom_nonrenderable_unknown_feature_count: int
+    maxzoom_nonrenderable_unknown_ids_sha256: str
+    maxzoom_nonrenderable_features: list[dict[str, object]]
+    maxzoom_nonrenderable_unknowns: list[dict[str, object]]
     tile_feature_count: int
     bounds: tuple[float, float, float, float]
     minzoom: int
     maxzoom: int
     data_updated: str | None
+    simplify_pixels: float
+    buffer_pixels: float
     tile_size_metrics: dict[str, object]
     tile_size_limits: dict[str, int]
     sha256: str
@@ -122,13 +130,21 @@ class BuildReport:
             "feature_count": self.feature_count,
             "geometry_count": self.geometry_count,
             "maxzoom_feature_count": self.maxzoom_feature_count,
+            "maxzoom_nonrenderable_feature_count": self.maxzoom_nonrenderable_feature_count,
+            "maxzoom_nonrenderable_feature_ids_sha256": self.maxzoom_nonrenderable_feature_ids_sha256,
             "unknown_feature_count": self.unknown_feature_count,
             "maxzoom_unknown_feature_count": self.maxzoom_unknown_feature_count,
+            "maxzoom_nonrenderable_unknown_feature_count": self.maxzoom_nonrenderable_unknown_feature_count,
+            "maxzoom_nonrenderable_unknown_ids_sha256": self.maxzoom_nonrenderable_unknown_ids_sha256,
+            "maxzoom_nonrenderable_features": self.maxzoom_nonrenderable_features,
+            "maxzoom_nonrenderable_unknowns": self.maxzoom_nonrenderable_unknowns,
             "tile_feature_count": self.tile_feature_count,
             "bounds": list(self.bounds),
             "minzoom": self.minzoom,
             "maxzoom": self.maxzoom,
             "data_updated": self.data_updated,
+            "simplify_pixels": self.simplify_pixels,
+            "buffer_pixels": self.buffer_pixels,
             "tile_size_metrics": self.tile_size_metrics,
             "tile_size_limits": self.tile_size_limits,
             "sha256": self.sha256,
@@ -564,10 +580,17 @@ def _metadata_rows(
     feature_count: int,
     unknown_feature_count: int,
     maxzoom_feature_count: int,
+    maxzoom_nonrenderable_feature_count: int,
+    maxzoom_nonrenderable_feature_ids_sha256: str,
+    maxzoom_unknown_feature_count: int,
+    maxzoom_nonrenderable_unknown_feature_count: int,
+    maxzoom_nonrenderable_unknown_ids_sha256: str,
     bounds: tuple[float, float, float, float],
     minzoom: int,
     maxzoom: int,
     data_updated: str | None,
+    simplify_pixels: float,
+    buffer_pixels: float,
     optional_source_id_fields: tuple[str, ...],
     tile_size_metrics: dict[str, object],
     tile_size_limits: dict[str, int],
@@ -634,14 +657,20 @@ def _metadata_rows(
         ("source_schedule_group_count", str(source_schedule_group_count)),
         ("feature_count", str(feature_count)),
         ("unknown_feature_count", str(unknown_feature_count)),
-        ("maxzoom_unknown_feature_count", str(unknown_feature_count)),
+        ("maxzoom_unknown_feature_count", str(maxzoom_unknown_feature_count)),
+        ("maxzoom_nonrenderable_unknown_feature_count", str(maxzoom_nonrenderable_unknown_feature_count)),
+        ("maxzoom_nonrenderable_unknown_ids_sha256", maxzoom_nonrenderable_unknown_ids_sha256),
         ("geometry_count", str(feature_count)),
         ("maxzoom_feature_count", str(maxzoom_feature_count)),
+        ("maxzoom_nonrenderable_feature_count", str(maxzoom_nonrenderable_feature_count)),
+        ("maxzoom_nonrenderable_feature_ids_sha256", maxzoom_nonrenderable_feature_ids_sha256),
         ("source_layer", SOURCE_LAYER),
         ("unknown_source_layer", UNKNOWN_SOURCE_LAYER),
         ("unknown_minzoom", str(min(maxzoom, max(minzoom, UNKNOWN_MIN_ZOOM)))),
         ("minzoom", str(minzoom)),
         ("maxzoom", str(maxzoom)),
+        ("simplify_pixels", f"{simplify_pixels:.12g}"),
+        ("buffer_pixels", f"{buffer_pixels:.12g}"),
         ("bounds", ",".join(f"{value:.7f}" for value in bounds)),
         ("center", f"{(west + east) / 2:.7f},{(south + north) / 2:.7f},{minzoom}"),
         ("json", json.dumps(vector_layers, sort_keys=True, separators=(",", ":"))),
@@ -721,6 +750,55 @@ def _survives_quantization(
     return False
 
 
+def _tile_geometry_with_source_fallback(
+    simplified: BaseGeometry,
+    source: BaseGeometry,
+    clipping_box: BaseGeometry,
+    tile_bounds: tuple[float, float, float, float],
+) -> tuple[BaseGeometry | None, bool]:
+    """Return encodable linework, retrying exact source geometry when needed."""
+
+    clipped = _linear_parts(simplified.intersection(clipping_box))
+    if clipped is not None and _survives_quantization(clipped, tile_bounds):
+        return clipped, False
+    if source is simplified:
+        return None, False
+    source_clipped = _linear_parts(source.intersection(clipping_box))
+    if source_clipped is not None and _survives_quantization(source_clipped, tile_bounds):
+        return source_clipped, True
+    return None, False
+
+
+def _id_set_sha256(feature_ids: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    for feature_id in sorted(feature_ids):
+        digest.update(feature_id.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _nonrenderable_feature_records(
+    features: list[TileBlockFace],
+    indexes: set[int],
+    *,
+    unknown: bool,
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for index in sorted(indexes, key=lambda item: features[item].properties["id"]):
+        feature = features[index]
+        record: dict[str, object] = {
+            "id": feature.properties["id"],
+            "street_name": feature.properties["street_name"],
+            "side": feature.properties["side"],
+            "projected_length_meters": round(float(feature.geometry.length), 6),
+            "reason": "COLLAPSES_AFTER_MVT_QUANTIZATION",
+        }
+        if unknown:
+            record["reason_code"] = feature.properties["reason_code"]
+        records.append(record)
+    return records
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -761,6 +839,8 @@ def build_tiles(
 ) -> BuildReport:
     if not database_path.is_file():
         raise FileNotFoundError(database_path)
+    simplify_pixels = float(simplify_pixels)
+    buffer_pixels = float(buffer_pixels)
     if not 0 <= minzoom <= maxzoom <= 22:
         raise ValueError("zoom range must satisfy 0 <= minzoom <= maxzoom <= 22")
     if simplify_pixels < 0:
@@ -838,6 +918,12 @@ def build_tiles(
     tile_feature_count = 0
     represented_at_maxzoom: set[int] = set()
     represented_unknown_at_maxzoom: set[int] = set()
+    source_fallback_at_maxzoom: set[int] = set()
+    source_unknown_fallback_at_maxzoom: set[int] = set()
+    nonrenderable_at_maxzoom: set[int] = set()
+    nonrenderable_unknown_at_maxzoom: set[int] = set()
+    maxzoom_nonrenderable_features: list[dict[str, object]] = []
+    maxzoom_nonrenderable_unknowns: list[dict[str, object]] = []
     sizes_by_zoom: dict[int, list[tuple[int, int]]] = defaultdict(list)
     try:
         with closing(sqlite3.connect(temporary_path)) as archive:
@@ -860,13 +946,21 @@ def build_tiles(
                     for unknown in unknown_faces
                 ] if zoom >= UNKNOWN_MIN_ZOOM else []
                 tile_members: dict[tuple[int, int], list[int]] = defaultdict(list)
-                for index, geometry in enumerate(simplified):
+                membership_geometries = (
+                    [feature.geometry for feature in block_faces]
+                    if zoom == maxzoom else simplified
+                )
+                for index, geometry in enumerate(membership_geometries):
                     x_values, y_values = _tile_range(geometry.bounds, zoom, buffer_distance)
                     for x in x_values:
                         for y in y_values:
                             tile_members[(x, y)].append(index)
                 unknown_tile_members: dict[tuple[int, int], list[int]] = defaultdict(list)
-                for index, geometry in enumerate(simplified_unknowns):
+                unknown_membership_geometries = (
+                    [feature.geometry for feature in unknown_faces]
+                    if zoom == maxzoom else simplified_unknowns
+                )
+                for index, geometry in enumerate(unknown_membership_geometries):
                     x_values, y_values = _tile_range(geometry.bounds, zoom, buffer_distance)
                     for x in x_values:
                         for y in y_values:
@@ -893,24 +987,35 @@ def build_tiles(
                     clipping_box = box(*clip_bounds)
                     encoded_features = []
                     for index in indexes:
-                        clipped = _linear_parts(simplified[index].intersection(clipping_box))
+                        clipped, used_source_fallback = _tile_geometry_with_source_fallback(
+                            simplified[index],
+                            block_faces[index].geometry if zoom == maxzoom else simplified[index],
+                            clipping_box,
+                            (min_x, min_y, max_x, max_y),
+                        )
                         if clipped is None:
-                            continue
-                        tile_bounds = (min_x, min_y, max_x, max_y)
-                        if not _survives_quantization(clipped, tile_bounds):
                             continue
                         if zoom == maxzoom:
                             represented_at_maxzoom.add(index)
+                            if used_source_fallback:
+                                source_fallback_at_maxzoom.add(index)
                         encoded_features.append(
                             {"geometry": clipped, "properties": block_faces[index].properties}
                         )
                     encoded_unknowns = []
                     for index in unknown_tile_members.get((x, y), []):
-                        clipped = _linear_parts(simplified_unknowns[index].intersection(clipping_box))
-                        if clipped is None or not _survives_quantization(clipped, (min_x, min_y, max_x, max_y)):
+                        clipped, used_source_fallback = _tile_geometry_with_source_fallback(
+                            simplified_unknowns[index],
+                            unknown_faces[index].geometry if zoom == maxzoom else simplified_unknowns[index],
+                            clipping_box,
+                            (min_x, min_y, max_x, max_y),
+                        )
+                        if clipped is None:
                             continue
                         if zoom == maxzoom:
                             represented_unknown_at_maxzoom.add(index)
+                            if used_source_fallback:
+                                source_unknown_fallback_at_maxzoom.add(index)
                         encoded_unknowns.append(
                             {"geometry": clipped, "properties": unknown_faces[index].properties}
                         )
@@ -980,15 +1085,41 @@ def build_tiles(
                 len(represented_at_maxzoom),
             )
             if len(represented_at_maxzoom) != len(block_faces):
-                raise RuntimeError(
-                    "tile build did not represent every source block face at max zoom: "
-                    f"zoom={maxzoom} expected={len(block_faces)} actual={len(represented_at_maxzoom)}"
-                )
+                nonrenderable_at_maxzoom = set(range(len(block_faces))) - represented_at_maxzoom
             if len(represented_unknown_at_maxzoom) != len(unknown_faces):
-                raise RuntimeError(
-                    "tile build did not represent every unknown face at max zoom: "
-                    f"zoom={maxzoom} expected={len(unknown_faces)} "
-                    f"actual={len(represented_unknown_at_maxzoom)}"
+                nonrenderable_unknown_at_maxzoom = (
+                    set(range(len(unknown_faces))) - represented_unknown_at_maxzoom
+                )
+            maxzoom_nonrenderable_features = _nonrenderable_feature_records(
+                block_faces, nonrenderable_at_maxzoom, unknown=False
+            )
+            maxzoom_nonrenderable_unknowns = _nonrenderable_feature_records(
+                unknown_faces, nonrenderable_unknown_at_maxzoom, unknown=True
+            )
+            LOGGER.info(
+                "Maximum-zoom renderability scheduled=%s/%s nonrenderable=%s "
+                "source_fallbacks=%s unknown=%s/%s unknown_nonrenderable=%s "
+                "unknown_source_fallbacks=%s",
+                len(represented_at_maxzoom),
+                len(block_faces),
+                len(nonrenderable_at_maxzoom),
+                len(source_fallback_at_maxzoom),
+                len(represented_unknown_at_maxzoom),
+                len(unknown_faces),
+                len(nonrenderable_unknown_at_maxzoom),
+                len(source_unknown_fallback_at_maxzoom),
+            )
+            if maxzoom_nonrenderable_features:
+                LOGGER.warning(
+                    "Scheduled features below the maximum-zoom tile grid count=%s ids=%s",
+                    len(maxzoom_nonrenderable_features),
+                    [record["id"] for record in maxzoom_nonrenderable_features[:20]],
+                )
+            if maxzoom_nonrenderable_unknowns:
+                LOGGER.warning(
+                    "Unknown features below the maximum-zoom tile grid count=%s ids=%s",
+                    len(maxzoom_nonrenderable_unknowns),
+                    [record["id"] for record in maxzoom_nonrenderable_unknowns[:20]],
                 )
             if tile_count == 0:
                 raise RuntimeError("tile build produced no tiles")
@@ -1005,10 +1136,21 @@ def build_tiles(
                     feature_count=feature_count,
                     unknown_feature_count=len(unknown_faces),
                     maxzoom_feature_count=len(represented_at_maxzoom),
+                    maxzoom_nonrenderable_feature_count=len(nonrenderable_at_maxzoom),
+                    maxzoom_nonrenderable_feature_ids_sha256=_id_set_sha256(
+                        record["id"] for record in maxzoom_nonrenderable_features
+                    ),
+                    maxzoom_unknown_feature_count=len(represented_unknown_at_maxzoom),
+                    maxzoom_nonrenderable_unknown_feature_count=len(nonrenderable_unknown_at_maxzoom),
+                    maxzoom_nonrenderable_unknown_ids_sha256=_id_set_sha256(
+                        record["id"] for record in maxzoom_nonrenderable_unknowns
+                    ),
                     bounds=bounds,
                     minzoom=minzoom,
                     maxzoom=maxzoom,
                     data_updated=data_updated,
+                    simplify_pixels=simplify_pixels,
+                    buffer_pixels=buffer_pixels,
                     optional_source_id_fields=snapshot.optional_source_id_fields,
                     tile_size_metrics=tile_size_metrics,
                     tile_size_limits=tile_size_limits,
@@ -1039,13 +1181,25 @@ def build_tiles(
         feature_count=feature_count,
         geometry_count=feature_count,
         maxzoom_feature_count=len(represented_at_maxzoom),
+        maxzoom_nonrenderable_feature_count=len(nonrenderable_at_maxzoom),
+        maxzoom_nonrenderable_feature_ids_sha256=_id_set_sha256(
+            record["id"] for record in maxzoom_nonrenderable_features
+        ),
         unknown_feature_count=len(unknown_faces),
         maxzoom_unknown_feature_count=len(represented_unknown_at_maxzoom),
+        maxzoom_nonrenderable_unknown_feature_count=len(nonrenderable_unknown_at_maxzoom),
+        maxzoom_nonrenderable_unknown_ids_sha256=_id_set_sha256(
+            record["id"] for record in maxzoom_nonrenderable_unknowns
+        ),
+        maxzoom_nonrenderable_features=maxzoom_nonrenderable_features,
+        maxzoom_nonrenderable_unknowns=maxzoom_nonrenderable_unknowns,
         tile_feature_count=tile_feature_count,
         bounds=bounds,
         minzoom=minzoom,
         maxzoom=maxzoom,
         data_updated=data_updated,
+        simplify_pixels=simplify_pixels,
+        buffer_pixels=buffer_pixels,
         tile_size_metrics=tile_size_metrics,
         tile_size_limits=tile_size_limits,
         sha256=_file_sha256(output_path),

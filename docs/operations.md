@@ -39,9 +39,11 @@ The default v3 archive is an MBTiles SQLite file covering zooms 12–17. `collec
 | `*_status`, `*_rule`, `*_conflict`, `*_provenance` | Per-type evidence state and policy provenance |
 | `identity_method`, `geometry_method` | How identity and geometry were validated |
 
-Blank day lists with `UNKNOWN_SOURCE_BLANK` mean the official source schedule is unavailable, never that service does not exist. Every known block face has exactly four state rows. Unknown-layer features contain no weekday or status properties and must also survive maximum zoom exactly once.
+Blank day lists with `UNKNOWN_SOURCE_BLANK` mean the official source schedule is unavailable, never that service does not exist. Every known block face has exactly four state rows. Unknown-layer features contain no weekday or status properties.
 
 A line crossing a tile boundary is clipped into each intersecting tile. `feature_count` is the unique source count; `tile_feature_count` includes these per-tile placements.
+
+At maximum zoom, the builder first uses the normal simplified geometry and retries the exact source geometry if quantization would collapse it. A source line that still maps to a single vector-tile coordinate in every relevant buffered tile is classified as nonrenderable at the configured maximum zoom. It remains in GeoJSON, SQLite, and the audit trail, but does not block publication. The tile report records each such ID, its projected length, its reason, and a digest of the complete ID set. Release validation independently projects and tests the source geometry; an omitted line that could render, an unexplained missing ID, or a count/digest mismatch still fails the release.
 
 MapLibre fetches the current contract from `/api/map-config`, then requests only visible PBF tiles. The API translates XYZ requests to MBTiles TMS rows and returns gzip content without decompressing it. Versioned URLs have `Cache-Control: public, max-age=31536000, immutable` and an `ETag`; empty valid coordinates return `204`.
 
@@ -54,7 +56,7 @@ Each build fails before publication if any tile exceeds either default ceiling:
 
 The `TILE_MAX_COMPRESSED_BYTES` and `TILE_MAX_UNCOMPRESSED_BYTES` settings (and equivalent `scripts/build_tiles.py` flags) may lower these gates for stricter deployments. They cannot raise the hard release ceilings; increasing those requires a reviewed code change so an environment typo cannot silently trade away download/decode latency.
 
-`tile_build_report.json`, MBTiles metadata, and release validation record overall and per-zoom tile counts; compressed and uncompressed totals, maxima, and p95 sizes; initial-zoom bytes; build limits; source feature/count bindings; per-zoom unique-feature coverage; and complete maximum-zoom coverage. This makes a performance regression a release artifact rather than a browser surprise.
+`tile_build_report.json`, MBTiles metadata, and release validation record overall and per-zoom tile counts; compressed and uncompressed totals, maxima, and p95 sizes; initial-zoom bytes; build limits; source feature/count bindings; per-zoom unique-feature coverage; and maximum-zoom rendered/nonrenderable reconciliation. This makes a performance regression or renderability exception a release artifact rather than a browser surprise.
 
 ## Immutable, atomic releases
 
@@ -118,7 +120,7 @@ The background refresh will not change the manifest unless all of these pass:
 2. Full LION row, LION-side, and DSNY-frequency reconciliation with zero fatal audit outcomes.
 3. Processed GeoJSON byte digest, per-feature semantic digest, and count binding.
 4. Exact processed-to-SQLite identity/geometry/schedule/provenance reconciliation plus integrity, foreign-key, and RTree checks.
-5. Decoded all-zoom tile-property reconciliation to SQLite, full maximum-zoom feature coverage, gzip, coordinate, and tile-size checks.
+5. Decoded all-zoom tile-property reconciliation to SQLite, maximum-zoom rendered/nonrenderable reconciliation with independent source-geometry verification, gzip, coordinate, and tile-size checks.
 6. Cross-artifact SHA-256, version, and count checks for the whole release bundle.
 7. Count floors and regression limits.
 

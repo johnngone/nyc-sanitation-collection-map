@@ -750,8 +750,13 @@ def main() -> None:
             tileset=tileset_summary,
         )
         LOGGER.info(
-            "Stage 7/8 complete tiles=%s max_compressed_bytes=%s elapsed_s=%.1f",
+            "Stage 7/8 complete tiles=%s rendered_features=%s nonrenderable_features=%s "
+            "rendered_unknowns=%s nonrenderable_unknowns=%s max_compressed_bytes=%s elapsed_s=%.1f",
             tileset_summary["tile_count"],
+            tile_report["maxzoom_feature_count"],
+            tile_report["maxzoom_nonrenderable_feature_count"],
+            tile_report["maxzoom_unknown_feature_count"],
+            tile_report["maxzoom_nonrenderable_unknown_feature_count"],
             tile_report["tile_size_metrics"]["max_compressed_tile_bytes"],
             monotonic() - stage_started,
         )
@@ -810,7 +815,11 @@ def main() -> None:
             "schedule_groups": database_summary["schedule_group_count"],
             "schedule_rows_by_type": database_summary["schedule_counts"],
             "tile_features": tile_report["feature_count"],
+            "rendered_tile_features": tile_report["maxzoom_feature_count"],
+            "nonrenderable_tile_features": tile_report["maxzoom_nonrenderable_feature_count"],
             "unknown_features": database_summary["unknown_feature_count"],
+            "rendered_unknown_features": tile_report["maxzoom_unknown_feature_count"],
+            "nonrenderable_unknown_features": tile_report["maxzoom_nonrenderable_unknown_feature_count"],
         }
         recovery_counts = {
             "identity_candidates": identity_report["candidate_count"],

@@ -5,12 +5,13 @@ import sqlite3
 
 import mapbox_vector_tile
 import pytest
+from shapely.geometry import LineString, box
 from fastapi.testclient import TestClient
 
 from app import api
 from app.database import initialize
 from app.main import app
-from scripts.build_tiles import build_tiles
+from scripts.build_tiles import _tile_geometry_with_source_fallback, build_tiles
 
 
 def _write_mbtiles(
@@ -228,6 +229,8 @@ def test_builder_writes_one_feature_per_geometry_with_size_and_source_binding(tm
     assert report.feature_count == 1
     assert report.geometry_count == 1
     assert report.maxzoom_feature_count == 1
+    assert report.maxzoom_nonrenderable_feature_count == 0
+    assert report.maxzoom_nonrenderable_features == []
     assert report.source_block_face_count == 1
     assert report.source_schedule_count == 3
     assert report.source_schedule_group_count == 2
@@ -249,6 +252,8 @@ def test_builder_writes_one_feature_per_geometry_with_size_and_source_binding(tm
     assert metadata["feature_count"] == "1"
     assert metadata["geometry_count"] == "1"
     assert metadata["maxzoom_feature_count"] == "1"
+    assert metadata["maxzoom_nonrenderable_feature_count"] == "0"
+    assert metadata["maxzoom_nonrenderable_unknown_feature_count"] == "0"
     assert metadata["source_layer"] == "collection_streets"
     assert metadata["data_updated"] == "2026-08-19T12:00:00Z"
     assert all(row[0].startswith(b"\x1f\x8b") for row in tile_rows)
@@ -380,8 +385,9 @@ def test_builder_gzip_tile_bytes_and_metrics_are_deterministic(tmp_path) -> None
     assert first.tile_size_metrics == second.tile_size_metrics
 
 
-def test_builder_requires_every_face_to_survive_at_maxzoom(tmp_path) -> None:
+def test_builder_reconciles_subgrid_scheduled_face_without_blocking_release(tmp_path) -> None:
     database = tmp_path / "app.sqlite3"
+    archive = tmp_path / "collection.mbtiles"
     _source_database(database)
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -391,15 +397,84 @@ def test_builder_requires_every_face_to_survive_at_maxzoom(tmp_path) -> None:
                    max_x = -73.999999999, max_y = 40.600000001
                WHERE block_face_id = 'bf-1'"""
         )
-
-    with pytest.raises(RuntimeError, match="at max zoom"):
-        build_tiles(
-            database,
-            tmp_path / "collection.mbtiles",
-            minzoom=11,
-            maxzoom=11,
-            simplify_pixels=0,
+        connection.execute(
+            """INSERT INTO unknown_block_faces
+               (unknown_id, technical_identity, segment_id, borough, street_name, side,
+                reason_code, reason, identity_method, geometry_method, geometry_wkt,
+                min_x, min_y, max_x, max_y, evidence_json)
+               VALUES ('unknown-visible', 'LION:2:LEFT', '2', 'BROOKLYN', 'VISIBLE GAP', 'LEFT',
+                       'OUTSIDE_DSNY_COVERAGE', 'No exact polygon coverage', 'UNRESOLVED',
+                       'DIRECT_SIDE_TRACE_UNRESOLVED',
+                       'LINESTRING (-74.0 40.6, -73.99 40.61)',
+                       -74.0, 40.6, -73.99, 40.61, '{}')"""
         )
+
+    report = build_tiles(database, archive, minzoom=16, maxzoom=16, simplify_pixels=0)
+
+    assert report.feature_count == 1
+    assert report.maxzoom_feature_count == 0
+    assert report.maxzoom_nonrenderable_feature_count == 1
+    assert [record["id"] for record in report.maxzoom_nonrenderable_features] == ["bf-1"]
+    assert report.maxzoom_unknown_feature_count == 1
+
+
+def test_builder_retries_exact_geometry_when_simplification_collapses_line() -> None:
+    source = LineString([(0.1, 0.1), (1.1, 0.1), (0.2, 0.1)])
+    simplified = source.simplify(2, preserve_topology=True)
+
+    encoded, used_source_fallback = _tile_geometry_with_source_fallback(
+        simplified,
+        source,
+        box(-10, -10, 4106, 4106),
+        (0, 0, 4096, 4096),
+    )
+
+    assert encoded is not None
+    assert used_source_fallback is True
+
+
+def test_builder_reconciles_subgrid_unknown_without_fabricating_geometry(tmp_path) -> None:
+    database = tmp_path / "app.sqlite3"
+    archive = tmp_path / "collection.mbtiles"
+    _source_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """INSERT INTO unknown_block_faces
+               (unknown_id, technical_identity, segment_id, borough, street_name, side,
+                reason_code, reason, identity_method, geometry_method, geometry_wkt,
+                min_x, min_y, max_x, max_y, evidence_json)
+               VALUES ('unknown-tiny', 'LION:3:RIGHT', '3', 'QUEENS', 'TINY GAP', 'RIGHT',
+                       'PARTIAL_GEOMETRY_GAP', 'Tiny uncovered source fragment',
+                       'LION_BLOCK_FACE_ID', 'DIRECT_SIDE_TRACE_UNRESOLVED',
+                       'LINESTRING (-74 40.6, -73.999999999 40.600000001)',
+                       -74, 40.6, -73.999999999, 40.600000001, '{}')"""
+        )
+
+    report = build_tiles(database, archive, minzoom=16, maxzoom=16, simplify_pixels=0)
+
+    assert report.unknown_feature_count == 1
+    assert report.maxzoom_unknown_feature_count == 0
+    assert report.maxzoom_nonrenderable_unknown_feature_count == 1
+    assert len(report.maxzoom_nonrenderable_unknowns) == 1
+    nonrenderable = report.maxzoom_nonrenderable_unknowns[0]
+    assert nonrenderable == {
+        "id": "unknown-tiny",
+        "street_name": "TINY GAP",
+        "side": "RIGHT",
+        "projected_length_meters": nonrenderable["projected_length_meters"],
+        "reason": "COLLAPSES_AFTER_MVT_QUANTIZATION",
+        "reason_code": "PARTIAL_GEOMETRY_GAP",
+    }
+    assert 0 < nonrenderable["projected_length_meters"] < 0.001
+    with sqlite3.connect(archive) as connection:
+        decoded_unknown_ids = {
+            feature["properties"]["id"]
+            for (tile_data,) in connection.execute("SELECT tile_data FROM tiles")
+            for feature in mapbox_vector_tile.decode(gzip.decompress(tile_data))
+            .get("collection_unknowns", {})
+            .get("features", [])
+        }
+    assert "unknown-tiny" not in decoded_unknown_ids
 
 
 def test_builder_rejects_buffer_smaller_than_frontend_style_reach(tmp_path) -> None:

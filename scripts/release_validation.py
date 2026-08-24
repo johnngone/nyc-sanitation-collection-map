@@ -17,9 +17,11 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 import mapbox_vector_tile
-from shapely import wkt
-from shapely.geometry import shape
+from pyproj import Transformer
+from shapely import force_2d, wkt
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, box, shape
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import transform
 
 from backend.app.releases import MANIFEST_VERSION, VERSION_PATTERN, read_current_release
 
@@ -51,6 +53,9 @@ MAX_RELEASE_COMPRESSED_TILE_BYTES = 512_000
 MAX_RELEASE_UNCOMPRESSED_TILE_BYTES = 5_242_880
 TILE_SOURCE_LAYER = "collection_streets"
 TILE_UNKNOWN_SOURCE_LAYER = "collection_unknowns"
+MVT_EXTENT = 4096
+WEB_MERCATOR_HALF_WORLD = 20_037_508.342789244
+MIN_RENDER_BUFFER_PIXELS = 16.0
 TILE_REQUIRED_PROPERTIES = {
     "id",
     "origin_block_face_id",
@@ -334,8 +339,14 @@ def validate_tileset(
             "feature_count",
             "geometry_count",
             "maxzoom_feature_count",
+            "maxzoom_nonrenderable_feature_count",
+            "maxzoom_nonrenderable_feature_ids_sha256",
             "unknown_feature_count",
             "maxzoom_unknown_feature_count",
+            "maxzoom_nonrenderable_unknown_feature_count",
+            "maxzoom_nonrenderable_unknown_ids_sha256",
+            "simplify_pixels",
+            "buffer_pixels",
             "tile_size_metrics",
             "tile_size_limits",
             "compression",
@@ -352,6 +363,10 @@ def validate_tileset(
             )
         minzoom = _metadata_int(metadata, "minzoom")
         maxzoom = _metadata_int(metadata, "maxzoom")
+        simplify_pixels = _metadata_float(metadata, "simplify_pixels", minimum=0)
+        buffer_pixels = _metadata_float(
+            metadata, "buffer_pixels", minimum=MIN_RENDER_BUFFER_PIXELS
+        )
         bounds = _validated_bounds(metadata.get("bounds"), "staged tileset metadata bounds")
         tile_count = connection.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
         invalid_gzip = connection.execute(
@@ -387,8 +402,10 @@ def validate_tileset(
         "feature_count",
         "geometry_count",
         "maxzoom_feature_count",
+        "maxzoom_nonrenderable_feature_count",
         "unknown_feature_count",
         "maxzoom_unknown_feature_count",
+        "maxzoom_nonrenderable_unknown_feature_count",
     )
     binding: dict[str, object] = {}
     for key in binding_keys:
@@ -406,14 +423,28 @@ def validate_tileset(
         str(binding["source_database_sha256"])
     ):
         raise RuntimeError("staged tileset source database checksum is invalid")
+    nonrenderable_feature_ids_sha256 = metadata["maxzoom_nonrenderable_feature_ids_sha256"]
+    nonrenderable_unknown_ids_sha256 = metadata["maxzoom_nonrenderable_unknown_ids_sha256"]
+    if not SHA256_PATTERN.fullmatch(nonrenderable_feature_ids_sha256):
+        raise RuntimeError("staged tileset nonrenderable feature digest is invalid")
+    if not SHA256_PATTERN.fullmatch(nonrenderable_unknown_ids_sha256):
+        raise RuntimeError("staged tileset nonrenderable unknown digest is invalid")
     payload_expected = {
         "maxzoom_unique_id_count": binding["maxzoom_feature_count"],
         "decoded_tile_feature_count": payload_validation["decoded_tile_feature_count"],
     }
-    if binding["maxzoom_feature_count"] != binding["feature_count"]:
-        raise RuntimeError("staged tileset maxzoom coverage count does not match feature_count")
-    if binding["maxzoom_unknown_feature_count"] != binding["unknown_feature_count"]:
-        raise RuntimeError("staged tileset maxzoom unknown coverage does not match unknown_feature_count")
+    if (
+        binding["maxzoom_feature_count"]
+        + binding["maxzoom_nonrenderable_feature_count"]
+        != binding["feature_count"]
+    ):
+        raise RuntimeError("staged tileset scheduled maxzoom renderability does not reconcile")
+    if (
+        binding["maxzoom_unknown_feature_count"]
+        + binding["maxzoom_nonrenderable_unknown_feature_count"]
+        != binding["unknown_feature_count"]
+    ):
+        raise RuntimeError("staged tileset unknown maxzoom renderability does not reconcile")
     if payload_validation["maxzoom_unique_id_count"] != binding["maxzoom_feature_count"]:
         raise RuntimeError(
             "staged tileset decoded maxzoom ID coverage does not match metadata "
@@ -424,6 +455,8 @@ def validate_tileset(
         raise RuntimeError(
             "staged tileset decoded unknown maxzoom ID coverage does not match metadata"
         )
+    maxzoom_nonrenderable_features: list[dict[str, object]] = []
+    maxzoom_nonrenderable_unknowns: list[dict[str, object]] = []
     if expected_database is not None:
         if expected_database_path is None:
             raise RuntimeError("database path is required for semantic tile validation")
@@ -437,25 +470,76 @@ def validate_tileset(
             "feature_count": expected_database["block_faces"],
             "geometry_count": expected_database["block_faces"],
             "unknown_feature_count": expected_database["unknown_feature_count"],
-            "maxzoom_unknown_feature_count": expected_database["unknown_feature_count"],
         }
         _require_equal_fields(binding, expected_bindings, "MBTiles/database binding")
-        expected_properties = _expected_tile_properties(Path(expected_database_path))
+        database_path = Path(expected_database_path)
+        expected_properties = _expected_tile_properties(database_path)
+        expected_geometries = _expected_tile_geometries(database_path)
+        expected_unknown_properties, expected_unknown_geometries = (
+            _expected_unknown_tile_records(database_path)
+        )
+        maxzoom_nonrenderable_features = _validated_nonrenderable_records(
+            expected_properties,
+            expected_geometries,
+            payload_validation["maxzoom_ids"],
+            declared_count=binding["maxzoom_nonrenderable_feature_count"],
+            declared_sha256=nonrenderable_feature_ids_sha256,
+            maxzoom=maxzoom,
+            buffer_pixels=buffer_pixels,
+            unknown=False,
+        )
+        maxzoom_nonrenderable_unknowns = _validated_nonrenderable_records(
+            expected_unknown_properties,
+            expected_unknown_geometries,
+            payload_validation["maxzoom_unknown_ids"],
+            declared_count=binding["maxzoom_nonrenderable_unknown_feature_count"],
+            declared_sha256=nonrenderable_unknown_ids_sha256,
+            maxzoom=maxzoom,
+            buffer_pixels=buffer_pixels,
+            unknown=True,
+        )
         # Compare the union from every zoom, not only maxzoom.  A stale or
         # invented feature present solely in an initial-view tile must fail.
+        # A proven sub-grid feature may be absent from every zoom while its
+        # exact source geometry remains bound in SQLite and the build report.
         actual_properties = payload_validation["properties_by_id"]
-        if not _same_value(actual_properties, expected_properties):
-            missing_ids = sorted(set(expected_properties) - set(actual_properties))[:10]
-            unexpected_ids = sorted(set(actual_properties) - set(expected_properties))[:10]
-            mismatched_ids = sorted(
-                feature_id
-                for feature_id in set(expected_properties) & set(actual_properties)
-                if not _same_value(actual_properties[feature_id], expected_properties[feature_id])
-            )[:10]
+        actual_unknown_properties = payload_validation["unknown_properties_by_id"]
+        allowed_missing = {record["id"] for record in maxzoom_nonrenderable_features}
+        allowed_unknown_missing = {
+            record["id"] for record in maxzoom_nonrenderable_unknowns
+        }
+        missing_ids = set(expected_properties) - set(actual_properties)
+        unexpected_ids = set(actual_properties) - set(expected_properties)
+        mismatched_ids = {
+            feature_id
+            for feature_id in set(expected_properties) & set(actual_properties)
+            if not _same_value(actual_properties[feature_id], expected_properties[feature_id])
+        }
+        missing_unknown_ids = set(expected_unknown_properties) - set(actual_unknown_properties)
+        unexpected_unknown_ids = set(actual_unknown_properties) - set(expected_unknown_properties)
+        mismatched_unknown_ids = {
+            feature_id
+            for feature_id in set(expected_unknown_properties) & set(actual_unknown_properties)
+            if not _same_value(
+                actual_unknown_properties[feature_id], expected_unknown_properties[feature_id]
+            )
+        }
+        if (
+            not missing_ids.issubset(allowed_missing)
+            or unexpected_ids
+            or mismatched_ids
+            or not missing_unknown_ids.issubset(allowed_unknown_missing)
+            or unexpected_unknown_ids
+            or mismatched_unknown_ids
+        ):
             raise RuntimeError(
                 "staged tileset semantic content does not match source database "
-                f"missing_ids={missing_ids} unexpected_ids={unexpected_ids} "
-                f"mismatched_ids={mismatched_ids}"
+                f"missing_ids={sorted(missing_ids)[:10]} "
+                f"unexpected_ids={sorted(unexpected_ids)[:10]} "
+                f"mismatched_ids={sorted(mismatched_ids)[:10]} "
+                f"missing_unknown_ids={sorted(missing_unknown_ids)[:10]} "
+                f"unexpected_unknown_ids={sorted(unexpected_unknown_ids)[:10]} "
+                f"mismatched_unknown_ids={sorted(mismatched_unknown_ids)[:10]}"
             )
     return {
         "integrity_check": integrity,
@@ -467,6 +551,12 @@ def validate_tileset(
         "bounds": bounds,
         "tile_count": tile_count,
         "bytes": tileset.stat().st_size,
+        "simplify_pixels": simplify_pixels,
+        "buffer_pixels": buffer_pixels,
+        "maxzoom_nonrenderable_feature_ids_sha256": nonrenderable_feature_ids_sha256,
+        "maxzoom_nonrenderable_unknown_ids_sha256": nonrenderable_unknown_ids_sha256,
+        "maxzoom_nonrenderable_features": maxzoom_nonrenderable_features,
+        "maxzoom_nonrenderable_unknowns": maxzoom_nonrenderable_unknowns,
         **binding,
         **payload_expected,
         "feature_coverage_by_zoom": payload_validation["feature_coverage_by_zoom"],
@@ -512,6 +602,7 @@ def _validate_tile_payloads(
     maxzoom_ids: set[str] = set()
     maxzoom_unknown_ids: set[str] = set()
     properties_by_id: dict[str, dict[str, object]] = {}
+    unknown_properties_by_id: dict[str, dict[str, object]] = {}
     decoded_feature_count = 0
     rows = connection.execute(
         "SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles "
@@ -592,6 +683,20 @@ def _validate_tile_payloads(
             if feature_id in unknown_tile_ids:
                 raise RuntimeError(f"staged tile contains duplicate unknown ID {feature_id!r}")
             unknown_tile_ids.add(feature_id)
+            previous_properties = unknown_properties_by_id.setdefault(feature_id, properties)
+            if previous_properties != properties:
+                raise RuntimeError(
+                    f"staged tileset has inconsistent unknown properties for ID {feature_id!r}"
+                )
+            geometry = feature.get("geometry")
+            if (
+                not isinstance(geometry, dict)
+                or geometry.get("type") not in {"LineString", "MultiLineString"}
+                or not geometry.get("coordinates")
+            ):
+                raise RuntimeError(
+                    f"staged unknown tile feature {feature_id!r} has invalid line geometry"
+                )
             if zoom == maxzoom:
                 maxzoom_unknown_ids.add(feature_id)
         decoded_feature_count += len(features) + len(unknown_features)
@@ -611,7 +716,10 @@ def _validate_tile_payloads(
         "decoded_tile_feature_count": decoded_feature_count,
         "maxzoom_unique_id_count": len(maxzoom_ids),
         "maxzoom_unknown_unique_id_count": len(maxzoom_unknown_ids),
+        "maxzoom_ids": maxzoom_ids,
+        "maxzoom_unknown_ids": maxzoom_unknown_ids,
         "properties_by_id": properties_by_id,
+        "unknown_properties_by_id": unknown_properties_by_id,
         "feature_coverage_by_zoom": {
             str(zoom): len(ids_by_zoom.get(zoom, set()))
             for zoom in range(minzoom, maxzoom + 1)
@@ -719,6 +827,206 @@ def _expected_tile_properties(database: Path) -> dict[str, dict[str, object]]:
         properties["identity_method"] = "LION_BLOCK_FACE_ID"
         properties["geometry_method"] = "DIRECT_SIDE_TRACE"
     return expected
+
+
+def _expected_tile_geometries(database: Path) -> dict[str, BaseGeometry]:
+    with closing(
+        sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+    ) as connection:
+        return {
+            str(feature_id): force_2d(wkt.loads(str(geometry_wkt)))
+            for feature_id, geometry_wkt in connection.execute(
+                "SELECT block_face_id, geometry_wkt FROM block_faces ORDER BY block_face_id"
+            )
+        }
+
+
+def _expected_unknown_tile_records(
+    database: Path,
+) -> tuple[dict[str, dict[str, object]], dict[str, BaseGeometry]]:
+    properties_by_id: dict[str, dict[str, object]] = {}
+    geometries_by_id: dict[str, BaseGeometry] = {}
+    with closing(
+        sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+    ) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """SELECT unknown_id, technical_identity, segment_id, borough, street_name, side,
+                      reason_code, reason, identity_method, geometry_method, geometry_wkt
+               FROM unknown_block_faces ORDER BY unknown_id"""
+        )
+        for row in rows:
+            feature_id = str(row["unknown_id"])
+            properties_by_id[feature_id] = {
+                "id": feature_id,
+                "technical_identity": (
+                    "" if row["technical_identity"] is None else str(row["technical_identity"])
+                ),
+                "segment_id": str(row["segment_id"]),
+                "borough": "" if row["borough"] is None else str(row["borough"]),
+                "street_name": str(row["street_name"]),
+                "side": str(row["side"]),
+                "reason_code": str(row["reason_code"]),
+                "reason": str(row["reason"]),
+                "identity_method": str(row["identity_method"]),
+                "geometry_method": str(row["geometry_method"]),
+            }
+            geometries_by_id[feature_id] = force_2d(wkt.loads(str(row["geometry_wkt"])))
+    return properties_by_id, geometries_by_id
+
+
+def _render_tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+    span = (2 * WEB_MERCATOR_HALF_WORLD) / (1 << z)
+    min_x = -WEB_MERCATOR_HALF_WORLD + x * span
+    max_y = WEB_MERCATOR_HALF_WORLD - y * span
+    return min_x, max_y - span, min_x + span, max_y
+
+
+def _render_tile_range(
+    bounds: tuple[float, float, float, float],
+    z: int,
+    padding: float,
+) -> tuple[range, range]:
+    min_x, min_y, max_x, max_y = bounds
+    dimension = 1 << z
+    span = (2 * WEB_MERCATOR_HALF_WORLD) / dimension
+    first_x = math.floor((min_x - padding + WEB_MERCATOR_HALF_WORLD) / span)
+    last_x = math.floor((max_x + padding + WEB_MERCATOR_HALF_WORLD) / span)
+    first_y = math.floor((WEB_MERCATOR_HALF_WORLD - max_y - padding) / span)
+    last_y = math.floor((WEB_MERCATOR_HALF_WORLD - min_y + padding) / span)
+    return (
+        range(max(0, first_x), min(dimension - 1, last_x) + 1),
+        range(max(0, first_y), min(dimension - 1, last_y) + 1),
+    )
+
+
+def _render_linear_parts(geometry: BaseGeometry) -> BaseGeometry | None:
+    if geometry.is_empty:
+        return None
+    if isinstance(geometry, LineString):
+        return geometry if len(geometry.coords) >= 2 else None
+    lines: list[LineString] = []
+    if isinstance(geometry, MultiLineString):
+        lines.extend(line for line in geometry.geoms if len(line.coords) >= 2)
+    elif isinstance(geometry, GeometryCollection):
+        for part in geometry.geoms:
+            linear = _render_linear_parts(part)
+            if isinstance(linear, LineString):
+                lines.append(linear)
+            elif isinstance(linear, MultiLineString):
+                lines.extend(linear.geoms)
+    if not lines:
+        return None
+    return lines[0] if len(lines) == 1 else MultiLineString(lines)
+
+
+def _render_survives_quantization(
+    geometry: BaseGeometry,
+    tile_bounds: tuple[float, float, float, float],
+) -> bool:
+    min_x, min_y, max_x, max_y = tile_bounds
+
+    def quantized(coordinate: tuple[float, ...]) -> tuple[int, int]:
+        x, y = coordinate[:2]
+        return (
+            round(MVT_EXTENT * (x - min_x) / (max_x - min_x)),
+            round(MVT_EXTENT * (y - min_y) / (max_y - min_y)),
+        )
+
+    lines = geometry.geoms if isinstance(geometry, MultiLineString) else (geometry,)
+    for line in lines:
+        coordinates = iter(line.coords)
+        first = quantized(next(coordinates))
+        if any(quantized(coordinate) != first for coordinate in coordinates):
+            return True
+    return False
+
+
+def _source_geometry_survives_maxzoom(
+    geometry_wgs84: BaseGeometry,
+    maxzoom: int,
+    buffer_pixels: float,
+) -> tuple[bool, BaseGeometry]:
+    projector = Transformer.from_crs(4326, 3857, always_xy=True)
+    projected = transform(projector.transform, geometry_wgs84)
+    span = (2 * WEB_MERCATOR_HALF_WORLD) / (1 << maxzoom)
+    buffer_distance = span * buffer_pixels / 512
+    x_values, y_values = _render_tile_range(projected.bounds, maxzoom, buffer_distance)
+    for x in x_values:
+        for y in y_values:
+            tile_bounds = _render_tile_bounds(maxzoom, x, y)
+            min_x, min_y, max_x, max_y = tile_bounds
+            clipped = _render_linear_parts(
+                projected.intersection(
+                    box(
+                        min_x - buffer_distance,
+                        min_y - buffer_distance,
+                        max_x + buffer_distance,
+                        max_y + buffer_distance,
+                    )
+                )
+            )
+            if clipped is not None and _render_survives_quantization(clipped, tile_bounds):
+                return True, projected
+    return False, projected
+
+
+def _renderability_id_set_sha256(feature_ids: set[str]) -> str:
+    digest = hashlib.sha256()
+    for feature_id in sorted(feature_ids):
+        digest.update(feature_id.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _validated_nonrenderable_records(
+    properties_by_id: dict[str, dict[str, object]],
+    geometries_by_id: dict[str, BaseGeometry],
+    rendered_at_maxzoom: set[str],
+    *,
+    declared_count: int,
+    declared_sha256: str,
+    maxzoom: int,
+    buffer_pixels: float,
+    unknown: bool,
+) -> list[dict[str, object]]:
+    expected_ids = set(properties_by_id)
+    unexpected = rendered_at_maxzoom - expected_ids
+    if unexpected:
+        raise RuntimeError(
+            f"staged tileset contains unexpected maxzoom IDs: {sorted(unexpected)[:10]}"
+        )
+    missing = expected_ids - rendered_at_maxzoom
+    if len(missing) != declared_count:
+        raise RuntimeError(
+            "staged tileset nonrenderable count does not match missing maxzoom IDs "
+            f"expected={declared_count} actual={len(missing)}"
+        )
+    if _renderability_id_set_sha256(missing) != declared_sha256:
+        raise RuntimeError("staged tileset nonrenderable ID digest does not match missing IDs")
+
+    records: list[dict[str, object]] = []
+    for feature_id in sorted(missing):
+        survives, projected = _source_geometry_survives_maxzoom(
+            geometries_by_id[feature_id], maxzoom, buffer_pixels
+        )
+        if survives:
+            raise RuntimeError(
+                "staged tileset omitted renderable maxzoom geometry "
+                f"id={feature_id!r}"
+            )
+        properties = properties_by_id[feature_id]
+        record: dict[str, object] = {
+            "id": feature_id,
+            "street_name": properties["street_name"],
+            "side": properties["side"],
+            "projected_length_meters": round(float(projected.length), 6),
+            "reason": "COLLAPSES_AFTER_MVT_QUANTIZATION",
+        }
+        if unknown:
+            record["reason_code"] = properties["reason_code"]
+        records.append(record)
+    return records
 
 
 def _decompress_gzip_bounded(payload: bytes, limit: int) -> bytes:
@@ -1335,9 +1643,17 @@ def validate_tile_build_report(
         "minzoom": tileset["minzoom"],
         "maxzoom": tileset["maxzoom"],
         "maxzoom_feature_count": tileset["maxzoom_feature_count"],
+        "maxzoom_nonrenderable_feature_count": tileset["maxzoom_nonrenderable_feature_count"],
+        "maxzoom_nonrenderable_feature_ids_sha256": tileset["maxzoom_nonrenderable_feature_ids_sha256"],
         "unknown_feature_count": database["unknown_feature_count"],
         "maxzoom_unknown_feature_count": tileset["maxzoom_unknown_feature_count"],
+        "maxzoom_nonrenderable_unknown_feature_count": tileset["maxzoom_nonrenderable_unknown_feature_count"],
+        "maxzoom_nonrenderable_unknown_ids_sha256": tileset["maxzoom_nonrenderable_unknown_ids_sha256"],
+        "maxzoom_nonrenderable_features": tileset["maxzoom_nonrenderable_features"],
+        "maxzoom_nonrenderable_unknowns": tileset["maxzoom_nonrenderable_unknowns"],
         "tile_feature_count": tileset["decoded_tile_feature_count"],
+        "simplify_pixels": tileset["simplify_pixels"],
+        "buffer_pixels": tileset["buffer_pixels"],
         "tile_size_metrics": tileset["tile_size_metrics"],
         "tile_size_limits": tileset["tile_size_limits"],
         "sha256": tileset["sha256"],
@@ -1349,12 +1665,20 @@ def validate_tile_build_report(
         for actual, expected_value in zip(report_bounds, tileset["bounds"], strict=True)
     ):
         raise RuntimeError("tile build report bounds do not match MBTiles metadata")
-    if report["maxzoom_feature_count"] < report["feature_count"]:
-        raise RuntimeError("tile build report maxzoom coverage is below the source feature count")
+    if (
+        report["maxzoom_feature_count"]
+        + report["maxzoom_nonrenderable_feature_count"]
+        != report["feature_count"]
+    ):
+        raise RuntimeError("tile build report scheduled maxzoom renderability is incomplete")
     if report["tile_feature_count"] < report["maxzoom_feature_count"]:
         raise RuntimeError("tile build report total feature count is internally inconsistent")
-    if report["maxzoom_unknown_feature_count"] != report["unknown_feature_count"]:
-        raise RuntimeError("tile build report unknown maxzoom coverage is incomplete")
+    if (
+        report["maxzoom_unknown_feature_count"]
+        + report["maxzoom_nonrenderable_unknown_feature_count"]
+        != report["unknown_feature_count"]
+    ):
+        raise RuntimeError("tile build report unknown maxzoom renderability is incomplete")
     return report
 
 
@@ -1597,7 +1921,11 @@ def validate_release_bundle(release_dir: str | Path, manifest: dict[str, object]
         "schedule_groups": database["schedule_group_count"],
         "schedule_rows_by_type": database["schedule_counts"],
         "tile_features": tile_report["feature_count"],
+        "rendered_tile_features": tile_report["maxzoom_feature_count"],
+        "nonrenderable_tile_features": tile_report["maxzoom_nonrenderable_feature_count"],
         "unknown_features": database["unknown_feature_count"],
+        "rendered_unknown_features": tile_report["maxzoom_unknown_feature_count"],
+        "nonrenderable_unknown_features": tile_report["maxzoom_nonrenderable_unknown_feature_count"],
     }
     if not isinstance(counts, dict):
         raise RuntimeError("release manifest counts must be an object")
@@ -1955,6 +2283,23 @@ def _metadata_int(metadata: dict[str, str], key: str) -> int:
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError(f"staged tileset metadata {key!r} must be an integer") from error
     return _nonnegative_int(value, f"staged tileset metadata {key}")
+
+
+def _metadata_float(
+    metadata: dict[str, str],
+    key: str,
+    *,
+    minimum: float,
+) -> float:
+    try:
+        value = float(metadata[key])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(f"staged tileset metadata {key!r} must be numeric") from error
+    if not math.isfinite(value) or value < minimum:
+        raise RuntimeError(
+            f"staged tileset metadata {key!r} must be at least {minimum:g}"
+        )
+    return value
 
 
 def _validated_bounds(value: object, label: str) -> list[float]:

@@ -1,12 +1,14 @@
+import hashlib
+import gzip
 import json
 import shutil
 import sqlite3
-import gzip
 import copy
 from concurrent.futures import ThreadPoolExecutor
 
 import mapbox_vector_tile
 import pytest
+from shapely.geometry import LineString
 
 from app.database import initialize
 from app.releases import ReleaseManifestError, read_current_release, tileset_for_version
@@ -22,9 +24,11 @@ from scripts.release_validation import (
     validate_processed_geojson,
     validate_regression_gates,
     validate_release_bundle,
+    validate_tile_build_report,
     validate_tileset,
 )
 from scripts.release_validation import _tile_size_metrics
+from scripts.release_validation import _validated_nonrenderable_records
 
 
 def _audit(processed_sha256: str) -> dict[str, object]:
@@ -340,7 +344,11 @@ def _bundle(tmp_path, version: str):
             "schedule_groups": 4,
             "schedule_rows_by_type": database_summary["schedule_counts"],
             "tile_features": 1,
+            "rendered_tile_features": 1,
+            "nonrenderable_tile_features": 0,
             "unknown_features": 0,
+            "rendered_unknown_features": 0,
+            "nonrenderable_unknown_features": 0,
         },
         "block_faces": 1,
         "schedule_counts": database_summary["schedule_counts"],
@@ -480,8 +488,98 @@ def test_tileset_validation_rejects_maxzoom_count_mismatch(tmp_path) -> None:
             "UPDATE metadata SET value = '2' WHERE name = 'maxzoom_feature_count'"
         )
 
-    with pytest.raises(RuntimeError, match="maxzoom coverage count"):
+    with pytest.raises(RuntimeError, match="maxzoom renderability"):
         validate_tileset(tileset)
+
+
+def test_tileset_validation_reconciles_subgrid_unknown_against_database(tmp_path) -> None:
+    bundle = _bundle(tmp_path, "release-subgrid-unknown")
+    database = bundle / "app.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """INSERT INTO unknown_block_faces
+               (unknown_id, technical_identity, segment_id, borough, street_name, side,
+                reason_code, reason, identity_method, geometry_method, geometry_wkt,
+                min_x, min_y, max_x, max_y, evidence_json)
+               VALUES ('unknown-tiny', 'LION:3:RIGHT', '3', 'QUEENS', 'TINY GAP', 'RIGHT',
+                       'PARTIAL_GEOMETRY_GAP', 'Tiny uncovered source fragment',
+                       'LION_BLOCK_FACE_ID', 'DIRECT_SIDE_TRACE_UNRESOLVED',
+                       'LINESTRING (-74 40.6, -73.999999999 40.600000001)',
+                       -74, 40.6, -73.999999999, 40.600000001, '{}')"""
+        )
+    database_summary = validate_database(database)
+    tileset = tmp_path / "subgrid-unknown.mbtiles"
+    report = build_tiles(
+        database,
+        tileset,
+        minzoom=16,
+        maxzoom=16,
+        version="release-subgrid-unknown",
+        source_version="release-subgrid-unknown",
+        simplify_pixels=0,
+    ).as_dict()
+
+    summary = validate_tileset(
+        tileset,
+        "release-subgrid-unknown",
+        expected_database=database_summary,
+        expected_database_path=database,
+    )
+
+    assert summary["unknown_feature_count"] == 1
+    assert summary["maxzoom_unknown_feature_count"] == 0
+    assert summary["maxzoom_nonrenderable_unknown_feature_count"] == 1
+    assert [item["id"] for item in summary["maxzoom_nonrenderable_unknowns"]] == [
+        "unknown-tiny"
+    ]
+    report_path = tmp_path / "subgrid-tile-report.json"
+    atomic_json(report_path, report)
+    validated_report = validate_tile_build_report(
+        report_path,
+        expected_version="release-subgrid-unknown",
+        database=database_summary,
+        tileset=summary,
+    )
+    assert validated_report["maxzoom_nonrenderable_unknown_feature_count"] == 1
+
+    with sqlite3.connect(tileset) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = ? "
+            "WHERE name = 'maxzoom_nonrenderable_unknown_ids_sha256'",
+            ("0" * 64,),
+        )
+    with pytest.raises(RuntimeError, match="digest does not match missing IDs"):
+        validate_tileset(
+            tileset,
+            "release-subgrid-unknown",
+            expected_database=database_summary,
+            expected_database_path=database,
+        )
+
+
+def test_nonrenderable_exception_rejects_ordinary_renderable_geometry() -> None:
+    properties = {
+        "face-1": {
+            "id": "face-1",
+            "street_name": "VISIBLE STREET",
+            "side": "LEFT",
+        }
+    }
+    geometries = {
+        "face-1": LineString([(-74.0, 40.6), (-73.99, 40.61)])
+    }
+
+    with pytest.raises(RuntimeError, match="omitted renderable maxzoom geometry"):
+        _validated_nonrenderable_records(
+            properties,
+            geometries,
+            set(),
+            declared_count=1,
+            declared_sha256=hashlib.sha256(b"face-1\n").hexdigest(),
+            maxzoom=17,
+            buffer_pixels=16,
+            unknown=False,
+        )
 
 
 def test_tileset_validation_rejects_runtime_invalid_bounds(tmp_path) -> None:
