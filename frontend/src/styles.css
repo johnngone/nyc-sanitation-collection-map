@@ -56,6 +56,59 @@ button { -webkit-tap-highlight-color: transparent; }
   position: relative;
 }
 
+.maplibregl-ctrl-top-right {
+  top: max(.2rem, env(safe-area-inset-top));
+  right: max(.2rem, env(safe-area-inset-right));
+}
+
+.maplibregl-ctrl-top-right .maplibregl-ctrl {
+  margin: .65rem .65rem 0 0;
+}
+
+.maplibregl-ctrl-top-right .maplibregl-ctrl-attrib {
+  max-width: min(34rem, calc(100vw - 5.5rem));
+  padding: .25rem .45rem;
+  border-radius: 9px;
+  color: #4f5b64;
+  background: rgba(255, 255, 255, .82);
+  box-shadow: 0 3px 14px rgba(23, 32, 42, .09);
+  font-size: .65rem;
+  line-height: 1.25;
+  text-align: right;
+  -webkit-backdrop-filter: saturate(160%) blur(12px);
+  backdrop-filter: saturate(160%) blur(12px);
+}
+
+.maplibregl-ctrl-attrib-inner {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.maplibregl-ctrl-attrib-inner a { white-space: normal; }
+
+.maplibregl-ctrl-group {
+  overflow: hidden;
+  border-radius: 9px;
+}
+
+.map-view-control button.map-view-mode {
+  color: #34414b;
+  font-size: .68rem;
+  font-weight: 750;
+  letter-spacing: -.01em;
+}
+
+.map-view-control button.map-view-mode[aria-pressed="true"] {
+  color: white;
+  background: #34414b;
+}
+
+.map-view-control button.map-view-mode[aria-pressed="true"]:hover {
+  background: #28343d;
+}
+
+.map-view-compass[hidden] { display: none; }
+
 button {
   border: 1px solid #c7d0d8;
   border-radius: 10px;
@@ -572,16 +625,23 @@ label input[type="checkbox"] {
   .status-summary { gap: .6rem; padding: .85rem; }
   .status-summary > div { font-size: .8rem; }
 
-  .maplibregl-ctrl-bottom-right {
-    top: max(.65rem, env(safe-area-inset-top));
-    right: max(.25rem, env(safe-area-inset-right));
-    bottom: auto;
-    transition: top 260ms cubic-bezier(.22, 1, .36, 1);
+  .maplibregl-ctrl-top-right {
+    top: max(.15rem, env(safe-area-inset-top));
+    right: max(.15rem, env(safe-area-inset-right));
   }
 
-  .maplibregl-ctrl-bottom-right .maplibregl-ctrl {
-    margin-top: 0;
-    margin-bottom: 10px;
+  .maplibregl-ctrl-top-right .maplibregl-ctrl {
+    margin: .5rem .5rem 0 0;
+  }
+
+  .maplibregl-ctrl-top-right .maplibregl-ctrl-attrib {
+    max-width: calc(100vw - 4.9rem);
+    font-size: .6rem;
+  }
+
+  .maplibregl-ctrl-group button {
+    width: 44px;
+    height: 44px;
   }
 
 }

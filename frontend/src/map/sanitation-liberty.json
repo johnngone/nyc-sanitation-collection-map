@@ -1,0 +1,359 @@
+{
+  "version": 8,
+  "name": "NYC Sanitation Liberty",
+  "metadata": {
+    "derived-from": "OpenFreeMap Liberty 72e1480dfc92858d334647037988bd2591fdb021"
+  },
+  "glyphs": "https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf",
+  "sources": {
+    "openmaptiles": {
+      "type": "vector",
+      "url": "https://tiles.openfreemap.org/planet",
+      "attribution": "<a href=\"https://openmaptiles.org/\" target=\"_blank\" rel=\"noopener noreferrer\">© OpenMapTiles</a> Data from <a href=\"https://www.openstreetmap.org/copyright\" target=\"_blank\" rel=\"noopener noreferrer\">OpenStreetMap</a>"
+    }
+  },
+  "layers": [
+    {
+      "id": "basemap-background",
+      "type": "background",
+      "paint": {
+        "background-color": "#f4f5f6"
+      }
+    },
+    {
+      "id": "basemap-park-protected",
+      "type": "fill",
+      "source": "openmaptiles",
+      "source-layer": "park",
+      "filter": ["match", ["geometry-type"], ["Polygon", "MultiPolygon"], true, false],
+      "paint": {
+        "fill-color": "#e2eadc",
+        "fill-opacity": 0.82,
+        "fill-outline-color": "#cbd9c5"
+      }
+    },
+    {
+      "id": "basemap-park-wood",
+      "type": "fill",
+      "source": "openmaptiles",
+      "source-layer": "landcover",
+      "filter": ["==", ["get", "class"], "wood"],
+      "paint": {
+        "fill-color": "#dce7d7",
+        "fill-opacity": 0.72
+      }
+    },
+    {
+      "id": "basemap-park-grass",
+      "type": "fill",
+      "source": "openmaptiles",
+      "source-layer": "landcover",
+      "filter": [
+        "all",
+        ["==", ["get", "class"], "grass"],
+        ["in", ["get", "subclass"], ["literal", ["park", "garden", "recreation_ground", "grass"]]]
+      ],
+      "paint": {
+        "fill-color": "#e2eadc",
+        "fill-opacity": 0.75
+      }
+    },
+    {
+      "id": "basemap-water",
+      "type": "fill",
+      "source": "openmaptiles",
+      "source-layer": "water",
+      "filter": ["!=", ["get", "brunnel"], "tunnel"],
+      "paint": {
+        "fill-color": "#dbe7ec"
+      }
+    },
+    {
+      "id": "basemap-waterway",
+      "type": "line",
+      "source": "openmaptiles",
+      "source-layer": "waterway",
+      "filter": ["!=", ["get", "brunnel"], "tunnel"],
+      "paint": {
+        "line-color": "#c4d9e1",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 12, 0.8, 17, 2.2]
+      }
+    },
+    {
+      "id": "basemap-road-casing",
+      "type": "line",
+      "source": "openmaptiles",
+      "source-layer": "transportation",
+      "filter": [
+        "all",
+        ["match", ["geometry-type"], ["LineString", "MultiLineString"], true, false],
+        ["match", ["get", "class"], ["motorway", "trunk", "primary", "secondary", "tertiary", "minor", "service"], true, false]
+      ],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#d7dce0",
+        "line-width": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          12,
+          ["match", ["get", "class"], "motorway", 4.8, ["trunk", "primary"], 4, ["secondary", "tertiary"], 3.2, 2.2],
+          17,
+          ["match", ["get", "class"], "motorway", 10.5, ["trunk", "primary"], 8.5, ["secondary", "tertiary"], 7, 5.5]
+        ]
+      }
+    },
+    {
+      "id": "basemap-road-fill",
+      "type": "line",
+      "source": "openmaptiles",
+      "source-layer": "transportation",
+      "filter": [
+        "all",
+        ["match", ["geometry-type"], ["LineString", "MultiLineString"], true, false],
+        ["match", ["get", "class"], ["motorway", "trunk", "primary", "secondary", "tertiary", "minor", "service"], true, false]
+      ],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#fbfbfa",
+        "line-width": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          12,
+          ["match", ["get", "class"], "motorway", 3.3, ["trunk", "primary"], 2.7, ["secondary", "tertiary"], 2.1, 1.3],
+          17,
+          ["match", ["get", "class"], "motorway", 9, ["trunk", "primary"], 7, ["secondary", "tertiary"], 5.5, 4]
+        ]
+      }
+    },
+    {
+      "id": "basemap-building-flat",
+      "type": "fill",
+      "source": "openmaptiles",
+      "source-layer": "building",
+      "minzoom": 13,
+      "layout": {
+        "visibility": "visible"
+      },
+      "paint": {
+        "fill-color": "#e2e5e7",
+        "fill-opacity": 0.9,
+        "fill-outline-color": "#bcc4c9"
+      }
+    },
+    {
+      "id": "basemap-building-3d",
+      "type": "fill-extrusion",
+      "source": "openmaptiles",
+      "source-layer": "building",
+      "minzoom": 14,
+      "filter": ["!=", ["get", "hide_3d"], true],
+      "layout": {
+        "visibility": "none"
+      },
+      "paint": {
+        "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], 0],
+        "fill-extrusion-color": "#d7dce0",
+        "fill-extrusion-height": ["coalesce", ["get", "render_height"], 3],
+        "fill-extrusion-opacity": 0.78,
+        "fill-extrusion-vertical-gradient": true
+      }
+    },
+    {
+      "id": "basemap-borough-boundary",
+      "type": "line",
+      "source": "openmaptiles",
+      "source-layer": "boundary",
+      "minzoom": 10,
+      "filter": [
+        "all",
+        ["==", ["get", "admin_level"], 6],
+        ["!=", ["get", "disputed"], 1],
+        ["!", ["has", "claimed_by"]]
+      ],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#929da5",
+        "line-opacity": 0.6,
+        "line-width": 1
+      }
+    },
+    {
+      "id": "basemap-street-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "transportation_name",
+      "minzoom": 12,
+      "filter": [
+        "all",
+        ["match", ["geometry-type"], ["LineString", "MultiLineString"], true, false],
+        ["match", ["get", "class"], ["motorway", "trunk", "primary", "secondary", "tertiary", "minor", "service"], true, false]
+      ],
+      "layout": {
+        "symbol-placement": "line",
+        "symbol-spacing": 300,
+        "text-field": ["coalesce", ["get", "name_en"], ["get", "name"]],
+        "text-font": ["Noto Sans Regular"],
+        "text-letter-spacing": 0.01,
+        "text-max-angle": 30,
+        "text-size": ["interpolate", ["linear"], ["zoom"], 12, 10, 17, 13]
+      },
+      "paint": {
+        "text-color": "#59636c",
+        "text-halo-color": "rgba(255,255,255,0.9)",
+        "text-halo-width": 1.25,
+        "text-halo-blur": 0.25
+      }
+    },
+    {
+      "id": "basemap-waterway-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "waterway",
+      "minzoom": 10,
+      "filter": ["match", ["geometry-type"], ["LineString", "MultiLineString"], true, false],
+      "layout": {
+        "symbol-placement": "line",
+        "symbol-spacing": 350,
+        "text-field": ["coalesce", ["get", "name_en"], ["get", "name"]],
+        "text-font": ["Noto Sans Italic"],
+        "text-size": 11
+      },
+      "paint": {
+        "text-color": "#607b86",
+        "text-halo-color": "rgba(244,248,250,0.9)",
+        "text-halo-width": 1.25
+      }
+    },
+    {
+      "id": "basemap-water-point-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "water_name",
+      "filter": ["match", ["geometry-type"], ["Point", "MultiPoint"], true, false],
+      "layout": {
+        "text-field": ["coalesce", ["get", "name_en"], ["get", "name"]],
+        "text-font": ["Noto Sans Italic"],
+        "text-size": ["interpolate", ["linear"], ["zoom"], 10, 11, 16, 13]
+      },
+      "paint": {
+        "text-color": "#607b86",
+        "text-halo-color": "rgba(244,248,250,0.9)",
+        "text-halo-width": 1.25
+      }
+    },
+    {
+      "id": "basemap-water-line-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "water_name",
+      "filter": ["match", ["geometry-type"], ["LineString", "MultiLineString"], true, false],
+      "layout": {
+        "symbol-placement": "line",
+        "symbol-spacing": 350,
+        "text-field": ["coalesce", ["get", "name_en"], ["get", "name"]],
+        "text-font": ["Noto Sans Italic"],
+        "text-size": 12
+      },
+      "paint": {
+        "text-color": "#607b86",
+        "text-halo-color": "rgba(244,248,250,0.9)",
+        "text-halo-width": 1.25
+      }
+    },
+    {
+      "id": "basemap-protected-park-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "park",
+      "minzoom": 11,
+      "layout": {
+        "text-field": ["coalesce", ["get", "name_en"], ["get", "name"]],
+        "text-font": ["Noto Sans Regular"],
+        "text-size": ["interpolate", ["linear"], ["zoom"], 11, 10, 16, 12]
+      },
+      "paint": {
+        "text-color": "#65705e",
+        "text-halo-color": "rgba(248,250,247,0.9)",
+        "text-halo-width": 1.2
+      }
+    },
+    {
+      "id": "basemap-park-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "poi",
+      "minzoom": 14,
+      "filter": [
+        "all",
+        ["match", ["geometry-type"], ["Point", "MultiPoint"], true, false],
+        ["==", ["get", "class"], "park"]
+      ],
+      "layout": {
+        "text-field": ["coalesce", ["get", "name_en"], ["get", "name"]],
+        "text-font": ["Noto Sans Regular"],
+        "text-max-width": 8,
+        "text-size": ["interpolate", ["linear"], ["zoom"], 14, 10, 17, 11]
+      },
+      "paint": {
+        "text-color": "#65705e",
+        "text-halo-color": "rgba(248,250,247,0.92)",
+        "text-halo-width": 1.2
+      }
+    },
+    {
+      "id": "basemap-borough-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "place",
+      "minzoom": 10,
+      "filter": [
+        "all",
+        ["==", ["get", "class"], "suburb"],
+        ["in", ["get", "name"], ["literal", ["Manhattan", "Brooklyn", "Queens", "The Bronx", "Staten Island"]]]
+      ],
+      "layout": {
+        "text-field": ["get", "name"],
+        "text-font": ["Noto Sans Regular"],
+        "text-letter-spacing": 0.08,
+        "text-size": ["interpolate", ["linear"], ["zoom"], 10, 13, 13, 16],
+        "text-transform": "uppercase"
+      },
+      "paint": {
+        "text-color": "#4f5962",
+        "text-halo-color": "rgba(255,255,255,0.9)",
+        "text-halo-width": 1.5
+      }
+    },
+    {
+      "id": "basemap-neighborhood-names",
+      "type": "symbol",
+      "source": "openmaptiles",
+      "source-layer": "place",
+      "minzoom": 12,
+      "filter": ["match", ["get", "class"], ["neighbourhood", "quarter", "hamlet"], true, false],
+      "layout": {
+        "text-field": ["coalesce", ["get", "name_en"], ["get", "name"]],
+        "text-font": ["Noto Sans Regular"],
+        "text-letter-spacing": 0.04,
+        "text-max-width": 8,
+        "text-size": ["interpolate", ["linear"], ["zoom"], 12, 10, 16, 12]
+      },
+      "paint": {
+        "text-color": "#6b737a",
+        "text-halo-color": "rgba(255,255,255,0.9)",
+        "text-halo-width": 1.25
+      }
+    }
+  ]
+}

@@ -25,6 +25,8 @@ Open `http://SERVER-IP:8080`. `APP_HOST_PORT` changes the browser-facing port on
 
 Compose starts one `app` service, mounting `./data:/app/data`. It serves the site and API and performs a full refresh on first startup, then repeats every 14 days by default. The basemap appears before the first dataset is ready; the collection layer becomes available automatically once the background refresh has promoted its validated release. A citywide refresh is CPU-, memory-, disk-, and network-intensive, so follow the app log until it reports a promoted dataset version.
 
+The bundled basemap style uses OpenMapTiles-compatible vector tiles from OpenFreeMap. `VITE_BASEMAP_TILEJSON_URL` can select another compatible TileJSON endpoint when building the frontend or container. This is a build-time setting, so changing it requires rebuilding the image. OpenFreeMap's public service is provided without an SLA; a basemap request failure does not prevent the locally served sanitation overlay from initializing.
+
 Useful commands:
 
 ```bash
@@ -87,6 +89,8 @@ npm ci
 npm run dev
 ```
 
+Local Vite commands read `VITE_BASEMAP_TILEJSON_URL` from the repository-root `.env` file when present. The default OpenFreeMap endpoint is used when it is omitted.
+
 Build and publish a complete local dataset from the official sources:
 
 ```bash
@@ -114,3 +118,5 @@ docker build -f Dockerfile -t nyc-sanitation-map:test .
 If the basemap loads but collection lines do not, inspect `/api/health` and the container log. A `503` whose detail says checksums are `verifying` is transient; keep polling. Any `invalid` result is a fail-closed integrity error. `HEALTH_SYNC_HASH_MAX_BYTES` controls which small releases are hashed inline (16 MiB by default); it never disables verification. A failed refresh leaves the current committed release live. Volume permission errors prevent the container from creating its temporary build or atomic manifest. Restore the volume backup or activate a retained release as described in [operations](docs/operations.md) if a manifest or committed artifact is invalid. For `port already allocated`, change only the host side, for example `9090:8000`.
 
 Official source attribution: NYC Department of Sanitation and NYC Department of City Planning. This visualization is not a substitute for the official [DSNY collection schedule lookup](https://www.nyc.gov/assets/dsny/site/collection-schedule-lookup).
+
+Basemap attribution: [© OpenMapTiles](https://openmaptiles.org/) Data from [OpenStreetMap](https://www.openstreetmap.org/copyright). See [third-party notices](THIRD_PARTY_NOTICES.md) for the style, tile, data, and font licenses.

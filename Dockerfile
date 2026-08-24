@@ -4,7 +4,9 @@ WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
+ARG VITE_BASEMAP_TILEJSON_URL=https://tiles.openfreemap.org/planet
 ENV VITE_API_BASE_URL=
+ENV VITE_BASEMAP_TILEJSON_URL=$VITE_BASEMAP_TILEJSON_URL
 RUN npm run build
 
 # Run FastAPI and serve the compiled frontend from the same container.
