@@ -162,8 +162,8 @@ export function App() {
         })
         .catch((error: unknown) => {
           if (isAbortError(error) || controller.signal.aborted) return;
-          console.error("Backend health check failed", error);
           const status = error instanceof Error && "status" in error ? error.status : undefined;
+          if (status !== 503) console.error("Backend health check failed", error);
           setBackendConnection(status === 503 ? "verifying" : "unavailable");
           window.clearTimeout(retryTimer);
           retryTimer = window.setTimeout(checkHealth, retryDelayMs);
@@ -327,7 +327,7 @@ export function App() {
             });
             map.addLayer({
               id: unknownLayerIds[1], type: "line", source: sourceId,
-              "source-layer": config.unknown_source_layer, minzoom: 15,
+              "source-layer": config.unknown_source_layer, minzoom: config.unknown_minzoom,
               filter: ["==", ["get", "reason_code"], "INSUFFICIENT_ADDRESS_EVIDENCE"],
               layout: { visibility: showInsufficientAddressRef.current ? "visible" : "none" },
               paint: { "line-color": "#687078", "line-width": 3, "line-dasharray": [1, 2], "line-opacity": 0.9, "line-offset": unknownSideOffset },

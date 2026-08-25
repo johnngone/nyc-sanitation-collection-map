@@ -549,7 +549,8 @@ def download_file(url: str, output: Path) -> dict[str, object]:
                     )
                     elapsed = max(now - started, 0.001)
                     LOGGER.info(
-                        "LION download progress bytes=%s expected=%s percent=%s rate_mib_s=%.2f elapsed_s=%.0f",
+                        "Archive download progress destination=%s bytes=%s expected=%s percent=%s rate_mib_s=%.2f elapsed_s=%.0f",
+                        output.name,
                         _format_bytes(downloaded),
                         _format_bytes(expected_size) if expected_size is not None else "unknown",
                         percentage,

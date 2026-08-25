@@ -522,42 +522,43 @@ def test_v4_unknown_layer_has_only_frontend_properties_and_survives_maxzoom(tmp_
     archive = tmp_path / "collection.mbtiles"
     _source_database(database)
     with sqlite3.connect(database) as connection:
-        connection.execute(
+        connection.executemany(
             """INSERT INTO unknown_block_faces
                (unknown_id, technical_identity, segment_id, borough, street_name, side,
                 reason_code, reason, identity_method, geometry_method, geometry_wkt,
                 min_x, min_y, max_x, max_y, evidence_json)
-               VALUES ('unknown-1', 'LION:1:LEFT', '1', 'BROOKLYN', 'UNKNOWN STREET', 'LEFT',
-                       'OUTSIDE_DSNY_COVERAGE', 'No exact polygon coverage', 'UNRESOLVED',
-                       'DIRECT_SIDE_TRACE_UNRESOLVED',
-                       'LINESTRING (-74.0 40.6, -73.99 40.61)',
-                       -74.0, 40.6, -73.99, 40.61, '{}')"""
+               VALUES (?, ?, ?, 'BROOKLYN', ?, 'LEFT', ?, ?, 'UNRESOLVED',
+                       'DIRECT_SIDE_TRACE_UNRESOLVED', ?, ?, ?, ?, ?, '{}')""",
+            [
+                ('unknown-1', 'LION:1:LEFT', '1', 'UNKNOWN STREET',
+                 'OUTSIDE_DSNY_COVERAGE', 'No exact polygon coverage',
+                 'LINESTRING (-74.0 40.6, -73.99 40.61)', -74.0, 40.6, -73.99, 40.61),
+                ('unknown-2', 'LION:2:LEFT', '2', 'EVIDENCE STREET',
+                 'INSUFFICIENT_ADDRESS_EVIDENCE', 'Insufficient address evidence',
+                 'LINESTRING (-73.99 40.61, -73.98 40.62)', -73.99, 40.61, -73.98, 40.62),
+            ],
         )
 
-    report = build_tiles(database, archive, minzoom=15, maxzoom=16)
+    report = build_tiles(database, archive, minzoom=14, maxzoom=16)
 
-    assert report.unknown_feature_count == report.maxzoom_unknown_feature_count == 1
+    assert report.unknown_feature_count == report.maxzoom_unknown_feature_count == 2
     decoded_unknowns = []
-    decoded_unknowns_at_zoom_15 = []
+    decoded_unknowns_at_zoom_14 = []
     with sqlite3.connect(archive) as connection:
         metadata = dict(connection.execute("SELECT name, value FROM metadata"))
         for zoom, tile_data in connection.execute("SELECT zoom_level, tile_data FROM tiles"):
             decoded = mapbox_vector_tile.decode(gzip.decompress(tile_data))
             unknowns = decoded.get("collection_unknowns", {}).get("features", [])
             decoded_unknowns.extend(unknowns)
-            if zoom == 15:
-                decoded_unknowns_at_zoom_15.extend(unknowns)
-    assert metadata["unknown_minzoom"] == "15"
+            if zoom == 14:
+                decoded_unknowns_at_zoom_14.extend(unknowns)
+    assert metadata["unknown_minzoom"] == "14"
     assert decoded_unknowns
-    assert decoded_unknowns_at_zoom_15
-    assert {feature["id"] for feature in decoded_unknowns} == {1}
-    properties = decoded_unknowns[0]["properties"]
-    assert properties == {
-        "street_name": "UNKNOWN STREET",
-        "side": "LEFT",
-        "reason_code": "OUTSIDE_DSNY_COVERAGE",
-        "reason": "No exact polygon coverage",
+    assert {feature["properties"]["reason_code"] for feature in decoded_unknowns_at_zoom_14} == {
+        "OUTSIDE_DSNY_COVERAGE", "INSUFFICIENT_ADDRESS_EVIDENCE",
     }
+    assert {feature["id"] for feature in decoded_unknowns} == {1, 2}
+    properties = decoded_unknowns[0]["properties"]
     unknown_fields = json.loads(metadata["json"])["vector_layers"][1]["fields"]
     assert set(unknown_fields) == set(properties)
 

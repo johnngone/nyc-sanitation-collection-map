@@ -1181,6 +1181,27 @@ def test_loader_aggregates_duplicate_ids_and_removes_stale_schedules(tmp_path) -
     }
     load_payload(replacement, database)
     with sqlite3.connect(database) as connection:
+        expected_secondary_indexes = {
+            "idx_schedule_day_type",
+            "idx_schedule_type_day_face",
+            "idx_collection_state_type",
+            "idx_unknown_reason",
+            "idx_block_face_bbox",
+            "idx_block_face_min_x",
+            "idx_block_face_max_x",
+            "idx_block_face_min_y",
+            "idx_block_face_max_y",
+            "idx_block_face_borough",
+            "idx_block_face_origin",
+            "idx_dsny_source_object",
+        }
+        actual_indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert expected_secondary_indexes <= actual_indexes
         rows = connection.execute(
             "SELECT collection_type, weekday FROM collection_schedules "
             "WHERE block_face_id = 'shared' ORDER BY collection_type, weekday"

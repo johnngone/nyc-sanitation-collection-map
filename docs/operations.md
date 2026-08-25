@@ -23,7 +23,7 @@ FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not en
 
 ## Vector-tile contract
 
-The default v4 archive is an MBTiles SQLite file covering zooms 12–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 15–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 15. The runtime continues to read retained v2 and v3 releases during rollout.
+The default v4 archive is an MBTiles SQLite file covering zooms 12–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 14–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 14. The runtime continues to read retained v2 and v3 releases during rollout.
 
 | Property | Meaning |
 |---|---|

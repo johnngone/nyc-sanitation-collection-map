@@ -120,25 +120,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS block_faces_rtree USING rtree(
     min_y, max_y
 );
 
-CREATE INDEX IF NOT EXISTS idx_schedule_day_type
-    ON collection_schedules(collection_type, weekday);
-CREATE INDEX IF NOT EXISTS idx_schedule_type_day_face
-    ON collection_schedules(collection_type, weekday, block_face_id);
-CREATE INDEX IF NOT EXISTS idx_collection_state_type
-    ON block_face_collection_states(collection_type, state);
-CREATE INDEX IF NOT EXISTS idx_unknown_reason
-    ON unknown_block_faces(reason_code);
-CREATE INDEX IF NOT EXISTS idx_block_face_bbox
-    ON block_faces(min_x, max_x, min_y, max_y);
-CREATE INDEX IF NOT EXISTS idx_block_face_min_x ON block_faces(min_x);
-CREATE INDEX IF NOT EXISTS idx_block_face_max_x ON block_faces(max_x);
-CREATE INDEX IF NOT EXISTS idx_block_face_min_y ON block_faces(min_y);
-CREATE INDEX IF NOT EXISTS idx_block_face_max_y ON block_faces(max_y);
-CREATE INDEX IF NOT EXISTS idx_block_face_borough
-    ON block_faces(borough);
-CREATE INDEX IF NOT EXISTS idx_dsny_source_object
-    ON block_face_dsny_sources(dsny_object_id);
 """
+
+SECONDARY_INDEXES = {
+    "idx_schedule_day_type": "ON collection_schedules(collection_type, weekday)",
+    "idx_schedule_type_day_face": "ON collection_schedules(collection_type, weekday, block_face_id)",
+    "idx_collection_state_type": "ON block_face_collection_states(collection_type, state)",
+    "idx_unknown_reason": "ON unknown_block_faces(reason_code)",
+    "idx_block_face_bbox": "ON block_faces(min_x, max_x, min_y, max_y)",
+    "idx_block_face_min_x": "ON block_faces(min_x)",
+    "idx_block_face_max_x": "ON block_faces(max_x)",
+    "idx_block_face_min_y": "ON block_faces(min_y)",
+    "idx_block_face_max_y": "ON block_faces(max_y)",
+    "idx_block_face_borough": "ON block_faces(borough)",
+    "idx_block_face_origin": "ON block_faces(origin_block_face_id)",
+    "idx_dsny_source_object": "ON block_face_dsny_sources(dsny_object_id)",
+}
+
+
+def create_secondary_indexes(connection: sqlite3.Connection) -> None:
+    for name, definition in SECONDARY_INDEXES.items():
+        connection.execute(f"CREATE INDEX IF NOT EXISTS {name} {definition}")
+
+
+def drop_secondary_indexes(connection: sqlite3.Connection) -> None:
+    for name in SECONDARY_INDEXES:
+        connection.execute(f"DROP INDEX IF EXISTS {name}")
 
 
 def connect(database_path: str | Path) -> sqlite3.Connection:
@@ -148,7 +155,7 @@ def connect(database_path: str | Path) -> sqlite3.Connection:
     return connection
 
 
-def initialize(database_path: str | Path) -> None:
+def initialize(database_path: str | Path, *, create_indexes: bool = True) -> None:
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(database_path)) as connection:
         connection.executescript(SCHEMA)
@@ -162,10 +169,8 @@ def initialize(database_path: str | Path) -> None:
                 "UPDATE block_faces SET origin_block_face_id = block_face_id "
                 "WHERE origin_block_face_id IS NULL"
             )
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_block_face_origin "
-            "ON block_faces(origin_block_face_id)"
-        )
+        if create_indexes:
+            create_secondary_indexes(connection)
         connection.commit()
 
 

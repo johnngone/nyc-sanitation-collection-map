@@ -16,7 +16,7 @@ from shapely.geometry.base import BaseGeometry
 from shapely.geometry import shape
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from backend.app.database import initialize
+from backend.app.database import create_secondary_indexes, drop_secondary_indexes, initialize
 from scripts.build_pilot import (
     DAY_ORDER,
     ORGANICS_POLICY_RULE_ID,
@@ -180,7 +180,7 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
     if not features:
         raise ValueError("input contains no features")
     LOGGER.info("Initializing SQLite and loading audited features=%s database=%s", len(features), database)
-    initialize(database)
+    initialize(database, create_indexes=False)
     with closing(sqlite3.connect(database)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         # SQLite cannot add a NOT NULL column without a table rebuild. Existing
@@ -218,6 +218,10 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
                 PRIMARY KEY (block_face_id, component_index)
             )"""
         )
+        # Defer secondary-index maintenance until the complete replacement has
+        # been inserted. Dropping, loading, and recreating indexes all occur in
+        # this transaction, so readers never observe a partially indexed snapshot.
+        drop_secondary_indexes(connection)
         # This loader consumes a complete snapshot. Clear every spatial and
         # relational row in the same transaction so removed faces cannot
         # survive a successful refresh.
@@ -252,14 +256,13 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
                     max_y,
                 ),
             )
-            connection.execute(
-                "INSERT OR IGNORE INTO block_face_rtree_map (block_face_id) VALUES (?)",
+            rtree_map_cursor = connection.execute(
+                "INSERT INTO block_face_rtree_map (block_face_id) VALUES (?)",
                 (feature.block_face_id,),
             )
-            rtree_id = connection.execute(
-                "SELECT rtree_id FROM block_face_rtree_map WHERE block_face_id = ?",
-                (feature.block_face_id,),
-            ).fetchone()[0]
+            rtree_id = rtree_map_cursor.lastrowid
+            if rtree_id is None:
+                raise RuntimeError(f"SQLite did not assign an R-tree ID for {feature.block_face_id}")
             connection.execute(
                 "INSERT OR REPLACE INTO block_faces_rtree "
                 "(rtree_id, min_x, max_x, min_y, max_y) VALUES (?, ?, ?, ?, ?)",
@@ -366,6 +369,7 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
             ],
         )
         LOGGER.info("SQLite unknown-feature load complete features=%s", len(unknown_features))
+        create_secondary_indexes(connection)
         connection.commit()
     return len(features)
 
