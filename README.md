@@ -28,6 +28,24 @@ The first refresh downloads the source data and builds the map release. The base
 
 Release images are published for both `linux/amd64` and `linux/arm64`. Docker automatically pulls the matching image for the host, including an Oracle Cloud Ampere A1 VM. Use a GitHub release tag instead of `latest` when you want a pinned deployment. Published images use the form `ghcr.io/johnngone/nyc-sanitation-collection-map:<release-tag>`.
 
+Set the `APP_*` variables to customize visible branding and the metadata returned in the initial HTML response. Recreate the container after changing them; the image does not need to be rebuilt. Set `APP_PUBLIC_URL` to the deployment's public HTTPS origin without a trailing slash. It supplies the canonical URL, social image URL, sitemap, and structured-data URL.
+
+The initial page response includes the configured title and description, Open Graph and Twitter cards, canonical metadata, and JSON-LD. The server also exposes `/robots.txt` and `/sitemap.xml`; sitemap URLs are included once `APP_PUBLIC_URL` is configured.
+
+```bash
+docker run -d \
+  --name nyc-sanitation-map \
+  --restart unless-stopped \
+  -p "${HOST_PORT}:8000" \
+  -v "${DATA_DIR}:/app/data" \
+  -e APP_TITLE="My Collection Map" \
+  -e APP_SUBTITLE="Find pickup schedules in your neighborhood." \
+  -e APP_BROWSER_TITLE="Collection Schedule Map | Example Organization" \
+  -e APP_META_DESCRIPTION="Explore local refuse and recycling schedules by street." \
+  -e APP_PUBLIC_URL="https://map.example.com" \
+  "$IMAGE"
+```
+
 ## HTTPS and location tracking
 
 Live location tracking requires HTTPS. `http://localhost` also works for local use. Put a public or LAN deployment behind an HTTPS reverse proxy and allow the browser location permission.
@@ -40,6 +58,11 @@ The Docker image refreshes data on startup and every 14 days. Set these environm
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
+| `APP_TITLE` | `NYC Sanitation – Collection Map` | Visible and accessible map heading |
+| `APP_SUBTITLE` | `See collection schedules by street and day.` | Text beneath the map title |
+| `APP_BROWSER_TITLE` | `NYC Sanitation Collection Map` | Browser-tab, search-result, Open Graph, and Twitter title |
+| `APP_META_DESCRIPTION` | `Map NYC sanitation collection schedules by street and day.` | Search-result, Open Graph, and Twitter description |
+| `APP_PUBLIC_URL` | empty | Public HTTPS origin used for canonical, Open Graph, JSON-LD, robots, and sitemap URLs |
 | `DATA_REFRESH_ON_STARTUP` | `true` | Start a refresh when the container starts |
 | `DATA_REFRESH_ENABLED` | `true` | Run the background refresh scheduler |
 | `DATA_REFRESH_INTERVAL_DAYS` | `14` | Days between scheduled refreshes |
@@ -72,6 +95,7 @@ Compose mounts `./data` at `/app/data`.
 
 | Endpoint | Use |
 | --- | --- |
+| `GET /api/app-config` | Runtime title and subtitle used by the frontend |
 | `GET /api/health` | Release status record counts and artifact checks |
 | `GET /api/map-config` | Current vector tile URL and map availability |
 | `GET /api/tiles/{version}/{z}/{x}/{y}.pbf` | Gzip vector tiles used by the map |

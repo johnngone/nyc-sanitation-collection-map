@@ -2,6 +2,23 @@ import os
 
 
 APP_ENV = os.getenv("APP_ENV", "development")
+APP_TITLE = os.getenv("APP_TITLE", "NYC Sanitation – Collection Map").strip() or "NYC Sanitation – Collection Map"
+APP_SUBTITLE = (
+    os.getenv("APP_SUBTITLE", "See collection schedules by street and day.").strip()
+    or "See collection schedules by street and day."
+)
+APP_BROWSER_TITLE = (
+    os.getenv("APP_BROWSER_TITLE", "NYC Sanitation Collection Map").strip()
+    or "NYC Sanitation Collection Map"
+)
+APP_META_DESCRIPTION = (
+    os.getenv(
+        "APP_META_DESCRIPTION",
+        "Map NYC sanitation collection schedules by street and day.",
+    ).strip()
+    or "Map NYC sanitation collection schedules by street and day."
+)
+APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", "").strip().rstrip("/")
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/app.sqlite3")

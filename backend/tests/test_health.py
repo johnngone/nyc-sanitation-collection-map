@@ -2,7 +2,38 @@ from fastapi.testclient import TestClient
 
 from app import api
 from app.database import initialize
+from app import main
 from app.main import app
+
+
+def test_runtime_seo_metadata_is_injected_and_escaped() -> None:
+    rendered = main.render_frontend_index(
+        """<title id="runtime-browser-title">Default</title>
+        <meta id="runtime-meta-description" name="description" content="Default" />
+        <!-- runtime-seo -->""",
+        browser_title='Pickup <Map>',
+        meta_description='Schedules for "everyone" & neighbors.',
+        public_url="https://map.example.com",
+    )
+
+    assert "<title id=\"runtime-browser-title\">Pickup &lt;Map&gt;</title>" in rendered
+    assert "Schedules for &quot;everyone&quot; &amp; neighbors." in rendered
+    assert '<link rel="canonical" href="https://map.example.com" />' in rendered
+    assert '<meta property="og:image" content="https://map.example.com/logo.png" />' in rendered
+    assert '"url": "https://map.example.com"' in rendered
+    assert "runtime-seo" not in rendered
+
+
+def test_robots_and_sitemap_use_public_url(monkeypatch) -> None:
+    monkeypatch.setattr(main, "APP_PUBLIC_URL", "https://map.example.com")
+    client = TestClient(app)
+
+    assert client.get("/robots.txt").text == (
+        "User-agent: *\nAllow: /\nSitemap: https://map.example.com/sitemap.xml\n"
+    )
+    sitemap = client.get("/sitemap.xml")
+    assert sitemap.status_code == 200
+    assert "<loc>https://map.example.com</loc>" in sitemap.text
 
 
 def test_health(tmp_path, monkeypatch) -> None:
