@@ -589,6 +589,7 @@ label input[type="checkbox"] {
     max-height: calc(min(72dvh, 620px) - var(--mobile-sheet-peek));
     overflow: auto;
     overscroll-behavior: contain;
+    touch-action: pan-down;
     padding: .2rem 1rem calc(1rem + env(safe-area-inset-bottom));
     gap: 1rem;
     transition: opacity 160ms ease;

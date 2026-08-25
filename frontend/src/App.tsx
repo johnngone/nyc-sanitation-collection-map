@@ -4,6 +4,7 @@ import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 import { resolveApiUrl } from "./apiUrl";
 import { createBasemapStyle, DEFAULT_BASEMAP_TILEJSON_URL } from "./basemap";
 import { MAP_INTERACTION_OPTIONS, MapViewControl } from "./mapView";
+import { classifySheetGesture } from "./sheetGesture";
 
 const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
 type Weekday = (typeof weekdays)[number];
@@ -73,6 +74,7 @@ export function App() {
   const infoButtonRef = useRef<HTMLButtonElement>(null);
   const modalCloseRef = useRef<HTMLButtonElement>(null);
   const sheetGestureStartYRef = useRef<number | null>(null);
+  const sheetGesturePointerIdRef = useRef<number | null>(null);
   const sheetGestureHandledRef = useRef(false);
   const selectedDayRef = useRef<Weekday>(dayFromCode(new URLSearchParams(window.location.search).get("day")));
   const selectedTypesRef = useRef<CollectionType[]>(["REFUSE"]);
@@ -468,25 +470,40 @@ export function App() {
     window.history.replaceState({}, "", url);
   }
 
-  function beginSheetGesture(event: React.PointerEvent<HTMLButtonElement>) {
+  function beginSheetGesture(event: React.PointerEvent<HTMLElement>) {
+    if (!isMobileViewport || !event.isPrimary || event.button !== 0) return;
     sheetGestureStartYRef.current = event.clientY;
+    sheetGesturePointerIdRef.current = event.pointerId;
     sheetGestureHandledRef.current = false;
-    event.currentTarget.setPointerCapture(event.pointerId);
+
+    const target = event.target;
+    const toggle = target instanceof Element ? target.closest<HTMLButtonElement>(".sheet-toggle") : null;
+    toggle?.setPointerCapture(event.pointerId);
   }
 
-  function finishSheetGesture(event: React.PointerEvent<HTMLButtonElement>) {
+  function finishSheetGesture(event: React.PointerEvent<HTMLElement>) {
+    if (sheetGesturePointerIdRef.current !== event.pointerId) return;
     const startY = sheetGestureStartYRef.current;
     sheetGestureStartYRef.current = null;
+    sheetGesturePointerIdRef.current = null;
     if (startY === null) return;
-    const distance = event.clientY - startY;
-    if (Math.abs(distance) < 32) return;
+    const gesture = classifySheetGesture(startY, event.clientY);
+    if (!gesture) return;
     sheetGestureHandledRef.current = true;
-    setMobileSheetOpen(distance < 0);
+    setMobileSheetOpen(gesture === "expand");
   }
 
   function cancelSheetGesture() {
     sheetGestureStartYRef.current = null;
+    sheetGesturePointerIdRef.current = null;
     sheetGestureHandledRef.current = false;
+  }
+
+  function suppressClickAfterSheetGesture(event: React.MouseEvent<HTMLElement>) {
+    if (!sheetGestureHandledRef.current) return;
+    sheetGestureHandledRef.current = false;
+    event.preventDefault();
+    event.stopPropagation();
   }
 
   function toggleMobileSheet() {
@@ -533,7 +550,15 @@ export function App() {
             </span>
           </button>
         </div>
-        <aside ref={mapOverlayRef} className={`map-overlay ${mobileSheetOpen ? "is-open" : "is-collapsed"}`} aria-label="Map controls">
+        <aside
+          ref={mapOverlayRef}
+          className={`map-overlay ${mobileSheetOpen ? "is-open" : "is-collapsed"}`}
+          aria-label="Map controls"
+          onClickCapture={suppressClickAfterSheetGesture}
+          onPointerDown={beginSheetGesture}
+          onPointerUp={finishSheetGesture}
+          onPointerCancel={cancelSheetGesture}
+        >
           <button
             className="sheet-toggle"
             type="button"
@@ -541,9 +566,6 @@ export function App() {
             aria-expanded={mobileSheetOpen}
             aria-controls="map-control-content"
             onClick={toggleMobileSheet}
-            onPointerDown={beginSheetGesture}
-            onPointerUp={finishSheetGesture}
-            onPointerCancel={cancelSheetGesture}
           >
             <span className="sheet-grabber" aria-hidden="true" />
             <span className="sheet-toggle-label">{mobileSheetOpen ? "Hide controls" : "Show controls"}</span>
