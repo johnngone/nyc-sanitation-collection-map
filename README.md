@@ -26,7 +26,7 @@ Open `http://SERVER-IP:8080`. Replace `8080` with your `HOST_PORT` value.
 
 The first refresh downloads the source data and builds the map release. The basemap loads before that work is done. Street schedules appear after the release passes validation.
 
-Use a commit SHA tag instead of `latest` when you want a pinned deployment. Published images use the form `ghcr.io/johnngone/nyc-sanitation-collection-map:<commit-sha>`.
+Release images are published for both `linux/amd64` and `linux/arm64`. Docker automatically pulls the matching image for the host, including an Oracle Cloud Ampere A1 VM. Use a GitHub release tag instead of `latest` when you want a pinned deployment. Published images use the form `ghcr.io/johnngone/nyc-sanitation-collection-map:<release-tag>`.
 
 ## HTTPS and location tracking
 
