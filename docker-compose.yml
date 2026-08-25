@@ -14,6 +14,7 @@ services:
       APP_BROWSER_TITLE: ${APP_BROWSER_TITLE:-NYC Sanitation Collection Map}
       APP_META_DESCRIPTION: ${APP_META_DESCRIPTION:-Map NYC sanitation collection schedules by street and day.}
       APP_PUBLIC_URL: ${APP_PUBLIC_URL:-}
+      APP_ROBOTS_TXT: ${APP_ROBOTS_TXT:-}
       DATABASE_PATH: /app/data/app.sqlite3
       TILESET_PATH: /app/data/collection_streets.mbtiles
       DATA_MANIFEST_PATH: /app/data/data_manifest.json

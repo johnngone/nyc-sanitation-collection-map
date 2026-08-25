@@ -30,7 +30,21 @@ Release images are published for both `linux/amd64` and `linux/arm64`. Docker au
 
 Set the `APP_*` variables to customize visible branding and the metadata returned in the initial HTML response. Recreate the container after changing them; the image does not need to be rebuilt. Set `APP_PUBLIC_URL` to the deployment's public HTTPS origin without a trailing slash. It supplies the canonical URL, social image URL, sitemap, and structured-data URL.
 
-The initial page response includes the configured title and description, Open Graph and Twitter cards, canonical metadata, and JSON-LD. The server also exposes `/robots.txt` and `/sitemap.xml`; sitemap URLs are included once `APP_PUBLIC_URL` is configured.
+The initial page response includes the configured title and description, Open Graph and Twitter cards, canonical metadata, and JSON-LD. The server also exposes `/robots.txt` and `/sitemap.xml`.
+
+`APP_ROBOTS_TXT` defaults to a private, crawl-blocking policy. Use literal `\n` sequences between lines when setting a custom value.
+
+Private default (leaving the variable empty produces the same file):
+
+```env
+APP_ROBOTS_TXT=User-agent: *\nDisallow: /
+```
+
+Public example:
+
+```env
+APP_ROBOTS_TXT=User-agent: *\nAllow: /\nSitemap: https://map.example.com/sitemap.xml
+```
 
 ```bash
 docker run -d \
@@ -43,6 +57,7 @@ docker run -d \
   -e APP_BROWSER_TITLE="Collection Schedule Map | Example Organization" \
   -e APP_META_DESCRIPTION="Explore local refuse and recycling schedules by street." \
   -e APP_PUBLIC_URL="https://map.example.com" \
+  -e APP_ROBOTS_TXT="User-agent: *\\nAllow: /\\nSitemap: https://map.example.com/sitemap.xml" \
   "$IMAGE"
 ```
 
@@ -63,6 +78,7 @@ The Docker image refreshes data on startup and every 14 days. Set these environm
 | `APP_BROWSER_TITLE` | `NYC Sanitation Collection Map` | Browser-tab, search-result, Open Graph, and Twitter title |
 | `APP_META_DESCRIPTION` | `Map NYC sanitation collection schedules by street and day.` | Search-result, Open Graph, and Twitter description |
 | `APP_PUBLIC_URL` | empty | Public HTTPS origin used for canonical, Open Graph, JSON-LD, robots, and sitemap URLs |
+| `APP_ROBOTS_TXT` | empty (`Disallow: /`) | Complete `/robots.txt` override using literal `\n` line separators; set an explicit allow policy to make the site crawlable |
 | `DATA_REFRESH_ON_STARTUP` | `true` | Start a refresh when the container starts |
 | `DATA_REFRESH_ENABLED` | `true` | Run the background refresh scheduler |
 | `DATA_REFRESH_INTERVAL_DAYS` | `14` | Days between scheduled refreshes |

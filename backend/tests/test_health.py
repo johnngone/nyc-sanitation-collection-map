@@ -24,16 +24,31 @@ def test_runtime_seo_metadata_is_injected_and_escaped() -> None:
     assert "runtime-seo" not in rendered
 
 
-def test_robots_and_sitemap_use_public_url(monkeypatch) -> None:
+def test_robots_default_to_private_and_sitemap_uses_public_url(monkeypatch) -> None:
     monkeypatch.setattr(main, "APP_PUBLIC_URL", "https://map.example.com")
+    monkeypatch.setattr(main, "APP_ROBOTS_TXT", "")
     client = TestClient(app)
 
-    assert client.get("/robots.txt").text == (
-        "User-agent: *\nAllow: /\nSitemap: https://map.example.com/sitemap.xml\n"
-    )
+    assert client.get("/robots.txt").text == "User-agent: *\nDisallow: /\n"
     sitemap = client.get("/sitemap.xml")
     assert sitemap.status_code == 200
     assert "<loc>https://map.example.com</loc>" in sitemap.text
+
+
+def test_custom_public_robots_text_overrides_private_default(monkeypatch) -> None:
+    monkeypatch.setattr(main, "APP_PUBLIC_URL", "https://map.example.com")
+    monkeypatch.setattr(
+        main,
+        "APP_ROBOTS_TXT",
+        "User-agent: *\nAllow: /\nSitemap: https://map.example.com/sitemap.xml",
+    )
+
+    response = TestClient(app).get("/robots.txt")
+
+    assert response.status_code == 200
+    assert response.text == (
+        "User-agent: *\nAllow: /\nSitemap: https://map.example.com/sitemap.xml\n"
+    )
 
 
 def test_health(tmp_path, monkeypatch) -> None:

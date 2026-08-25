@@ -19,6 +19,7 @@ APP_META_DESCRIPTION = (
     or "Map NYC sanitation collection schedules by street and day."
 )
 APP_PUBLIC_URL = os.getenv("APP_PUBLIC_URL", "").strip().rstrip("/")
+APP_ROBOTS_TXT = os.getenv("APP_ROBOTS_TXT", "").replace("\\n", "\n").strip()
 API_HOST = os.getenv("API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/app.sqlite3")

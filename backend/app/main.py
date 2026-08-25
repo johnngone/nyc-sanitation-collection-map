@@ -16,6 +16,7 @@ from .config import (
     APP_BROWSER_TITLE,
     APP_META_DESCRIPTION,
     APP_PUBLIC_URL,
+    APP_ROBOTS_TXT,
     DATABASE_PATH,
     DATA_MANIFEST_PATH,
 )
@@ -146,10 +147,15 @@ app.include_router(router)
 
 @app.get("/robots.txt", include_in_schema=False)
 def robots() -> PlainTextResponse:
-    lines = ["User-agent: *", "Allow: /"]
-    if APP_PUBLIC_URL:
-        lines.append(f"Sitemap: {APP_PUBLIC_URL}/sitemap.xml")
-    return PlainTextResponse("\n".join(lines) + "\n", headers={"Cache-Control": "no-cache"})
+    if APP_ROBOTS_TXT:
+        return PlainTextResponse(
+            APP_ROBOTS_TXT + "\n",
+            headers={"Cache-Control": "no-cache"},
+        )
+    return PlainTextResponse(
+        "User-agent: *\nDisallow: /\n",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/sitemap.xml", include_in_schema=False)
