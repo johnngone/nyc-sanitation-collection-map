@@ -823,13 +823,19 @@ label input[type="checkbox"] {
 
   .maplibregl-ctrl-bottom-right {
     right: max(.15rem, env(safe-area-inset-right));
-    bottom: calc(var(--mobile-sheet-peek) + env(safe-area-inset-bottom) + .5rem);
-    transition: bottom 340ms cubic-bezier(.22, 1, .36, 1);
+    bottom: calc(var(--mobile-sheet-height) + .5rem);
+    transform: translate3d(
+      0,
+      calc(var(--mobile-sheet-height) - var(--mobile-sheet-peek) - env(safe-area-inset-bottom)),
+      0
+    );
+    transition: transform 340ms cubic-bezier(.22, 1, .36, 1);
+    will-change: transform;
   }
 
   .app-shell.mobile-sheet-core .maplibregl-ctrl-bottom-right,
   .app-shell.mobile-sheet-full .maplibregl-ctrl-bottom-right {
-    bottom: calc(var(--mobile-sheet-height) + .5rem);
+    transform: translate3d(0, 0, 0);
   }
 
   .maplibregl-ctrl-bottom-right .maplibregl-ctrl {

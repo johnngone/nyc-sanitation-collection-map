@@ -4,10 +4,13 @@ on:
   push:
     branches:
       - main
+  release:
+    types:
+      - published
   workflow_dispatch:
 
 concurrency:
-  # Keep one mutable image tag from being advanced out of order.
+  # Avoid overlapping full image verification and release publication runs.
   group: sanitation-container-publish
   cancel-in-progress: false
 
@@ -143,22 +146,19 @@ jobs:
           test "${cache_status}" = "304"
 
       - name: Log in to GHCR
+        if: github.event_name == 'release'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push immutable commit tag
+      - name: Publish release image
+        if: github.event_name == 'release'
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          docker tag nyc-sanitation-map:ci "${IMAGE}:${GITHUB_SHA}"
-          docker push "${IMAGE}:${GITHUB_SHA}"
-
-      - name: Advance latest tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker tag nyc-sanitation-map:ci "${IMAGE}:latest"
-          docker push "${IMAGE}:latest"
+          docker tag nyc-sanitation-map:ci "${IMAGE}:${RELEASE_TAG}"
+          docker push "${IMAGE}:${RELEASE_TAG}"
