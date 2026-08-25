@@ -153,16 +153,16 @@
       "type": "fill-extrusion",
       "source": "openmaptiles",
       "source-layer": "building",
-      "minzoom": 14,
+      "minzoom": 13,
       "filter": ["!=", ["get", "hide_3d"], true],
       "layout": {
         "visibility": "none"
       },
       "paint": {
-        "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], 0],
+        "fill-extrusion-base": ["interpolate", ["linear"], ["zoom"], 13.75, 0, 14, ["coalesce", ["get", "render_min_height"], 0]],
         "fill-extrusion-color": "#d7dce0",
-        "fill-extrusion-height": ["coalesce", ["get", "render_height"], 3],
-        "fill-extrusion-opacity": 0.78,
+        "fill-extrusion-height": ["interpolate", ["linear"], ["zoom"], 13.75, 0, 14, ["coalesce", ["get", "render_height"], 3]],
+        "fill-extrusion-opacity": ["interpolate", ["linear"], ["zoom"], 13.75, 0, 14, 0.78],
         "fill-extrusion-vertical-gradient": true
       }
     },

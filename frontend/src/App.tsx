@@ -3,7 +3,7 @@ import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
 import { resolveApiUrl } from "./apiUrl";
 import { createBasemapStyle, DEFAULT_BASEMAP_TILEJSON_URL } from "./basemap";
-import { MapViewControl } from "./mapView";
+import { MAP_INTERACTION_OPTIONS, MapViewControl } from "./mapView";
 
 const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
 type Weekday = (typeof weekdays)[number];
@@ -173,11 +173,7 @@ export function App() {
       zoom: 13,
       bearing: 0,
       pitch: 0,
-      maxPitch: 45,
-      dragRotate: true,
-      touchZoomRotate: true,
-      touchPitch: false,
-      pitchWithRotate: false,
+      ...MAP_INTERACTION_OPTIONS,
       attributionControl: false,
       style: createBasemapStyle(basemapTileJsonUrl),
     });

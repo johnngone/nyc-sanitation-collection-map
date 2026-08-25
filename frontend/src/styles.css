@@ -91,23 +91,22 @@ button { -webkit-tap-highlight-color: transparent; }
   border-radius: 9px;
 }
 
-.map-view-control button.map-view-mode {
-  color: #34414b;
-  font-size: .68rem;
-  font-weight: 750;
-  letter-spacing: -.01em;
-}
-
-.map-view-control button.map-view-mode[aria-pressed="true"] {
-  color: white;
-  background: #34414b;
-}
-
-.map-view-control button.map-view-mode[aria-pressed="true"]:hover {
-  background: #28343d;
-}
-
+.map-view-control[hidden],
 .map-view-compass[hidden] { display: none; }
+
+.map-view-compass .maplibregl-ctrl-icon {
+  background-image: none !important;
+  transform-origin: center;
+}
+
+.map-view-compass-needle {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.map-view-compass-north { fill: #e5484d; }
+.map-view-compass-south { fill: #aeb6bd; }
 
 button {
   border: 1px solid #c7d0d8;

@@ -1,15 +1,17 @@
-import type { ControlPosition, IControl, Map as MapLibreMap } from "maplibre-gl";
+import type { ControlPosition, IControl, Map as MapLibreMap, MapOptions } from "maplibre-gl";
 
 import { EXTRUDED_BUILDING_LAYER_ID, FLAT_BUILDING_LAYER_ID } from "./basemap";
 
 export const CAMERA_TOLERANCE_DEGREES = 1;
-const THREE_DIMENSIONAL_PITCH = 45;
-const THREE_DIMENSIONAL_MIN_ZOOM = 14;
-
-export interface CameraViewState {
-  isThreeDimensional: boolean;
-  showCompass: boolean;
-}
+export const EXTRUSION_DETAIL_ZOOM = 14;
+export const MAP_INTERACTION_OPTIONS = {
+  maxPitch: 45,
+  dragRotate: true,
+  touchZoomRotate: true,
+  touchPitch: true,
+  pitchWithRotate: true,
+  rollEnabled: false,
+} satisfies Pick<MapOptions, "maxPitch" | "dragRotate" | "touchZoomRotate" | "touchPitch" | "pitchWithRotate" | "rollEnabled">;
 
 export interface CameraPosition {
   bearing: number;
@@ -17,29 +19,44 @@ export interface CameraPosition {
   zoom: number;
 }
 
-export interface CameraTransition {
-  bearing?: number;
-  pitch: number;
-  zoom?: number;
+export interface MapViewState {
+  extrusionLatched: boolean;
+  showCompass: boolean;
+  showExtrudedBuildings: boolean;
+  showFlatBuildings: boolean;
 }
 
-export function cameraViewState(bearing: number, pitch: number): CameraViewState {
-  const normalizedBearing = ((bearing + 180) % 360 + 360) % 360 - 180;
-  const isThreeDimensional = pitch > CAMERA_TOLERANCE_DEGREES;
+function normalizedBearing(bearing: number): number {
+  return ((bearing + 180) % 360 + 360) % 360 - 180;
+}
+
+export function mapViewState(camera: CameraPosition, extrusionLatched: boolean, allowLatch = true): MapViewState {
+  const nextLatch = extrusionLatched
+    || (allowLatch && camera.pitch > CAMERA_TOLERANCE_DEGREES && camera.zoom >= EXTRUSION_DETAIL_ZOOM);
+  const cameraIsOriented = needsCameraReset(camera);
   return {
-    isThreeDimensional,
-    showCompass: isThreeDimensional || Math.abs(normalizedBearing) > CAMERA_TOLERANCE_DEGREES,
+    extrusionLatched: nextLatch,
+    showCompass: cameraIsOriented || nextLatch,
+    showExtrudedBuildings: nextLatch,
+    showFlatBuildings: !nextLatch || camera.zoom < EXTRUSION_DETAIL_ZOOM,
   };
 }
 
-export function nextCameraTransition(action: "toggle" | "reset", camera: CameraPosition): CameraTransition {
-  if (action === "reset") return { bearing: 0, pitch: 0 };
-  if (cameraViewState(camera.bearing, camera.pitch).isThreeDimensional) return { pitch: 0 };
-  return { pitch: THREE_DIMENSIONAL_PITCH, zoom: Math.max(camera.zoom, THREE_DIMENSIONAL_MIN_ZOOM) };
+export function needsCameraReset(camera: Pick<CameraPosition, "bearing" | "pitch">): boolean {
+  return camera.pitch > CAMERA_TOLERANCE_DEGREES
+    || Math.abs(normalizedBearing(camera.bearing)) > CAMERA_TOLERANCE_DEGREES;
+}
+
+export function compassTransform(bearing: number): string {
+  return `rotate(${-normalizedBearing(bearing)}deg)`;
+}
+
+export function cameraTransitionDuration(prefersReducedMotion: boolean): number {
+  return prefersReducedMotion ? 0 : 500;
 }
 
 function transitionDuration(): number {
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 500;
+  return cameraTransitionDuration(window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 }
 
 function setLayerVisibility(map: MapLibreMap, layerId: string, visible: boolean): void {
@@ -49,11 +66,30 @@ function setLayerVisibility(map: MapLibreMap, layerId: string, visible: boolean)
   if (current !== desired) map.setLayoutProperty(layerId, "visibility", desired);
 }
 
+function createCompassNeedle(): SVGSVGElement {
+  const namespace = "http://www.w3.org/2000/svg";
+  const needle = document.createElementNS(namespace, "svg");
+  needle.setAttribute("class", "map-view-compass-needle");
+  needle.setAttribute("viewBox", "0 0 29 29");
+  needle.setAttribute("aria-hidden", "true");
+
+  const north = document.createElementNS(namespace, "path");
+  north.setAttribute("class", "map-view-compass-north");
+  north.setAttribute("d", "m10.5 14 4-8 4 8z");
+  const south = document.createElementNS(namespace, "path");
+  south.setAttribute("class", "map-view-compass-south");
+  south.setAttribute("d", "m10.5 16 4 8 4-8z");
+  needle.append(north, south);
+  return needle;
+}
+
 export class MapViewControl implements IControl {
   private map?: MapLibreMap;
   private container?: HTMLDivElement;
   private compassButton?: HTMLButtonElement;
-  private modeButton?: HTMLButtonElement;
+  private compassIcon?: HTMLSpanElement;
+  private extrusionLatched = false;
+  private resettingView = false;
 
   getDefaultPosition(): ControlPosition {
     return "top-right";
@@ -67,22 +103,19 @@ export class MapViewControl implements IControl {
     this.compassButton = document.createElement("button");
     this.compassButton.type = "button";
     this.compassButton.className = "maplibregl-ctrl-compass map-view-compass";
-    this.compassButton.title = "Reset north and return to 2D";
-    this.compassButton.setAttribute("aria-label", "Reset north and return to 2D");
-    const compassIcon = document.createElement("span");
-    compassIcon.className = "maplibregl-ctrl-icon";
-    compassIcon.setAttribute("aria-hidden", "true");
-    this.compassButton.append(compassIcon);
+    this.compassButton.title = "Return to north and flat map";
+    this.compassButton.setAttribute("aria-label", "Return to north and flat map");
+    this.compassIcon = document.createElement("span");
+    this.compassIcon.className = "maplibregl-ctrl-icon";
+    this.compassIcon.setAttribute("aria-hidden", "true");
+    this.compassIcon.append(createCompassNeedle());
+    this.compassButton.append(this.compassIcon);
     this.compassButton.addEventListener("click", this.resetView);
+    this.container.append(this.compassButton);
 
-    this.modeButton = document.createElement("button");
-    this.modeButton.type = "button";
-    this.modeButton.className = "map-view-mode";
-    this.modeButton.addEventListener("click", this.toggleViewMode);
-
-    this.container.append(this.compassButton, this.modeButton);
     map.on("rotate", this.sync);
     map.on("pitch", this.sync);
+    map.on("zoom", this.sync);
     this.sync();
     return this.container;
   }
@@ -91,48 +124,47 @@ export class MapViewControl implements IControl {
     if (this.map) {
       this.map.off("rotate", this.sync);
       this.map.off("pitch", this.sync);
+      this.map.off("zoom", this.sync);
+      this.map.off("moveend", this.finishReset);
     }
     this.compassButton?.removeEventListener("click", this.resetView);
-    this.modeButton?.removeEventListener("click", this.toggleViewMode);
     this.container?.remove();
     this.map = undefined;
   }
 
   sync = (): void => {
-    if (!this.map || !this.compassButton || !this.modeButton) return;
-    const state = cameraViewState(this.map.getBearing(), this.map.getPitch());
+    if (!this.map || !this.container || !this.compassButton || !this.compassIcon) return;
+    const state = mapViewState({
+      bearing: this.map.getBearing(),
+      pitch: this.map.getPitch(),
+      zoom: this.map.getZoom(),
+    }, this.extrusionLatched, !this.resettingView);
+    this.extrusionLatched = state.extrusionLatched;
+    this.container.hidden = !state.showCompass;
     this.compassButton.hidden = !state.showCompass;
     this.compassButton.setAttribute("aria-hidden", String(!state.showCompass));
-    this.modeButton.textContent = state.isThreeDimensional ? "2D" : "3D";
-    this.modeButton.title = state.isThreeDimensional ? "Return to flat map" : "Show 3D buildings";
-    this.modeButton.setAttribute("aria-label", this.modeButton.title);
-    this.modeButton.setAttribute("aria-pressed", String(state.isThreeDimensional));
-    setLayerVisibility(this.map, FLAT_BUILDING_LAYER_ID, !state.isThreeDimensional);
-    setLayerVisibility(this.map, EXTRUDED_BUILDING_LAYER_ID, state.isThreeDimensional);
+    this.compassIcon.style.transform = compassTransform(this.map.getBearing());
+    setLayerVisibility(this.map, FLAT_BUILDING_LAYER_ID, state.showFlatBuildings);
+    setLayerVisibility(this.map, EXTRUDED_BUILDING_LAYER_ID, state.showExtrudedBuildings);
   };
 
   private resetView = (): void => {
     if (!this.map) return;
-    this.map.easeTo({
-      ...nextCameraTransition("reset", {
-        bearing: this.map.getBearing(),
-        pitch: this.map.getPitch(),
-        zoom: this.map.getZoom(),
-      }),
-      duration: transitionDuration(),
-    });
+    const camera = { bearing: this.map.getBearing(), pitch: this.map.getPitch() };
+    this.resettingView = true;
+    this.extrusionLatched = false;
+    this.sync();
+    if (!needsCameraReset(camera)) {
+      this.finishReset();
+      return;
+    }
+    this.map.off("moveend", this.finishReset);
+    this.map.once("moveend", this.finishReset);
+    this.map.easeTo({ bearing: 0, pitch: 0, duration: transitionDuration() });
   };
 
-  private toggleViewMode = (): void => {
-    if (!this.map) return;
-    const transition = nextCameraTransition("toggle", {
-      bearing: this.map.getBearing(),
-      pitch: this.map.getPitch(),
-      zoom: this.map.getZoom(),
-    });
-    this.map.easeTo({
-      ...transition,
-      duration: transitionDuration(),
-    });
+  private finishReset = (): void => {
+    this.resettingView = false;
+    this.sync();
   };
 }

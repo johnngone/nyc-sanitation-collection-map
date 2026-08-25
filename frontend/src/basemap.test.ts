@@ -55,12 +55,17 @@ describe("sanitation basemap style", () => {
     }
   });
 
-  it("keeps flat buildings by default and 3D buildings opt-in", () => {
+  it("keeps flat buildings by default and smoothly raises opt-in extrusions", () => {
     const flat = style.layers.find((layer) => layer.id === FLAT_BUILDING_LAYER_ID);
     const extruded = style.layers.find((layer) => layer.id === EXTRUDED_BUILDING_LAYER_ID);
     expect(flat).toMatchObject({ type: "fill", minzoom: 13, layout: { visibility: "visible" } });
     expect(flat).not.toHaveProperty("maxzoom");
-    expect(extruded).toMatchObject({ type: "fill-extrusion", minzoom: 14, layout: { visibility: "none" } });
+    expect(extruded).toMatchObject({ type: "fill-extrusion", minzoom: 13, layout: { visibility: "none" } });
+    expect(extruded?.paint).toMatchObject({
+      "fill-extrusion-base": ["interpolate", ["linear"], ["zoom"], 13.75, 0, 14, ["coalesce", ["get", "render_min_height"], 0]],
+      "fill-extrusion-height": ["interpolate", ["linear"], ["zoom"], 13.75, 0, 14, ["coalesce", ["get", "render_height"], 3]],
+      "fill-extrusion-opacity": ["interpolate", ["linear"], ["zoom"], 13.75, 0, 14, 0.78],
+    });
   });
 
   it("uses the exact linked attribution and supports a source override", () => {
