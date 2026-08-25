@@ -205,7 +205,7 @@ input:focus-visible {
 .brand-lockup.is-expanded .brand-copy,
 .brand-button:focus-visible .brand-copy {
   width: min(23rem, calc(100vw - 5rem));
-  margin-left: .55rem;
+  margin-left: 1.2rem;
   opacity: 1;
   transform: translateX(0);
 }
@@ -518,7 +518,7 @@ label input[type="checkbox"] {
   .brand-lockup.is-expanded .brand-copy,
   .brand-button:focus-visible .brand-copy {
     width: min(17.5rem, calc(100vw - 4.8rem));
-    margin-left: .45rem;
+    margin-left: 1.05rem;
   }
 
   .brand-copy strong { font-size: .82rem; }
