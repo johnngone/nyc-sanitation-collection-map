@@ -714,32 +714,18 @@ label input[type="checkbox"] {
   }
 
   .sheet-toggle-core-guidance {
-    width: min(17rem, calc(100% - 2rem));
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr);
+    width: min(18rem, calc(100% - 1rem));
+    display: flex;
     align-items: center;
-    gap: .55rem;
-  }
-
-  .sheet-toggle-direction {
-    min-width: 0;
-    display: grid;
-    justify-items: center;
-    gap: .05rem;
-    line-height: 1;
+    justify-content: center;
+    gap: .2rem;
     white-space: nowrap;
+    font-size: .73rem;
   }
 
-  .sheet-direction-arrow {
-    color: #73808a;
-    font-size: .8rem;
-    line-height: .75;
-  }
-
-  .sheet-toggle-divider {
-    width: 1px;
-    height: 22px;
-    background: #d5dbe0;
+  .sheet-toggle-core-guidance .sheet-chevron {
+    width: 16px;
+    height: 16px;
   }
 
   .sheet-grabber {
@@ -765,6 +751,7 @@ label input[type="checkbox"] {
   }
 
   .map-overlay.is-minimized .sheet-chevron { transform: rotate(180deg); }
+  .sheet-chevron-up { transform: rotate(180deg); }
 
   .sheet-content {
     max-height: calc(min(72dvh, 620px) - var(--mobile-sheet-peek));

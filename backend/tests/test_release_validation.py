@@ -658,6 +658,43 @@ def test_tileset_validation_rejects_corrupt_gzip_payload(tmp_path) -> None:
         validate_tileset(tileset)
 
 
+def test_tileset_validation_rejects_declared_limits_above_release_ceiling(tmp_path) -> None:
+    bundle = _bundle(tmp_path, "release-oversize-declaration")
+    tileset = bundle / "collection_streets.mbtiles"
+    limits = {
+        "max_compressed_tile_bytes": release_validation.MAX_RELEASE_COMPRESSED_TILE_BYTES + 1,
+        "max_uncompressed_tile_bytes": release_validation.MAX_RELEASE_UNCOMPRESSED_TILE_BYTES,
+    }
+    with sqlite3.connect(tileset) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE name = 'tile_size_limits'",
+            (json.dumps(limits, sort_keys=True, separators=(",", ":")),),
+        )
+
+    with pytest.raises(RuntimeError, match="above the release safety budget"):
+        validate_tileset(tileset)
+
+
+def test_tileset_validation_rejects_tile_above_declared_compressed_limit(tmp_path) -> None:
+    bundle = _bundle(tmp_path, "release-oversize-payload")
+    tileset = bundle / "collection_streets.mbtiles"
+    with sqlite3.connect(tileset) as connection:
+        compressed_size = connection.execute(
+            "SELECT MAX(LENGTH(tile_data)) FROM tiles"
+        ).fetchone()[0]
+        limits = {
+            "max_compressed_tile_bytes": compressed_size - 1,
+            "max_uncompressed_tile_bytes": release_validation.MAX_RELEASE_UNCOMPRESSED_TILE_BYTES,
+        }
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE name = 'tile_size_limits'",
+            (json.dumps(limits, sort_keys=True, separators=(",", ":")),),
+        )
+
+    with pytest.raises(RuntimeError, match="compressed tile exceeds its declared limit"):
+        validate_tileset(tileset)
+
+
 def test_tileset_validation_rejects_wrong_vector_layer_schema(tmp_path) -> None:
     bundle = _bundle(tmp_path, "release-schema")
     tileset = bundle / "collection_streets.mbtiles"

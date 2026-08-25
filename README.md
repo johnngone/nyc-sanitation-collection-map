@@ -1,6 +1,6 @@
 # NYC Sanitation Collection Map
 
-Map NYC sanitation collection schedules by street. Pick a day and filter Refuse Recycling Organics or Bulk trash. The map also supports live browser location tracking. Run the whole app as one Docker container.
+Map NYC sanitation collection schedules by street. Pick a day and filter by refuse, recycling, organics, or bulk trash. The map also supports live browser location tracking. Hostable as a standalone Docker container.
 
 ## Quick start
 

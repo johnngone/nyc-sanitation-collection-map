@@ -222,6 +222,11 @@ def _committed_refresh(tmp_path, processing: dict[str, object]):
 
 
 def test_processing_fingerprint_changes_with_generation_configuration() -> None:
+    zoom_11 = processing_fingerprint(
+        tile_minzoom=11,
+        tile_maxzoom=16,
+        side_offset_feet=25.0,
+    )
     zoom_16 = processing_fingerprint(
         tile_minzoom=12,
         tile_maxzoom=16,
@@ -233,7 +238,9 @@ def test_processing_fingerprint_changes_with_generation_configuration() -> None:
         side_offset_feet=25.0,
     )
 
+    assert zoom_11["sha256"] != zoom_16["sha256"]
     assert zoom_16["sha256"] != zoom_17["sha256"]
+    assert zoom_11["inputs"]["configuration"]["tile_minzoom"] == 11
     assert zoom_16["inputs"]["configuration"]["tile_maxzoom"] == 16
 
 

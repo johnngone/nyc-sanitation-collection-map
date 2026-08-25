@@ -12,7 +12,10 @@ from app import api
 from app.database import initialize
 from app.main import app
 from scripts.build_tiles import (
+    DEFAULT_MAX_COMPRESSED_TILE_BYTES,
+    DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES,
     DEFAULT_MAX_ZOOM,
+    DEFAULT_MIN_ZOOM,
     _tile_geometry_with_source_fallback,
     build_tiles,
 )
@@ -503,7 +506,20 @@ def test_builder_rejects_buffer_smaller_than_frontend_style_reach(tmp_path) -> N
         )
 
 
-def test_builder_rejects_raising_hard_tile_size_ceilings(tmp_path) -> None:
+def test_builder_defaults_cover_zoom_11_with_reviewed_tile_size_ceilings() -> None:
+    assert DEFAULT_MIN_ZOOM == 11
+    assert DEFAULT_MAX_COMPRESSED_TILE_BYTES == 1_572_864
+    assert DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES == 6_291_456
+
+
+@pytest.mark.parametrize(
+    "limit_arguments",
+    [
+        {"max_compressed_tile_bytes": 1_572_865},
+        {"max_uncompressed_tile_bytes": 6_291_457},
+    ],
+)
+def test_builder_rejects_raising_hard_tile_size_ceilings(tmp_path, limit_arguments) -> None:
     database = tmp_path / "app.sqlite3"
     _source_database(database)
 
@@ -513,7 +529,7 @@ def test_builder_rejects_raising_hard_tile_size_ceilings(tmp_path) -> None:
             tmp_path / "collection.mbtiles",
             minzoom=11,
             maxzoom=11,
-            max_compressed_tile_bytes=512_001,
+            **limit_arguments,
         )
 
 

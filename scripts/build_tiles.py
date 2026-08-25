@@ -40,15 +40,15 @@ SOURCE_LAYER = "collection_streets"
 UNKNOWN_SOURCE_LAYER = "collection_unknowns"
 UNKNOWN_MIN_ZOOM = 14
 TILE_SCHEMA_REVISION = 4
-DEFAULT_MIN_ZOOM = 12
+DEFAULT_MIN_ZOOM = 11
 DEFAULT_MAX_ZOOM = 16
 DEFAULT_BUFFER_PIXELS = 16.0
 # The frontend's widest styled line is offset 9 px with a 5 px stroke.  Keep
 # enough geometry outside each tile for that stroke (plus antialiasing/joins)
 # to render across tile seams.
 MIN_RENDER_BUFFER_PIXELS = 16.0
-DEFAULT_MAX_COMPRESSED_TILE_BYTES = 500 * 1024
-DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES = 5 * 1024 * 1024
+DEFAULT_MAX_COMPRESSED_TILE_BYTES = 1536 * 1024
+DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES = 6 * 1024 * 1024
 MVT_EXTENT = 4096
 WEB_MERCATOR_HALF_WORLD = 20_037_508.342789244
 WEB_MERCATOR_LATITUDE_LIMIT = 85.05112878
@@ -1245,7 +1245,10 @@ def main() -> None:
         default=int(
             os.getenv("TILE_MAX_COMPRESSED_BYTES", str(DEFAULT_MAX_COMPRESSED_TILE_BYTES))
         ),
-        help="Fail before publication at this size; may be lowered but not raised above 512000",
+        help=(
+            "Fail before publication at this size; may be lowered but not raised above "
+            f"{DEFAULT_MAX_COMPRESSED_TILE_BYTES}"
+        ),
     )
     parser.add_argument(
         "--max-uncompressed-tile-bytes",
@@ -1253,7 +1256,10 @@ def main() -> None:
         default=int(
             os.getenv("TILE_MAX_UNCOMPRESSED_BYTES", str(DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES))
         ),
-        help="Fail before publication at this size; may be lowered but not raised above 5242880",
+        help=(
+            "Fail before publication at this size; may be lowered but not raised above "
+            f"{DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES}"
+        ),
     )
     parser.add_argument("--metadata-output", type=Path, help="Optional JSON build-report sidecar")
     args = parser.parse_args()

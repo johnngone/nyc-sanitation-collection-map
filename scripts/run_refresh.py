@@ -105,11 +105,11 @@ def processing_fingerprint(
     repository = Path(__file__).resolve().parents[1]
     if tile_max_compressed_bytes is None:
         tile_max_compressed_bytes = int(
-            os.getenv("TILE_MAX_COMPRESSED_BYTES", "512000")
+            os.getenv("TILE_MAX_COMPRESSED_BYTES", "1572864")
         )
     if tile_max_uncompressed_bytes is None:
         tile_max_uncompressed_bytes = int(
-            os.getenv("TILE_MAX_UNCOMPRESSED_BYTES", "5242880")
+            os.getenv("TILE_MAX_UNCOMPRESSED_BYTES", "6291456")
         )
     code_sha256 = {
         relative: file_sha256(repository / relative)
@@ -720,7 +720,7 @@ def main() -> None:
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--allow-large-run", action="store_true")
     parser.add_argument("--manifest", type=Path, default=Path(os.getenv("DATA_MANIFEST_PATH", "data/data_manifest.json")))
-    parser.add_argument("--tile-minzoom", type=int, default=int(os.getenv("TILE_MIN_ZOOM", "12")))
+    parser.add_argument("--tile-minzoom", type=int, default=int(os.getenv("TILE_MIN_ZOOM", "11")))
     parser.add_argument("--tile-maxzoom", type=int, default=int(os.getenv("TILE_MAX_ZOOM", "16")))
     parser.add_argument("--side-offset-feet", type=float, default=25.0)
     parser.add_argument(

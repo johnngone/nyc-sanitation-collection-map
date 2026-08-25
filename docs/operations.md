@@ -23,7 +23,7 @@ FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not en
 
 ## Vector-tile contract
 
-The default v4 archive is an MBTiles SQLite file covering zooms 12–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 14–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 14. The runtime continues to read retained v2 and v3 releases during rollout.
+The default v4 archive is an MBTiles SQLite file covering zooms 11–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 14–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 14. The runtime continues to read retained v2 and v3 releases during rollout.
 
 | Property | Meaning |
 |---|---|
@@ -50,8 +50,8 @@ MapLibre fetches the current contract from `/api/map-config`, then requests only
 
 Each build fails before publication if any tile exceeds either default ceiling:
 
-- compressed PBF: 500 KiB;
-- uncompressed PBF: 5 MiB.
+- compressed PBF: 1.5 MiB;
+- uncompressed PBF: 6 MiB.
 
 The `TILE_MAX_COMPRESSED_BYTES` and `TILE_MAX_UNCOMPRESSED_BYTES` settings (and equivalent `scripts/build_tiles.py` flags) may lower these gates for stricter deployments. They cannot raise the hard release ceilings; increasing those requires a reviewed code change so an environment typo cannot silently trade away download/decode latency.
 
