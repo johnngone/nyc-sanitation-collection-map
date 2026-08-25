@@ -12,6 +12,9 @@ def test_health(tmp_path, monkeypatch) -> None:
     response = TestClient(app).get("/api/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.headers["permissions-policy"] == (
+        "geolocation=(self), accelerometer=(self), gyroscope=(self), magnetometer=(self)"
+    )
 
 
 def test_api_routes_are_before_frontend_catch_all() -> None:

@@ -6,7 +6,7 @@ export const CAMERA_TOLERANCE_DEGREES = 1;
 export const EXTRUSION_DETAIL_ZOOM = 14;
 export const MAP_INTERACTION_OPTIONS = {
   maxZoom: 18,
-  maxPitch: 45,
+  maxPitch: 50,
   dragRotate: true,
   touchZoomRotate: true,
   touchPitch: true,
@@ -103,7 +103,7 @@ export class MapViewControl implements IControl {
 
     this.compassButton = document.createElement("button");
     this.compassButton.type = "button";
-    this.compassButton.className = "maplibregl-ctrl-compass map-view-compass";
+    this.compassButton.className = "map-view-compass";
     this.compassButton.title = "Return to north and flat map";
     this.compassButton.setAttribute("aria-label", "Return to north and flat map");
     this.compassIcon = document.createElement("span");

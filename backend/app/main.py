@@ -17,6 +17,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+SENSOR_PERMISSIONS_POLICY = (
+    "geolocation=(self), accelerometer=(self), gyroscope=(self), magnetometer=(self)"
+)
 
 
 class FrontendStaticFiles(StaticFiles):
@@ -41,6 +44,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="NYC Sanitation Map API", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def add_sensor_permissions_policy(request, call_next):
+    response = await call_next(request)
+    response.headers["Permissions-Policy"] = SENSOR_PERMISSIONS_POLICY
+    return response
+
+
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.add_middleware(
     CORSMiddleware,

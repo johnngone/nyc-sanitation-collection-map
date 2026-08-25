@@ -5,6 +5,7 @@ import { resolveApiUrl } from "./apiUrl";
 import { createBasemapStyle, DEFAULT_BASEMAP_TILEJSON_URL } from "./basemap";
 import { MAP_INTERACTION_OPTIONS, MapViewControl } from "./mapView";
 import { classifySheetGesture } from "./sheetGesture";
+import { UserLocationControl } from "./userLocation";
 
 const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
 type Weekday = (typeof weekdays)[number];
@@ -196,8 +197,10 @@ export function App() {
     });
     mapRef.current = map;
     const viewControl = new MapViewControl();
+    const userLocationControl = new UserLocationControl();
     map.addControl(new maplibregl.AttributionControl({ compact: false }), "bottom-right");
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    map.addControl(userLocationControl, "top-right");
     map.addControl(viewControl, "top-right");
 
     map.once("style.load", () => {

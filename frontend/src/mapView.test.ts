@@ -6,7 +6,7 @@ describe("map interactions", () => {
   it("enables desktop and touch rotation and pitch without camera roll", () => {
     expect(MAP_INTERACTION_OPTIONS).toEqual({
       maxZoom: 18,
-      maxPitch: 45,
+      maxPitch: 50,
       dragRotate: true,
       touchZoomRotate: true,
       touchPitch: true,

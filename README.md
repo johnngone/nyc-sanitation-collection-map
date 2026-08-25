@@ -23,6 +23,8 @@ docker compose logs -f app
 
 Open `http://SERVER-IP:8080`. `APP_HOST_PORT` changes the browser-facing port only; the container remains on port `8000`.
 
+The optional in-browser location marker requires a secure browser context. Put LAN deployments behind an HTTPS reverse proxy; browsers permit geolocation on plain HTTP only for literal `localhost`. Precise coordinates, accuracy, and heading remain in browser memory and are never sent to this application's API, stored, logged, or added to URLs. Recentring can still cause normal tile requests for the visible neighborhood, just as manually panning the map does.
+
 Compose starts one `app` service, mounting `./data:/app/data`. It serves the site and API and performs a full refresh on first startup, then repeats every 14 days by default. The basemap appears before the first dataset is ready; the collection layer becomes available automatically once the background refresh has promoted its validated release. A citywide refresh is CPU-, memory-, disk-, and network-intensive, so follow the app log until it reports a promoted dataset version.
 
 The bundled basemap style uses OpenMapTiles-compatible vector tiles from OpenFreeMap. `VITE_BASEMAP_TILEJSON_URL` can select another compatible TileJSON endpoint when building the frontend or container. This is a build-time setting, so changing it requires rebuilding the image. OpenFreeMap's public service is provided without an SLA; a basemap request failure does not prevent the locally served sanitation overlay from initializing.
