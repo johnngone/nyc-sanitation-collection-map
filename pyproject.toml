@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "nyc-sanitation-map"
 version = "0.1.0"
 description = "NYC residential refuse collection map"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",

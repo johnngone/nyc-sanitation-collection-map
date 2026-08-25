@@ -43,7 +43,12 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="NYC Sanitation Map API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="NYC Sanitation Map API",
+    version="0.1.0",
+    license_info={"name": "MIT License", "identifier": "MIT"},
+    lifespan=lifespan,
+)
 
 
 @app.middleware("http")

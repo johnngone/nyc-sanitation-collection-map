@@ -359,8 +359,28 @@ input:focus-visible {
 .sheet-content {
   display: flex;
   flex-direction: column;
-  gap: .85rem;
+  gap: 0;
   padding: 1rem;
+}
+
+.core-controls,
+.advanced-controls-inner {
+  display: flex;
+  flex-direction: column;
+  gap: .85rem;
+}
+
+.advanced-controls {
+  display: grid;
+  grid-template-rows: 1fr;
+  min-height: 0;
+  margin-top: .85rem;
+  opacity: 1;
+}
+
+.advanced-controls-inner {
+  min-height: 0;
+  overflow: hidden;
 }
 
 .info-button {
@@ -480,14 +500,25 @@ label input[type="checkbox"] {
   );
 }
 
+.status-summary-card {
+  position: relative;
+  border-radius: 12px;
+  background: rgba(238, 242, 245, .78);
+}
+
+.status-summary-card > .info-button {
+  position: absolute;
+  z-index: 1;
+  top: .45rem;
+  right: .45rem;
+}
+
 .status-summary {
   display: flex;
   flex-direction: column;
   gap: .5rem;
   margin: 0;
-  padding: .75rem;
-  border-radius: 12px;
-  background: rgba(238, 242, 245, .78);
+  padding: .75rem calc(.75rem + 2.35rem) .75rem .75rem;
 }
 
 .status-summary > div {
@@ -509,17 +540,6 @@ label input[type="checkbox"] {
   margin: 0;
   color: #283641;
   overflow-wrap: anywhere;
-}
-
-.status-updated dd {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: .55rem;
-}
-
-.status-updated .info-button {
-  margin: -.3rem -.3rem -.3rem 0;
 }
 
 .status-dot {
@@ -662,7 +682,7 @@ label input[type="checkbox"] {
     transition: transform 340ms cubic-bezier(.22, 1, .36, 1);
   }
 
-  .map-overlay.is-collapsed {
+  .map-overlay.is-minimized {
     transform: translateY(calc(100% - var(--mobile-sheet-peek) - env(safe-area-inset-bottom)));
   }
 
@@ -686,6 +706,20 @@ label input[type="checkbox"] {
 
   .sheet-toggle:hover { background: transparent; }
 
+  .sheet-toggle-copy {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    line-height: 1.15;
+  }
+
+  .sheet-toggle-hint {
+    margin-top: .12rem;
+    color: #7a8790;
+    font-size: .66rem;
+    font-weight: 500;
+  }
+
   .sheet-grabber {
     width: 38px;
     height: 5px;
@@ -708,7 +742,8 @@ label input[type="checkbox"] {
     transition: transform 260ms cubic-bezier(.22, 1, .36, 1);
   }
 
-  .map-overlay.is-collapsed .sheet-chevron { transform: rotate(180deg); }
+  .map-overlay.is-minimized .sheet-chevron,
+  .map-overlay.is-core .sheet-chevron { transform: rotate(180deg); }
 
   .sheet-content {
     max-height: calc(min(72dvh, 620px) - var(--mobile-sheet-peek));
@@ -716,11 +751,29 @@ label input[type="checkbox"] {
     overscroll-behavior: contain;
     touch-action: pan-down;
     padding: .2rem 1rem calc(1rem + env(safe-area-inset-bottom));
-    gap: 1rem;
     transition: opacity 160ms ease;
   }
 
-  .map-overlay.is-collapsed .sheet-content {
+  .core-controls,
+  .advanced-controls-inner { gap: 1rem; }
+
+  .advanced-controls {
+    margin-top: 1rem;
+    transition:
+      grid-template-rows 260ms cubic-bezier(.22, 1, .36, 1),
+      margin-top 260ms cubic-bezier(.22, 1, .36, 1),
+      opacity 160ms ease;
+  }
+
+  .map-overlay.is-core .advanced-controls,
+  .map-overlay.is-minimized .advanced-controls {
+    grid-template-rows: 0fr;
+    margin-top: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .map-overlay.is-minimized .sheet-content {
     opacity: 0;
     pointer-events: none;
   }
@@ -747,9 +800,9 @@ label input[type="checkbox"] {
     flex-basis: 20px;
   }
 
-  .status-summary { gap: .6rem; padding: .85rem; }
+  .status-summary { gap: .6rem; padding: .85rem calc(.85rem + 3.15rem) .85rem .85rem; }
   .status-summary > div { font-size: .8rem; }
-  .status-updated .info-button { margin: -.55rem -.55rem -.55rem 0; }
+  .status-summary-card > .info-button { top: .45rem; right: .45rem; }
 
   .maplibregl-ctrl-top-right {
     top: max(.15rem, env(safe-area-inset-top));
@@ -766,7 +819,8 @@ label input[type="checkbox"] {
     transition: bottom 340ms cubic-bezier(.22, 1, .36, 1);
   }
 
-  .app-shell.mobile-sheet-open .maplibregl-ctrl-bottom-right {
+  .app-shell.mobile-sheet-core .maplibregl-ctrl-bottom-right,
+  .app-shell.mobile-sheet-full .maplibregl-ctrl-bottom-right {
     bottom: calc(var(--mobile-sheet-height) + .5rem);
   }
 

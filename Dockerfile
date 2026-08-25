@@ -12,7 +12,9 @@ RUN npm run build
 # Run FastAPI and serve the compiled frontend from the same container.
 FROM python:3.11-slim
 WORKDIR /app
-COPY pyproject.toml README.md ./
+LABEL org.opencontainers.image.source="https://github.com/johnngone/nyc-sanitation-collection-map"
+LABEL org.opencontainers.image.licenses="MIT"
+COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./
 COPY backend ./backend
 COPY scripts ./scripts
 COPY --from=frontend-build /app/frontend/dist ./frontend-dist

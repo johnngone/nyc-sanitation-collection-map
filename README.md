@@ -1,89 +1,104 @@
 # NYC Sanitation Collection Map
 
-An interactive map of NYC refuse, recycling, organics, and bulk collection schedules. The browser now loads small vector tiles for the visible area instead of downloading a citywide GeoJSON response.
+Map NYC sanitation collection schedules by street. Pick a day and filter Refuse Recycling Organics or Bulk trash. The map also supports live browser location tracking. Run the whole app as one Docker container.
 
-The production image is a standalone container: it serves the compiled React/MapLibre frontend and FastAPI API on port `8000`, while a background process in that same container downloads, audits, and publishes the data release to its persistent volume.
+## Quick start
 
-## Why the map loads quickly
-
-- The MBTiles archive contains one vector feature per stored block face. Its four schedule fields are comma-separated weekday codes, so geometry is not repeated for every day or collection type.
-- Geometry is clipped and simplified by zoom (`12` through `16` by default), and each PBF tile is gzip-compressed.
-- MapLibre requests only the tiles needed for the current view and filters day/type in the browser.
-- Tile URLs include the immutable dataset version. Successful responses use a one-year immutable cache policy and an `ETag`.
-
-See [architecture and operations](docs/operations.md) for the tile schema, release layout, validation gates, and rollback procedure. See [data sources and completeness](docs/data-sources.md) for the source-to-map audit contract.
-
-## Deploy with Docker Compose
+Pull the published GHCR image and mount a persistent data directory. The container listens on port `8000`. Set `HOST_PORT` to the port people will use in their browser.
 
 ```bash
-cp .env.example .env
+HOST_PORT=8080
+DATA_DIR=/opt/nyc-sanitation-map/data
+IMAGE=ghcr.io/johnngone/nyc-sanitation-collection-map:latest
+
+mkdir -p "$DATA_DIR"
+docker pull "$IMAGE"
+docker run -d \
+  --name nyc-sanitation-map \
+  --restart unless-stopped \
+  -p "${HOST_PORT}:8000" \
+  -v "${DATA_DIR}:/app/data" \
+  -e DATA_REFRESH_ON_STARTUP=true \
+  "$IMAGE"
+```
+
+Open `http://SERVER-IP:8080`. Replace `8080` with your `HOST_PORT` value.
+
+The first refresh downloads the source data and builds the map release. The basemap loads before that work is done. Street schedules appear after the release passes validation.
+
+Use a commit SHA tag instead of `latest` when you want a pinned deployment. Published images use the form `ghcr.io/johnngone/nyc-sanitation-collection-map:<commit-sha>`.
+
+## HTTPS and location tracking
+
+Live location tracking requires HTTPS. `http://localhost` also works for local use. Put a public or LAN deployment behind an HTTPS reverse proxy and allow the browser location permission.
+
+The browser keeps location coordinates in memory. The app does not send them to its API or store them in the data volume.
+
+## Deployment settings
+
+The Docker image refreshes data on startup and every 14 days. Set these environment variables on `docker run` or in Docker Compose when you need different behavior.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `DATA_REFRESH_ON_STARTUP` | `true` | Start a refresh when the container starts |
+| `DATA_REFRESH_ENABLED` | `true` | Run the background refresh scheduler |
+| `DATA_REFRESH_INTERVAL_DAYS` | `14` | Days between scheduled refreshes |
+| `DATA_RELEASE_RETENTION` | `2` | Validated releases kept on the data volume |
+| `HEALTH_SYNC_HASH_MAX_BYTES` | `16777216` | Artifact bytes checked during a health request before validation continues in the background |
+| `VITE_BASEMAP_TILEJSON_URL` | OpenFreeMap | Basemap TileJSON URL used while building the image |
+
+`VITE_BASEMAP_TILEJSON_URL` is a build setting. Rebuild the image after changing it. The remaining settings apply when the container starts.
+
+For a source build with Docker Compose copy `.env.example` to `.env`. Set `APP_HOST_PORT` in `.env` then run:
+
+```bash
 docker compose up -d --build
 docker compose logs -f app
 ```
 
-Open `http://SERVER-IP:8080`. `APP_HOST_PORT` changes the browser-facing port only; the container remains on port `8000`.
+Compose mounts `./data` at `/app/data`.
 
-The optional in-browser location marker requires a secure browser context. Put LAN deployments behind an HTTPS reverse proxy; browsers permit geolocation on plain HTTP only for literal `localhost`. Precise coordinates, accuracy, and heading remain in browser memory and are never sent to this application's API, stored, logged, or added to URLs. Recentring can still cause normal tile requests for the visible neighborhood, just as manually panning the map does.
+## Documentation
 
-Compose starts one `app` service, mounting `./data:/app/data`. It serves the site and API and performs a full refresh on first startup, then repeats every 14 days by default. The basemap appears before the first dataset is ready; the collection layer becomes available automatically once the background refresh has promoted its validated release. A citywide refresh is CPU-, memory-, disk-, and network-intensive, so follow the app log until it reports a promoted dataset version.
+- [Deployment and release operations](docs/operations.md) covers refreshes release checks rollback and tile limits.
+- [Data sources and completeness](docs/data-sources.md) covers DSNY frequencies DCP LION validation and limits on map interpretation.
+- [Build process and release checks](docs/operations.md#refresh-gates) lists the gates that run before a release becomes live.
+- [Map architecture](docs/operations.md#runtime-data-path) shows the path from source downloads to vector tiles in the browser.
+- [Backend architecture](docs/operations.md#runtime-data-path) covers the FastAPI service and its release data path.
+- [Frontend map design](docs/operations.md#vector-tile-contract) covers MapLibre viewport requests and browser caching.
+- [DSNY address lookup investigation](docs/dsny-lookup.md) documents the separate research utility. The production refresh does not call the address lookup page.
 
-The bundled basemap style uses OpenMapTiles-compatible vector tiles from OpenFreeMap. `VITE_BASEMAP_TILEJSON_URL` can select another compatible TileJSON endpoint when building the frontend or container. This is a build-time setting, so changing it requires rebuilding the image. OpenFreeMap's public service is provided without an SLA; a basemap request failure does not prevent the locally served sanitation overlay from initializing.
+## API
 
-Useful commands:
+| Endpoint | Use |
+| --- | --- |
+| `GET /api/health` | Release status record counts and artifact checks |
+| `GET /api/map-config` | Current vector tile URL and map availability |
+| `GET /api/tiles/{version}/{z}/{x}/{y}.pbf` | Gzip vector tiles used by the map |
+| `GET /api/refuse-streets?day=MON&types=REFUSE` | Legacy GeoJSON query limited to 20000 features |
 
-```bash
-docker compose ps
-docker compose logs -f app
-curl http://127.0.0.1:8080/api/health
-docker compose down
-```
+The frontend uses `/api/map-config` and vector tiles. Keep `/api/refuse-streets` for compatibility or diagnostics.
 
-Set `DATA_REFRESH_ON_STARTUP=false` after the first run if recreating the container should wait until the next interval. Set `DATA_REFRESH_ENABLED=false` to stop scheduled refreshes entirely. Failed refreshes retain the current release and retry after `DATA_REFRESH_FAILURE_RETRY_MINUTES` (30 minutes by default), rather than waiting for the normal 14-day interval.
+## Troubleshooting
 
-## Deploy the published GHCR images
+| Problem | Check |
+| --- | --- |
+| Basemap loads but street schedules do not | Run `curl http://127.0.0.1:8080/api/health` and inspect `docker logs nyc-sanitation-map` |
+| Health returns `503` while checksums are verifying | Keep polling. The app checks each committed database and tileset before serving it |
+| Location button is unavailable | Use HTTPS or `localhost` and grant browser location permission |
+| Docker reports that the port is allocated | Change `HOST_PORT` such as `9090` |
+| The first refresh cannot publish data | Confirm the mounted data directory is writable and inspect the container log |
 
-The image does not contain a citywide dataset. Choose one published commit SHA and run one standalone container:
+## Local development
 
-```bash
-RELEASE_SHA=<published-commit-sha>
-mkdir -p /opt/nyc-sanitation-map/data
-docker pull ghcr.io/johnngone/nyc-sanitation-collection-map:${RELEASE_SHA}
-
-docker run -d --name nyc-sanitation-map --restart unless-stopped \
-  -p 8080:8000 \
-  -v /opt/nyc-sanitation-map/data:/app/data \
-  -e DATA_REFRESH_ON_STARTUP=true \
-  -e DATA_REFRESH_INTERVAL_DAYS=14 \
-  ghcr.io/johnngone/nyc-sanitation-collection-map:${RELEASE_SHA}
-```
-
-The publish workflow builds and smoke-tests the image before publishing its immutable `<sha>` tag, then advances the convenience `latest` tag in a serialized job. Prefer a commit SHA for deployments.
-
-For unRAID, create one web container from `:<sha>` with container port `8000` and map a persistent host folder to `/app/data`. The container runs the web service and refresh process together. The moving `:latest` tag is available when commit pinning is impractical.
-
-## Migrate an existing DB-only volume
-
-Back up the existing data directory, leave its `app.sqlite3` in place, and deploy the new standalone container against that same directory. It can still inspect the legacy database while its background refresh builds the first complete release. When validation succeeds, it adds `releases/<dataset-version>/` and atomically writes `data_manifest.json`; subsequent requests use the paired database and tileset from that release. The old root-level database is not silently converted or overwritten and can remain until the new release has been verified.
-
-Allow room for the temporary build and at least two retained releases. Confirm migration with:
+Install the backend dependencies and start FastAPI from the repository root.
 
 ```bash
-curl http://SERVER-IP:8080/api/health
-docker logs nyc-sanitation-map
-```
-
-`dataset_version` should be non-null and `map_available` should be `true`.
-
-## Local development and refresh
-
-From the repository root:
-
-```bash
-python -m pip install -e ".[refresh,test]"
+python -m pip install -e ".[refresh]"
 python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-In another terminal:
+Start the frontend in another terminal.
 
 ```bash
 cd frontend
@@ -91,34 +106,12 @@ npm ci
 npm run dev
 ```
 
-Local Vite commands read `VITE_BASEMAP_TILEJSON_URL` from the repository-root `.env` file when present. The default OpenFreeMap endpoint is used when it is omitted.
+Use `python scripts/run_refresh.py --allow-large-run` to build a local dataset from the official sources. Run `python scripts/run_refresh.py --status` to inspect the current release.
 
-Build and publish a complete local dataset from the official sources:
+## License
 
-```bash
-python scripts/run_refresh.py --allow-large-run
-python scripts/run_refresh.py --status
-```
+The project code is licensed under the [MIT License](LICENSE). Third-party data and assets retain their own terms.
 
-The guard flag makes a costly citywide run explicit. Nothing is promoted unless source, ingestion, database, tile, checksum, count-regression, and bundle checks all pass.
+This map derives street schedules from NYC Department of Sanitation frequency data and NYC Department of City Planning LION street centerlines. Use the official [DSNY collection schedule lookup](https://www.nyc.gov/assets/dsny/site/collection-schedule-lookup) for an address-specific answer.
 
-## Tests
-
-```bash
-python -m pytest
-cd frontend && npm ci && npm run build
-docker build -f Dockerfile -t nyc-sanitation-map:test .
-```
-
-## API and troubleshooting
-
-- `/api/health` reports the committed version, record counts, quality summary, artifact-integrity state, and whether the map archive exists.
-- `/api/map-config` reports the current versioned vector-tile URL. An unavailable response during first initialization is expected.
-- `/api/tiles/{version}/{z}/{x}/{y}.pbf` serves cached gzip PBF tiles.
-- `/api/refuse-streets` is retained for compatibility, but responses are capped at 20,000 features. A broad request returns HTTP `413`; use a smaller bounding box or vector tiles.
-
-If the basemap loads but collection lines do not, inspect `/api/health` and the container log. A `503` whose detail says checksums are `verifying` is transient; keep polling. Any `invalid` result is a fail-closed integrity error. `HEALTH_SYNC_HASH_MAX_BYTES` controls which small releases are hashed inline (16 MiB by default); it never disables verification. A failed refresh leaves the current committed release live. Volume permission errors prevent the container from creating its temporary build or atomic manifest. Restore the volume backup or activate a retained release as described in [operations](docs/operations.md) if a manifest or committed artifact is invalid. For `port already allocated`, change only the host side, for example `9090:8000`.
-
-Official source attribution: NYC Department of Sanitation and NYC Department of City Planning. This visualization is not a substitute for the official [DSNY collection schedule lookup](https://www.nyc.gov/assets/dsny/site/collection-schedule-lookup).
-
-Basemap attribution: [© OpenMapTiles](https://openmaptiles.org/) Data from [OpenStreetMap](https://www.openstreetmap.org/copyright). See [third-party notices](THIRD_PARTY_NOTICES.md) for the style, tile, data, and font licenses.
+Basemap data comes from [OpenMapTiles](https://openmaptiles.org/) and [OpenStreetMap](https://www.openstreetmap.org/copyright). See [third-party notices](THIRD_PARTY_NOTICES.md) for licenses.

@@ -4,7 +4,13 @@ import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 import { resolveApiUrl } from "./apiUrl";
 import { createBasemapStyle, DEFAULT_BASEMAP_TILEJSON_URL } from "./basemap";
 import { MAP_INTERACTION_OPTIONS, MapViewControl } from "./mapView";
-import { classifySheetGesture } from "./sheetGesture";
+import {
+  classifySheetGesture,
+  sheetStateAfterGesture,
+  sheetStateAfterGripTap,
+  type ExpandedSheetState,
+  type MobileSheetState,
+} from "./sheetGesture";
 import { UserLocationControl } from "./userLocation";
 
 const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
@@ -72,11 +78,13 @@ export function App() {
   const mapRef = useRef<MapLibreMap | null>(null);
   const mapOverlayRef = useRef<HTMLElement>(null);
   const sheetContentRef = useRef<HTMLDivElement>(null);
+  const advancedControlsRef = useRef<HTMLDivElement>(null);
   const infoButtonRef = useRef<HTMLButtonElement>(null);
   const modalCloseRef = useRef<HTMLButtonElement>(null);
   const sheetGestureStartYRef = useRef<number | null>(null);
   const sheetGesturePointerIdRef = useRef<number | null>(null);
   const sheetGestureHandledRef = useRef(false);
+  const lastExpandedSheetStateRef = useRef<ExpandedSheetState>("core");
   const selectedDayRef = useRef<Weekday>(dayFromCode(new URLSearchParams(window.location.search).get("day")));
   const selectedTypesRef = useRef<CollectionType[]>(["REFUSE"]);
   const showCoverageGapsRef = useRef(true);
@@ -93,7 +101,7 @@ export function App() {
   const [showCoverageGaps, setShowCoverageGaps] = useState(true);
   const [showInsufficientAddress, setShowInsufficientAddress] = useState(true);
   const [unknownLayerAvailable, setUnknownLayerAvailable] = useState(false);
-  const [mobileSheetOpen, setMobileSheetOpen] = useState(true);
+  const [mobileSheetState, setMobileSheetState] = useState<MobileSheetState>("core");
   const [brandExpanded, setBrandExpanded] = useState(false);
   const [isMobileViewport, setIsMobileViewport] = useState(
     () => window.matchMedia(mobileControlsMediaQuery).matches,
@@ -109,9 +117,13 @@ export function App() {
   useEffect(() => {
     const content = sheetContentRef.current;
     if (!content) return;
-    if (isMobileViewport && !mobileSheetOpen) content.setAttribute("inert", "");
+    if (isMobileViewport && mobileSheetState === "minimized") content.setAttribute("inert", "");
     else content.removeAttribute("inert");
-  }, [isMobileViewport, mobileSheetOpen]);
+    const advancedControls = advancedControlsRef.current;
+    if (!advancedControls) return;
+    if (isMobileViewport && mobileSheetState !== "full") advancedControls.setAttribute("inert", "");
+    else advancedControls.removeAttribute("inert");
+  }, [isMobileViewport, mobileSheetState]);
 
   useEffect(() => {
     const shell = appShellRef.current;
@@ -493,7 +505,11 @@ export function App() {
     const gesture = classifySheetGesture(startY, event.clientY);
     if (!gesture) return;
     sheetGestureHandledRef.current = true;
-    setMobileSheetOpen(gesture === "expand");
+    setMobileSheetState((current) => {
+      const next = sheetStateAfterGesture(current, gesture);
+      if (next !== "minimized") lastExpandedSheetStateRef.current = next;
+      return next;
+    });
   }
 
   function cancelSheetGesture() {
@@ -514,7 +530,10 @@ export function App() {
       sheetGestureHandledRef.current = false;
       return;
     }
-    setMobileSheetOpen((current) => !current);
+    setMobileSheetState((current) => {
+      if (current !== "minimized") lastExpandedSheetStateRef.current = current;
+      return sheetStateAfterGripTap(current, lastExpandedSheetStateRef.current);
+    });
   }
 
   function closeInfo() {
@@ -523,7 +542,7 @@ export function App() {
   }
 
   return (
-    <main ref={appShellRef} className={`app-shell ${mobileSheetOpen ? "mobile-sheet-open" : "mobile-sheet-collapsed"}`}>
+    <main ref={appShellRef} className={`app-shell mobile-sheet-${mobileSheetState}`}>
       <h1 className="visually-hidden">NYC Sanitation – Collection Map</h1>
       <section className="map-panel" aria-label="NYC sanitation collection map">
         <div ref={mapNode} className="map" />
@@ -555,7 +574,7 @@ export function App() {
         </div>
         <aside
           ref={mapOverlayRef}
-          className={`map-overlay ${mobileSheetOpen ? "is-open" : "is-collapsed"}`}
+          className={`map-overlay is-${mobileSheetState}`}
           aria-label="Map controls"
           onClickCapture={suppressClickAfterSheetGesture}
           onPointerDown={beginSheetGesture}
@@ -565,34 +584,52 @@ export function App() {
           <button
             className="sheet-toggle"
             type="button"
-            aria-label={mobileSheetOpen ? "Collapse map controls" : "Expand map controls"}
-            aria-expanded={mobileSheetOpen}
+            aria-label={mobileSheetState === "minimized" ? "Restore controls" : "Hide controls"}
+            aria-expanded={mobileSheetState !== "minimized"}
             aria-controls="map-control-content"
             onClick={toggleMobileSheet}
           >
             <span className="sheet-grabber" aria-hidden="true" />
-            <span className="sheet-toggle-label">{mobileSheetOpen ? "Hide controls" : "Show controls"}</span>
+            <span className="sheet-toggle-copy">
+              <span className="sheet-toggle-label">
+                {mobileSheetState === "minimized" ? "Show controls" : mobileSheetState === "core" ? "More controls" : "Less controls"}
+              </span>
+              {mobileSheetState === "core" && <span className="sheet-toggle-hint">Swipe down to hide</span>}
+            </span>
             <svg className="sheet-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m5.5 7.5 4.5 4 4.5-4" /></svg>
           </button>
           <div
             ref={sheetContentRef}
             id="map-control-content"
             className="sheet-content"
-            aria-hidden={isMobileViewport && !mobileSheetOpen}
+            aria-hidden={isMobileViewport && mobileSheetState === "minimized"}
           >
-            <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-label={day} aria-pressed={selectedDay === day}>{dayShortLabel(day)}</button>)}</div>
-            <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
-            {unknownLayerAvailable && <fieldset className="unknown-controls"><legend>Unresolved street segments <span>(zoomed-in only)</span></legend><label><input type="checkbox" checked={showCoverageGaps} onChange={() => setShowCoverageGaps((current) => !current)} /><i className="unknown-swatch coverage" aria-hidden="true" />Source coverage gaps</label><label><input type="checkbox" checked={showInsufficientAddress} onChange={() => setShowInsufficientAddress((current) => !current)} /><i className="unknown-swatch address" aria-hidden="true" />Insufficient address evidence</label></fieldset>}
-            <dl className="status-summary" aria-live="polite">
-              <div><dt>Backend</dt><dd><i className={`status-dot ${backendConnection}`} aria-hidden="true" />{backendConnectionLabel(backendConnection)}</dd></div>
-              <div><dt>Mapped</dt><dd>{mappedFeatureCount === null ? "Waiting for data" : `${mappedFeatureCount.toLocaleString()} street features`}</dd></div>
-              <div><dt>Status</dt><dd>{mapStatus}</dd></div>
-              <div className="status-updated"><dt>Last Updated</dt><dd><time dateTime={dataUpdated ?? undefined}>{formatDataUpdated(dataUpdated)}</time><button ref={infoButtonRef} className="info-button" type="button" aria-label="About this data" onClick={() => setShowInfo(true)}>i</button></dd></div>
-            </dl>
+            <div className="core-controls">
+              <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-label={day} aria-pressed={selectedDay === day}>{dayShortLabel(day)}</button>)}</div>
+              <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
+            </div>
+            <div
+              ref={advancedControlsRef}
+              className="advanced-controls"
+              aria-hidden={isMobileViewport && mobileSheetState !== "full"}
+            >
+              <div className="advanced-controls-inner">
+                {unknownLayerAvailable && <fieldset className="unknown-controls"><legend>Unresolved street segments <span>(zoomed-in only)</span></legend><label><input type="checkbox" checked={showCoverageGaps} onChange={() => setShowCoverageGaps((current) => !current)} /><i className="unknown-swatch coverage" aria-hidden="true" />Source coverage gaps</label><label><input type="checkbox" checked={showInsufficientAddress} onChange={() => setShowInsufficientAddress((current) => !current)} /><i className="unknown-swatch address" aria-hidden="true" />Insufficient address evidence</label></fieldset>}
+                <div className="status-summary-card">
+                  <button ref={infoButtonRef} className="info-button" type="button" aria-label="About this data" onClick={() => setShowInfo(true)}>i</button>
+                  <dl className="status-summary" aria-live="polite">
+                    <div><dt>Backend</dt><dd><i className={`status-dot ${backendConnection}`} aria-hidden="true" />{backendConnectionLabel(backendConnection)}</dd></div>
+                    <div><dt>Mapped</dt><dd>{mappedFeatureCount === null ? "Waiting for data" : `${mappedFeatureCount.toLocaleString()} street features`}</dd></div>
+                    <div><dt>Status</dt><dd>{mapStatus}</dd></div>
+                    <div className="status-updated"><dt>Last Updated</dt><dd><time dateTime={dataUpdated ?? undefined}>{formatDataUpdated(dataUpdated)}</time></dd></div>
+                  </dl>
+                </div>
+              </div>
+            </div>
           </div>
         </aside>
       </section>
-      {showInfo && <div className="modal-backdrop" role="presentation" onClick={closeInfo}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button ref={modalCloseRef} className="modal-close" type="button" aria-label="Close information" onClick={closeInfo}>×</button><h2 id="data-info-title">About this map</h2><p>This map shows NYC sanitation collection schedules by street, making them easier to explore at a glance.</p><p>The city's <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">collection schedule lookup</a> provides results for one address at a time. This map brings those schedules together so you can see collection patterns across a neighborhood or the whole city.</p><p>It combines the Department of City Planning's <a href="https://www.nyc.gov/site/planning/data-maps/open-data/dwn-lion.page" target="_blank" rel="noreferrer">LION street data</a> with DSNY's official <a href="https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0" target="_blank" rel="noreferrer">collection-frequency data</a> for refuse, recycling, organics, and bulk pick-up. Records are matched to individual block faces, meaning each side of a street, then converted into map tiles for fast viewing.</p><p>Only matches that pass the project's validation checks are shown as scheduled street lines. Source records that cannot be matched reliably are kept separate instead of being assigned a potentially incorrect schedule. Data is refreshed periodically from these official NYC sources.</p><h3>Unresolved street segments</h3><div className="unresolved-explanations"><article><div className="unresolved-explanation-heading"><i className="unknown-swatch coverage" aria-hidden="true" /><strong>Source coverage gap</strong></div><p>The LION street side has a valid block-face identity, but its side trace is not completely covered by a DSNY frequency polygon.</p></article><article><div className="unresolved-explanation-heading"><i className="unknown-swatch address" aria-hidden="true" /><strong>Insufficient address evidence</strong></div><p>LION does not provide a usable block-face ID for that side. An address range alone is not considered strong enough evidence to assign a schedule.</p></article></div><h3>Disclaimer</h3><p>This is an independent project and is not affiliated with, endorsed by, or operated by the City of New York or the NYC Department of Sanitation. NYC and DSNY names and trademarks belong to their respective owners.</p><p>This map uses public NYC data that has been processed and modified from its original sources. It is provided for informational purposes only, without warranties of accuracy, completeness, or availability. Collection schedules may change due to holidays, weather, emergencies, or other service changes. Always confirm your schedule through the official <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">DSNY collection schedule lookup</a> or by calling 311 before setting items out.</p><h3>Licensing</h3><p>The basemap uses <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> data under the ODbL through <a href="https://openmaptiles.org/" target="_blank" rel="noreferrer">OpenMapTiles</a>, with tiles served by <a href="https://openfreemap.org/" target="_blank" rel="noreferrer">OpenFreeMap</a>. OpenFreeMap is MIT licensed. The Liberty style code is BSD 3-Clause and its design is CC BY 4.0. Noto Sans uses the SIL Open Font License.</p></section></div>}
+      {showInfo && <div className="modal-backdrop" role="presentation" onClick={closeInfo}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button ref={modalCloseRef} className="modal-close" type="button" aria-label="Close information" onClick={closeInfo}>×</button><h2 id="data-info-title">About this map</h2><p>This map shows NYC sanitation collection schedules by street, making them easier to explore at a glance.</p><p>Location wayfinding stays on your device and is not sent to the server.</p><p>The city's <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">collection schedule lookup</a> provides results for one address at a time. This map brings those schedules together so you can see collection patterns across a neighborhood or the whole city.</p><p>It combines the Department of City Planning's <a href="https://www.nyc.gov/site/planning/data-maps/open-data/dwn-lion.page" target="_blank" rel="noreferrer">LION street data</a> with DSNY's official <a href="https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0" target="_blank" rel="noreferrer">collection-frequency data</a> for refuse, recycling, organics, and bulk pick-up. Records are matched to individual block faces, meaning each side of a street, then converted into map tiles for fast viewing.</p><p>Only matches that pass the project's validation checks are shown as scheduled street lines. Source records that cannot be matched reliably are kept separate instead of being assigned a potentially incorrect schedule. Data is refreshed periodically from these official NYC sources.</p><h3>Unresolved street segments</h3><div className="unresolved-explanations"><article><div className="unresolved-explanation-heading"><i className="unknown-swatch coverage" aria-hidden="true" /><strong>Source coverage gap</strong></div><p>The LION street side has a valid block-face identity, but its side trace is not completely covered by a DSNY frequency polygon.</p></article><article><div className="unresolved-explanation-heading"><i className="unknown-swatch address" aria-hidden="true" /><strong>Insufficient address evidence</strong></div><p>LION does not provide a usable block-face ID for that side. An address range alone is not considered strong enough evidence to assign a schedule.</p></article></div><h3>Disclaimer</h3><p>This is an independent project and is not affiliated with, endorsed by, or operated by the City of New York or the NYC Department of Sanitation. NYC and DSNY names and trademarks belong to their respective owners.</p><p>This map uses public NYC data that has been processed and modified from its original sources. It is provided for informational purposes only, without warranties of accuracy, completeness, or availability. Collection schedules may change due to holidays, weather, emergencies, or other service changes. Always confirm your schedule through the official <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">DSNY collection schedule lookup</a> or by calling 311 before setting items out.</p><h3>Project code</h3><p>Copyright © 2026 John Ng. Licensed under the MIT License.</p><h3>Third-party licenses</h3><p>The basemap uses <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> data under the ODbL through <a href="https://openmaptiles.org/" target="_blank" rel="noreferrer">OpenMapTiles</a>, with tiles served by <a href="https://openfreemap.org/" target="_blank" rel="noreferrer">OpenFreeMap</a>. OpenFreeMap is MIT licensed. The Liberty style code is BSD 3-Clause and its design is CC BY 4.0. Noto Sans uses the SIL Open Font License.</p></section></div>}
     </main>
   );
 }
