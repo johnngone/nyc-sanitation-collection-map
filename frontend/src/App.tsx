@@ -590,13 +590,26 @@ export function App() {
             onClick={toggleMobileSheet}
           >
             <span className="sheet-grabber" aria-hidden="true" />
-            <span className="sheet-toggle-copy">
-              <span className="sheet-toggle-label">
-                {mobileSheetState === "minimized" ? "Show controls" : mobileSheetState === "core" ? "More controls" : "Less controls"}
+            {mobileSheetState === "core" ? (
+              <span className="sheet-toggle-core-guidance" aria-hidden="true">
+                <span className="sheet-toggle-direction">
+                  <span>Even more controls</span>
+                  <span className="sheet-direction-arrow">↑</span>
+                </span>
+                <span className="sheet-toggle-divider" />
+                <span className="sheet-toggle-direction">
+                  <span>Hide controls</span>
+                  <span className="sheet-direction-arrow">↓</span>
+                </span>
               </span>
-              {mobileSheetState === "core" && <span className="sheet-toggle-hint">Swipe down to hide</span>}
-            </span>
-            <svg className="sheet-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m5.5 7.5 4.5 4 4.5-4" /></svg>
+            ) : (
+              <>
+                <span className="sheet-toggle-copy">
+                  <span className="sheet-toggle-label">{mobileSheetState === "minimized" ? "Show controls" : "Less controls"}</span>
+                </span>
+                <svg className="sheet-chevron" viewBox="0 0 20 20" aria-hidden="true"><path d="m5.5 7.5 4.5 4 4.5-4" /></svg>
+              </>
+            )}
           </button>
           <div
             ref={sheetContentRef}

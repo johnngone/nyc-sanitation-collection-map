@@ -713,11 +713,33 @@ label input[type="checkbox"] {
     line-height: 1.15;
   }
 
-  .sheet-toggle-hint {
-    margin-top: .12rem;
-    color: #7a8790;
-    font-size: .66rem;
-    font-weight: 500;
+  .sheet-toggle-core-guidance {
+    width: min(17rem, calc(100% - 2rem));
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr);
+    align-items: center;
+    gap: .55rem;
+  }
+
+  .sheet-toggle-direction {
+    min-width: 0;
+    display: grid;
+    justify-items: center;
+    gap: .05rem;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .sheet-direction-arrow {
+    color: #73808a;
+    font-size: .8rem;
+    line-height: .75;
+  }
+
+  .sheet-toggle-divider {
+    width: 1px;
+    height: 22px;
+    background: #d5dbe0;
   }
 
   .sheet-grabber {
@@ -742,8 +764,7 @@ label input[type="checkbox"] {
     transition: transform 260ms cubic-bezier(.22, 1, .36, 1);
   }
 
-  .map-overlay.is-minimized .sheet-chevron,
-  .map-overlay.is-core .sheet-chevron { transform: rotate(180deg); }
+  .map-overlay.is-minimized .sheet-chevron { transform: rotate(180deg); }
 
   .sheet-content {
     max-height: calc(min(72dvh, 620px) - var(--mobile-sheet-peek));
