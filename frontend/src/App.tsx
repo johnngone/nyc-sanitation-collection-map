@@ -102,7 +102,7 @@ export function App() {
   const [showInsufficientAddress, setShowInsufficientAddress] = useState(true);
   const [unknownLayerAvailable, setUnknownLayerAvailable] = useState(false);
   const [mobileSheetState, setMobileSheetState] = useState<MobileSheetState>("core");
-  const [brandExpanded, setBrandExpanded] = useState(false);
+  const [brandExpanded, setBrandExpanded] = useState(true);
   const [isMobileViewport, setIsMobileViewport] = useState(
     () => window.matchMedia(mobileControlsMediaQuery).matches,
   );
@@ -112,6 +112,11 @@ export function App() {
     const updateViewport = (event: MediaQueryListEvent) => setIsMobileViewport(event.matches);
     mediaQuery.addEventListener("change", updateViewport);
     return () => mediaQuery.removeEventListener("change", updateViewport);
+  }, []);
+
+  useEffect(() => {
+    const collapseTimer = window.setTimeout(() => setBrandExpanded(false), 5_000);
+    return () => window.clearTimeout(collapseTimer);
   }, []);
 
   useEffect(() => {
