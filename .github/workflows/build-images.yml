@@ -157,8 +157,13 @@ jobs:
         if: github.event_name == 'release'
         shell: bash
         env:
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           docker tag nyc-sanitation-map:ci "${IMAGE}:${RELEASE_TAG}"
           docker push "${IMAGE}:${RELEASE_TAG}"
+          if [[ "${IS_PRERELEASE}" == "false" ]]; then
+            docker tag nyc-sanitation-map:ci "${IMAGE}:latest"
+            docker push "${IMAGE}:latest"
+          fi
