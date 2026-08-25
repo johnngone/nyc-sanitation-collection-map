@@ -163,15 +163,16 @@ input:focus-visible {
 .brand-button:hover { background: transparent; }
 
 .brand-copy {
-  width: 0;
+  width: max-content;
   height: 52px;
-  max-width: min(23rem, calc(100vw - 5rem));
+  max-width: 0;
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 2px;
   overflow: hidden;
-  padding: 0 1rem 0 1.2rem;
+  margin-left: -10px;
+  padding: 0 1rem 0 calc(1.2rem + 10px);
   border-radius: 0 26px 26px 0;
   opacity: 0;
   transform: translateX(-12px);
@@ -179,7 +180,7 @@ input:focus-visible {
   white-space: nowrap;
   background: #fff;
   box-shadow: 0 8px 28px rgba(23, 32, 42, .16);
-  transition: width 260ms cubic-bezier(.22, 1, .36, 1),
+  transition: max-width 260ms cubic-bezier(.22, 1, .36, 1),
     opacity 160ms ease,
     transform 260ms cubic-bezier(.22, 1, .36, 1);
 }
@@ -211,7 +212,7 @@ input:focus-visible {
 
 .brand-lockup.is-expanded .brand-copy,
 .brand-button:focus-visible .brand-copy {
-  width: min(23rem, calc(100vw - 5rem));
+  max-width: min(23rem, calc(100vw - 5rem));
   opacity: 1;
   transform: translateX(0);
 }
@@ -518,16 +519,16 @@ label input[type="checkbox"] {
 
   .brand-copy {
     height: 46px;
-    max-width: min(17.5rem, calc(100vw - 4.8rem));
+    margin-left: -8px;
     padding-right: .85rem;
-    padding-left: 1.05rem;
+    padding-left: calc(1.05rem + 8px);
     border-radius: 0 23px 23px 0;
     white-space: nowrap;
   }
 
   .brand-lockup.is-expanded .brand-copy,
   .brand-button:focus-visible .brand-copy {
-    width: min(17.5rem, calc(100vw - 4.8rem));
+    max-width: min(17.5rem, calc(100vw - 4.8rem));
   }
 
   .brand-copy strong { font-size: .82rem; }
