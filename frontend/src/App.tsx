@@ -592,7 +592,7 @@ export function App() {
             <span className="sheet-grabber" aria-hidden="true" />
             {mobileSheetState === "core" ? (
               <span className="sheet-toggle-core-guidance" aria-hidden="true">
-                <span>Even more controls</span>
+                <span>More controls</span>
                 <svg className="sheet-chevron sheet-chevron-up" viewBox="0 0 20 20"><path d="m5.5 7.5 4.5 4 4.5-4" /></svg>
                 <span className="sheet-toggle-slash">/</span>
                 <svg className="sheet-chevron" viewBox="0 0 20 20"><path d="m5.5 7.5 4.5 4 4.5-4" /></svg>
