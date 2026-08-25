@@ -65,8 +65,10 @@ function formatDataUpdated(value: string | null): string {
 }
 
 export function App() {
+  const appShellRef = useRef<HTMLElement>(null);
   const mapNode = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
+  const mapOverlayRef = useRef<HTMLElement>(null);
   const sheetContentRef = useRef<HTMLDivElement>(null);
   const infoButtonRef = useRef<HTMLButtonElement>(null);
   const modalCloseRef = useRef<HTMLButtonElement>(null);
@@ -107,6 +109,19 @@ export function App() {
     if (isMobileViewport && !mobileSheetOpen) content.setAttribute("inert", "");
     else content.removeAttribute("inert");
   }, [isMobileViewport, mobileSheetOpen]);
+
+  useEffect(() => {
+    const shell = appShellRef.current;
+    const overlay = mapOverlayRef.current;
+    if (!shell || !overlay) return;
+    const updateSheetHeight = () => {
+      shell.style.setProperty("--mobile-sheet-height", `${overlay.getBoundingClientRect().height}px`);
+    };
+    updateSheetHeight();
+    const observer = new ResizeObserver(updateSheetHeight);
+    observer.observe(overlay);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!showInfo) return;
@@ -179,7 +194,7 @@ export function App() {
     });
     mapRef.current = map;
     const viewControl = new MapViewControl();
-    map.addControl(new maplibregl.AttributionControl({ compact: false }), "top-right");
+    map.addControl(new maplibregl.AttributionControl({ compact: false }), "bottom-right");
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(viewControl, "top-right");
 
@@ -488,7 +503,7 @@ export function App() {
   }
 
   return (
-    <main className={`app-shell ${mobileSheetOpen ? "mobile-sheet-open" : "mobile-sheet-collapsed"}`}>
+    <main ref={appShellRef} className={`app-shell ${mobileSheetOpen ? "mobile-sheet-open" : "mobile-sheet-collapsed"}`}>
       <h1 className="visually-hidden">NYC Sanitation – Collection Map</h1>
       <section className="map-panel" aria-label="NYC sanitation collection map">
         <div ref={mapNode} className="map" />
@@ -518,7 +533,7 @@ export function App() {
             </span>
           </button>
         </div>
-        <aside className={`map-overlay ${mobileSheetOpen ? "is-open" : "is-collapsed"}`} aria-label="Map controls">
+        <aside ref={mapOverlayRef} className={`map-overlay ${mobileSheetOpen ? "is-open" : "is-collapsed"}`} aria-label="Map controls">
           <button
             className="sheet-toggle"
             type="button"
@@ -540,10 +555,6 @@ export function App() {
             className="sheet-content"
             aria-hidden={isMobileViewport && !mobileSheetOpen}
           >
-            <div className="controls-heading">
-              <strong>Filters</strong>
-              <button ref={infoButtonRef} className="info-button" type="button" aria-label="About this data" onClick={() => setShowInfo(true)}>i</button>
-            </div>
             <div className="day-picker" aria-label="Collection day">{weekdays.map((day) => <button key={day} type="button" className={selectedDay === day ? "day-button selected" : "day-button"} onClick={() => selectDay(day)} aria-label={day} aria-pressed={selectedDay === day}>{dayShortLabel(day)}</button>)}</div>
             <div className="type-filters">{collectionTypes.map(([type, label, color]) => <label key={type}><input type="checkbox" checked={selectedTypes.includes(type)} onChange={() => setSelectedTypes((current) => current.includes(type) ? current.filter((item) => item !== type) : [...current, type])} /><i className="swatch" style={{ backgroundColor: color }} />{label}</label>)}</div>
             {unknownLayerAvailable && <fieldset className="unknown-controls"><legend>Unresolved street segments <span>(zoomed-in only)</span></legend><label><input type="checkbox" checked={showCoverageGaps} onChange={() => setShowCoverageGaps((current) => !current)} /><i className="unknown-swatch coverage" aria-hidden="true" />Source coverage gaps</label><label><input type="checkbox" checked={showInsufficientAddress} onChange={() => setShowInsufficientAddress((current) => !current)} /><i className="unknown-swatch address" aria-hidden="true" />Insufficient address evidence</label></fieldset>}
@@ -551,12 +562,12 @@ export function App() {
               <div><dt>Backend</dt><dd><i className={`status-dot ${backendConnection}`} aria-hidden="true" />{backendConnectionLabel(backendConnection)}</dd></div>
               <div><dt>Mapped</dt><dd>{mappedFeatureCount === null ? "Waiting for data" : `${mappedFeatureCount.toLocaleString()} street features`}</dd></div>
               <div><dt>Status</dt><dd>{mapStatus}</dd></div>
-              <div><dt>Last Updated</dt><dd><time dateTime={dataUpdated ?? undefined}>{formatDataUpdated(dataUpdated)}</time></dd></div>
+              <div className="status-updated"><dt>Last Updated</dt><dd><time dateTime={dataUpdated ?? undefined}>{formatDataUpdated(dataUpdated)}</time><button ref={infoButtonRef} className="info-button" type="button" aria-label="About this data" onClick={() => setShowInfo(true)}>i</button></dd></div>
             </dl>
           </div>
         </aside>
       </section>
-      {showInfo && <div className="modal-backdrop" role="presentation" onClick={closeInfo}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button ref={modalCloseRef} className="modal-close" type="button" aria-label="Close information" onClick={closeInfo}>×</button><h2 id="data-info-title">About this map</h2><p>This map shows NYC sanitation collection schedules by street, making them easier to explore at a glance.</p><p>The city's <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">collection schedule lookup</a> provides results for one address at a time. This map brings those schedules together so you can see collection patterns across a neighborhood or the whole city.</p><p>It combines the Department of City Planning's <a href="https://www.nyc.gov/site/planning/data-maps/open-data/dwn-lion.page" target="_blank" rel="noreferrer">LION street data</a> with DSNY's official <a href="https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0" target="_blank" rel="noreferrer">collection-frequency data</a> for refuse, recycling, organics, and bulk pick-up. Records are matched to individual block faces, meaning each side of a street, then converted into map tiles for fast viewing.</p><p>Only matches that pass the project's validation checks are shown as scheduled street lines. Source records that cannot be matched reliably are kept separate instead of being assigned a potentially incorrect schedule. Data is refreshed periodically from these official NYC sources.</p><h3>Unresolved street segments</h3><div className="unresolved-explanations"><article><div className="unresolved-explanation-heading"><i className="unknown-swatch coverage" aria-hidden="true" /><strong>Source coverage gap</strong></div><p>The LION street side has a valid block-face identity, but its side trace is not completely covered by a DSNY frequency polygon.</p></article><article><div className="unresolved-explanation-heading"><i className="unknown-swatch address" aria-hidden="true" /><strong>Insufficient address evidence</strong></div><p>LION does not provide a usable block-face ID for that side. An address range alone is not considered strong enough evidence to assign a schedule.</p></article></div><h3>Disclaimer</h3><p>This is an independent project and is not affiliated with, endorsed by, or operated by the City of New York or the NYC Department of Sanitation. NYC and DSNY names and trademarks belong to their respective owners.</p><p>This map uses public NYC data that has been processed and modified from its original sources. It is provided for informational purposes only, without warranties of accuracy, completeness, or availability. Collection schedules may change due to holidays, weather, emergencies, or other service changes. Always confirm your schedule through the official <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">DSNY collection schedule lookup</a> or by calling 311 before setting items out.</p><h3>Licensing</h3><p>The basemap uses <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> data under the ODbL through <a href="https://openmaptiles.org/" target="_blank" rel="noreferrer">OpenMapTiles</a>, with tiles served by <a href="https://openfreemap.org/" target="_blank" rel="noreferrer">OpenFreeMap</a>. OpenFreeMap is MIT licensed. The Liberty style code is BSD 3-Clause and its design is CC BY 4.0. Noto Sans uses the SIL Open Font License. Full details are listed in the project's bundled THIRD_PARTY_NOTICES.md file.</p></section></div>}
+      {showInfo && <div className="modal-backdrop" role="presentation" onClick={closeInfo}><section className="info-modal" role="dialog" aria-modal="true" aria-labelledby="data-info-title" onClick={(event) => event.stopPropagation()}><button ref={modalCloseRef} className="modal-close" type="button" aria-label="Close information" onClick={closeInfo}>×</button><h2 id="data-info-title">About this map</h2><p>This map shows NYC sanitation collection schedules by street, making them easier to explore at a glance.</p><p>The city's <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">collection schedule lookup</a> provides results for one address at a time. This map brings those schedules together so you can see collection patterns across a neighborhood or the whole city.</p><p>It combines the Department of City Planning's <a href="https://www.nyc.gov/site/planning/data-maps/open-data/dwn-lion.page" target="_blank" rel="noreferrer">LION street data</a> with DSNY's official <a href="https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/DSNY_Frequencies_OFFICIAL/FeatureServer/0" target="_blank" rel="noreferrer">collection-frequency data</a> for refuse, recycling, organics, and bulk pick-up. Records are matched to individual block faces, meaning each side of a street, then converted into map tiles for fast viewing.</p><p>Only matches that pass the project's validation checks are shown as scheduled street lines. Source records that cannot be matched reliably are kept separate instead of being assigned a potentially incorrect schedule. Data is refreshed periodically from these official NYC sources.</p><h3>Unresolved street segments</h3><div className="unresolved-explanations"><article><div className="unresolved-explanation-heading"><i className="unknown-swatch coverage" aria-hidden="true" /><strong>Source coverage gap</strong></div><p>The LION street side has a valid block-face identity, but its side trace is not completely covered by a DSNY frequency polygon.</p></article><article><div className="unresolved-explanation-heading"><i className="unknown-swatch address" aria-hidden="true" /><strong>Insufficient address evidence</strong></div><p>LION does not provide a usable block-face ID for that side. An address range alone is not considered strong enough evidence to assign a schedule.</p></article></div><h3>Disclaimer</h3><p>This is an independent project and is not affiliated with, endorsed by, or operated by the City of New York or the NYC Department of Sanitation. NYC and DSNY names and trademarks belong to their respective owners.</p><p>This map uses public NYC data that has been processed and modified from its original sources. It is provided for informational purposes only, without warranties of accuracy, completeness, or availability. Collection schedules may change due to holidays, weather, emergencies, or other service changes. Always confirm your schedule through the official <a href="https://www.nyc.gov/assets/dsny/forms/collection-schedule" target="_blank" rel="noreferrer">DSNY collection schedule lookup</a> or by calling 311 before setting items out.</p><h3>Licensing</h3><p>The basemap uses <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> data under the ODbL through <a href="https://openmaptiles.org/" target="_blank" rel="noreferrer">OpenMapTiles</a>, with tiles served by <a href="https://openfreemap.org/" target="_blank" rel="noreferrer">OpenFreeMap</a>. OpenFreeMap is MIT licensed. The Liberty style code is BSD 3-Clause and its design is CC BY 4.0. Noto Sans uses the SIL Open Font License.</p></section></div>}
     </main>
   );
 }
