@@ -5,13 +5,14 @@ import { EXTRUDED_BUILDING_LAYER_ID, FLAT_BUILDING_LAYER_ID } from "./basemap";
 export const CAMERA_TOLERANCE_DEGREES = 1;
 export const EXTRUSION_DETAIL_ZOOM = 14;
 export const MAP_INTERACTION_OPTIONS = {
+  maxZoom: 18,
   maxPitch: 45,
   dragRotate: true,
   touchZoomRotate: true,
   touchPitch: true,
   pitchWithRotate: true,
   rollEnabled: false,
-} satisfies Pick<MapOptions, "maxPitch" | "dragRotate" | "touchZoomRotate" | "touchPitch" | "pitchWithRotate" | "rollEnabled">;
+} satisfies Pick<MapOptions, "maxZoom" | "maxPitch" | "dragRotate" | "touchZoomRotate" | "touchPitch" | "pitchWithRotate" | "rollEnabled">;
 
 export interface CameraPosition {
   bearing: number;
