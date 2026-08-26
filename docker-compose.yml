@@ -15,11 +15,8 @@ services:
       APP_META_DESCRIPTION: ${APP_META_DESCRIPTION:-Map NYC sanitation collection schedules by street and day.}
       APP_PUBLIC_URL: ${APP_PUBLIC_URL:-}
       APP_ROBOTS_TXT: ${APP_ROBOTS_TXT:-}
-      DATABASE_PATH: /app/data/app.sqlite3
-      TILESET_PATH: /app/data/collection_streets.mbtiles
       DATA_MANIFEST_PATH: /app/data/data_manifest.json
       HEALTH_SYNC_HASH_MAX_BYTES: ${HEALTH_SYNC_HASH_MAX_BYTES:-16777216}
-      INGESTION_AUDIT_PATH: /app/data/ingestion_audit.json
       DATA_REFRESH_ENABLED: ${DATA_REFRESH_ENABLED:-true}
       DATA_REFRESH_INTERVAL_DAYS: ${DATA_REFRESH_INTERVAL_DAYS:-14}
       DATA_REFRESH_FAILURE_RETRY_MINUTES: ${DATA_REFRESH_FAILURE_RETRY_MINUTES:-30}
@@ -37,7 +34,7 @@ services:
       - ./data:/app/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/live')"]
       interval: 30s
       timeout: 5s
       retries: 3

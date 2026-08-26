@@ -41,7 +41,6 @@ interface MapConfig {
   version: string | null;
   tiles_url: string | null;
   source_layer: string;
-  known_source_layer?: string;
   unknown_source_layer?: string | null;
   unknown_minzoom?: number | null;
   minzoom: number | null;
@@ -92,7 +91,7 @@ function dayShortLabel(day: Weekday): string {
 
 function backendConnectionLabel(connection: BackendConnection): string {
   if (connection === "connected") return "Connected";
-  if (connection === "verifying") return "Verifying data · retrying";
+  if (connection === "verifying") return "Preparing data · retrying";
   if (connection === "unavailable") return "Unavailable · retrying";
   return "Checking connection";
 }
@@ -276,7 +275,7 @@ export function App() {
             !config.tiles_url
             || !config.version
             || !config.source_layer
-            || ![2, 3, 4].includes(config.tile_schema_revision ?? 0)
+            || config.tile_schema_revision !== 4
             || typeof config.minzoom !== "number"
             || typeof config.maxzoom !== "number"
             || !Number.isInteger(config.minzoom)
@@ -293,9 +292,7 @@ export function App() {
           }
 
           tilesInitialized = true;
-          const tileSchemaRevision = config.tile_schema_revision as 2 | 3 | 4;
-          const hasUnknownLayer = tileSchemaRevision >= 3
-            && Boolean(config.unknown_source_layer)
+          const hasUnknownLayer = Boolean(config.unknown_source_layer)
             && typeof config.unknown_minzoom === "number";
           setUnknownLayerAvailable(hasUnknownLayer);
           // Below the archive's minimum zoom the collection overlay would be
@@ -348,27 +345,25 @@ export function App() {
                 "line-offset": lineOffset,
               },
             });
-            if (tileSchemaRevision >= 3) {
-              map.addLayer({
-                id: blankLayerId(type),
-                type: "line",
-                source: sourceId,
-                "source-layer": config.source_layer,
-                minzoom: 16,
-                filter: ["==", ["get", `${type.toLowerCase()}_status`], "UNKNOWN_SOURCE_BLANK"],
-                layout: { visibility },
-                paint: {
-                  "line-color": "#707981",
-                  "line-width": 3,
-                  "line-dasharray": [2, 2],
-                  "line-opacity": 0.85,
-                  "line-offset": lineOffset,
-                },
-              });
-            }
+            map.addLayer({
+              id: blankLayerId(type),
+              type: "line",
+              source: sourceId,
+              "source-layer": config.source_layer,
+              minzoom: 16,
+              filter: ["==", ["get", `${type.toLowerCase()}_status`], "UNKNOWN_SOURCE_BLANK"],
+              layout: { visibility },
+              paint: {
+                "line-color": "#707981",
+                "line-width": 3,
+                "line-dasharray": [2, 2],
+                "line-opacity": 0.85,
+                "line-offset": lineOffset,
+              },
+            });
           }
 
-          if (tileSchemaRevision >= 3 && config.unknown_source_layer && typeof config.unknown_minzoom === "number") {
+          if (config.unknown_source_layer && typeof config.unknown_minzoom === "number") {
             const unknownSideOffset: maplibregl.ExpressionSpecification = [
               "*", ["match", ["get", "side"], "LEFT", -1, "RIGHT", 1, 0], 4,
             ];
@@ -421,7 +416,7 @@ export function App() {
               status,
               properties[`${collection[0].toLowerCase()}_conflict`] === "1",
             );
-            const blockFaceId = properties.origin_block_face_id ?? properties.source_block_face_id ?? properties.id;
+            const blockFaceId = properties.origin_block_face_id ?? properties.id;
             const metadata = [
               blockFaceId ? `Block face: ${escapeHtml(blockFaceId)}` : null,
               properties.source ? `Source: ${escapeHtml(properties.source)}` : null,
@@ -438,7 +433,7 @@ export function App() {
             ...collectionTypes.map(([type]) => blankLayerId(type)).filter((id) => Boolean(map.getLayer(id))),
           ];
           map.on("click", clickableCollectionLayers, showPopup);
-          if (tileSchemaRevision >= 3 && config.unknown_source_layer) map.on("click", unknownLayerIds, showPopup);
+          if (config.unknown_source_layer) map.on("click", unknownLayerIds, showPopup);
           map.on("mouseenter", collectionLayerIds, () => { map.getCanvas().style.cursor = "pointer"; });
           map.on("mouseleave", collectionLayerIds, () => { map.getCanvas().style.cursor = ""; });
 

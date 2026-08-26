@@ -85,9 +85,9 @@ def prepare_features(payload: object) -> list[ValidatedFeature]:
 
     LOGGER.info("Validating processed GeoJSON features=%s", len(raw_features))
     groups: dict[str, list[ValidatedFeature]] = defaultdict(list)
-    schema_revision = payload.get("schema_revision", 2)
-    if schema_revision not in {2, 3}:
-        raise ValueError(f"unsupported processed schema_revision {schema_revision!r}")
+    schema_revision = payload.get("schema_revision")
+    if schema_revision != 3:
+        raise ValueError("processed schema_revision must be 3")
     for feature_number, feature in enumerate(raw_features):
         validated = _validate_feature(feature, feature_number, schema_revision=int(schema_revision))
         groups[validated.block_face_id].append(validated)
@@ -183,64 +183,25 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
     initialize(database, create_indexes=False)
     with closing(sqlite3.connect(database)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        # SQLite cannot add a NOT NULL column without a table rebuild. Existing
-        # databases receive a nullable migration column, then this full-snapshot
-        # transaction replaces every row with a non-null audited origin.
-        _ensure_columns(connection, "block_faces", {"origin_block_face_id": "TEXT"})
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS block_face_dsny_sources (
-                block_face_id TEXT NOT NULL REFERENCES block_faces(block_face_id) ON DELETE CASCADE,
-                dsny_object_id TEXT NOT NULL,
-                frequency_row INTEGER,
-                schedule_code TEXT,
-                section TEXT,
-                district TEXT,
-                PRIMARY KEY (block_face_id, dsny_object_id)
-            )"""
-        )
-        _ensure_columns(connection, "block_face_dsny_sources", {
-            "frequency_row": "INTEGER",
-            "schedule_code": "TEXT",
-            "section": "TEXT",
-            "district": "TEXT",
-        })
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS block_face_lion_components (
-                block_face_id TEXT NOT NULL REFERENCES block_faces(block_face_id) ON DELETE CASCADE,
-                component_index INTEGER NOT NULL,
-                segment_id TEXT NOT NULL,
-                source_side TEXT NOT NULL CHECK (source_side IN ('LEFT', 'RIGHT')),
-                source_rows_json TEXT NOT NULL,
-                source_indices_json TEXT NOT NULL,
-                street_names_json TEXT NOT NULL,
-                source_records_json TEXT NOT NULL,
-                dsny_object_ids_json TEXT NOT NULL,
-                PRIMARY KEY (block_face_id, component_index)
-            )"""
-        )
         # Defer secondary-index maintenance until the complete replacement has
         # been inserted. Dropping, loading, and recreating indexes all occur in
         # this transaction, so readers never observe a partially indexed snapshot.
         drop_secondary_indexes(connection)
-        # This loader consumes a complete snapshot. Clear every spatial and
-        # relational row in the same transaction so removed faces cannot
-        # survive a successful refresh.
+        # This loader consumes a complete snapshot. Clear every relational row
+        # in the same transaction so removed faces cannot survive a refresh.
         connection.execute("DELETE FROM collection_schedules")
         connection.execute("DELETE FROM block_face_collection_states")
         connection.execute("DELETE FROM unknown_block_faces")
         connection.execute("DELETE FROM block_face_lion_components")
         connection.execute("DELETE FROM block_face_dsny_sources")
-        connection.execute("DELETE FROM block_faces_rtree")
-        connection.execute("DELETE FROM block_face_rtree_map")
         connection.execute("DELETE FROM block_faces")
         for feature_number, feature in enumerate(features, start=1):
-            min_x, min_y, max_x, max_y = feature.geometry.bounds
             stored_segment_ids = "|".join(feature.segment_ids)
             connection.execute(
                 """INSERT INTO block_faces
                 (block_face_id, origin_block_face_id, segment_id, borough, street_name, side,
-                 geometry_wkt, min_x, min_y, max_x, max_y)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 geometry_wkt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     feature.block_face_id,
@@ -249,24 +210,8 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
                     feature.borough,
                     feature.street_name,
                     feature.side,
-                    _compatible_wkt(feature.geometry),
-                    min_x,
-                    min_y,
-                    max_x,
-                    max_y,
+                    feature.geometry.wkt,
                 ),
-            )
-            rtree_map_cursor = connection.execute(
-                "INSERT INTO block_face_rtree_map (block_face_id) VALUES (?)",
-                (feature.block_face_id,),
-            )
-            rtree_id = rtree_map_cursor.lastrowid
-            if rtree_id is None:
-                raise RuntimeError(f"SQLite did not assign an R-tree ID for {feature.block_face_id}")
-            connection.execute(
-                "INSERT OR REPLACE INTO block_faces_rtree "
-                "(rtree_id, min_x, max_x, min_y, max_y) VALUES (?, ?, ?, ?, ?)",
-                (rtree_id, min_x, max_x, min_y, max_y),
             )
             schedule_rows = [
                 (
@@ -347,8 +292,8 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
             """INSERT INTO unknown_block_faces
             (unknown_id, technical_identity, segment_id, borough, street_name, side,
              reason_code, reason, identity_method, geometry_method, geometry_wkt,
-             min_x, min_y, max_x, max_y, evidence_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             evidence_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     item.unknown_id,
@@ -361,8 +306,7 @@ def load_prepared_payload(prepared: PreparedPayload, database: str | Path) -> in
                     item.reason,
                     item.identity_method,
                     item.geometry_method,
-                    _compatible_wkt(item.geometry),
-                    *item.geometry.bounds,
+                    item.geometry.wkt,
                     _canonical_json(item.evidence),
                 )
                 for item in unknown_features
@@ -378,7 +322,7 @@ def _validate_feature(
     feature: object,
     feature_number: int,
     *,
-    schema_revision: int = 2,
+    schema_revision: int = 3,
 ) -> ValidatedFeature:
     if not isinstance(feature, dict) or feature.get("type") != "Feature":
         raise ValueError(f"feature {feature_number} must be a GeoJSON Feature")
@@ -463,7 +407,6 @@ def _validate_feature(
         properties.get("schedule_states"),
         schedules,
         feature_number,
-        required=schema_revision >= 3,
     )
     refuse_days = _validate_days(
         properties["refuse_days"],
@@ -534,21 +477,7 @@ def _validate_schedule_states(
     value: object,
     schedules: dict[str, tuple[str, ...]],
     feature_number: int,
-    *,
-    required: bool,
 ) -> dict[str, dict[str, object]]:
-    if value is None and not required:
-        return {
-            collection_type: {
-                "state": "SOURCE_EXPLICIT" if schedules[collection_type] else "UNKNOWN_SOURCE_BLANK",
-                "source_field": SCHEDULE_FIELDS[collection_type],
-                "raw_value": ",".join(schedules[collection_type]) or None,
-                "rule_id": None,
-                "source_policy_conflict": False,
-                "provenance": "Legacy v2 processed artifact",
-            }
-            for collection_type in COLLECTION_TYPES
-        }
     if not isinstance(value, dict) or set(value) != set(COLLECTION_TYPES):
         raise ValueError(
             f"feature {feature_number} schedule_states must contain exactly "
@@ -910,28 +839,6 @@ def _conflicting_fields(group: list[ValidatedFeature]) -> list[str]:
     if len(state_signatures) > 1:
         conflicts.append("schedule_states")
     return conflicts
-
-
-def _compatible_wkt(geometry: BaseGeometry) -> str:
-    # The current API's deliberately small WKT reader expects no whitespace
-    # between MultiLineString components.
-    return geometry.wkt.replace("), (", "),(")
-
-
-def _ensure_columns(
-    connection: sqlite3.Connection,
-    table_name: str,
-    columns: dict[str, str],
-) -> None:
-    existing = {
-        str(row[1])
-        for row in connection.execute(f"PRAGMA table_info({table_name})")
-    }
-    for column_name, declaration in columns.items():
-        if column_name not in existing:
-            connection.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {declaration}"
-            )
 
 
 def main() -> None:

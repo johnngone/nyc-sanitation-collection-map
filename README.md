@@ -26,6 +26,8 @@ Open `http://SERVER-IP:8080`. Replace `8080` with your `HOST_PORT` value.
 
 The first refresh downloads the source data and builds the map release. The basemap loads before that work is done. Street schedules appear after the release passes validation.
 
+Version 2 uses a fresh-only persisted-data contract. Start it with an empty data directory; manifests and artifacts created by earlier versions are deliberately rejected. Do not point a v2 container at a v1 data volume.
+
 Release images are published for both `linux/amd64` and `linux/arm64`. Docker automatically pulls the matching image for the host, including an Oracle Cloud Ampere A1 VM. Use a GitHub release tag instead of `latest` when you want a pinned deployment. Published images use the form `ghcr.io/johnngone/nyc-sanitation-collection-map:<release-tag>`.
 
 Set the `APP_*` variables to customize visible branding and the metadata returned in the initial HTML response. Recreate the container after changing them; the image does not need to be rebuilt. Set `APP_PUBLIC_URL` to the deployment's public HTTPS origin without a trailing slash. It supplies the canonical URL, social image URL, sitemap, and structured-data URL.
@@ -112,11 +114,13 @@ Compose mounts `./data` at `/app/data`.
 | Endpoint | Use |
 | --- | --- |
 | `GET /api/health` | Release status record counts and artifact checks |
+| `GET /api/live` | Process liveness; always `200` while the server is running |
 | `GET /api/map-config` | Current vector tile URL and map availability |
 | `GET /api/tiles/{version}/{z}/{x}/{y}.pbf` | Gzip vector tiles used by the map |
-| `GET /api/refuse-streets?day=MON&types=REFUSE` | Legacy GeoJSON query limited to 20000 features |
 
-The frontend uses `/api/map-config` and vector tiles. Keep `/api/refuse-streets` for compatibility or diagnostics.
+Before the first release is committed, `/api/live` and the frontend return `200`, `/api/health` returns `503`, `/api/map-config` returns `available: false`, and tile URLs return `404`. The basemap remains usable while the frontend retries. `/api/refuse-streets` and `/api/app-config` do not exist.
+
+Interactive API documentation is available at `/docs`, `/redoc`, and `/openapi.json` in development. All three routes return `404` when `APP_ENV=production`.
 
 ## Troubleshooting
 
@@ -142,8 +146,10 @@ Start the frontend in another terminal.
 ```bash
 cd frontend
 npm ci
-npm run dev
+VITE_API_BASE_URL=http://127.0.0.1:8000 npm run dev
 ```
+
+In PowerShell, use `$env:VITE_API_BASE_URL='http://127.0.0.1:8000'; npm run dev`. There is intentionally no Vite proxy; set this URL explicitly whenever the frontend and backend use different origins.
 
 Use `python scripts/run_refresh.py --allow-large-run` to build a local dataset from the official sources. Run `python scripts/run_refresh.py --status` to inspect the current release.
 

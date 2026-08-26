@@ -43,13 +43,35 @@ jobs:
           cleanup() { docker logs nyc-sanitation-map-test 2>&1 || true; docker rm -f nyc-sanitation-map-test >/dev/null 2>&1 || true; }
           trap cleanup EXIT
 
+          docker run -d --name nyc-sanitation-map-test \
+            -e APP_ENV=production \
+            -e DATA_REFRESH_ENABLED=false \
+            -p 18080:8000 \
+            -v "${smoke_data}:/app/data" \
+            nyc-sanitation-map:test
+          for attempt in {1..30}; do
+            curl --fail --silent http://127.0.0.1:18080/api/live >/dev/null && break
+            sleep 1
+          done
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18080/)" = "200"
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18080/api/live)" = "200"
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18080/api/health)" = "503"
+          test "$(curl --silent http://127.0.0.1:18080/api/map-config | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["available"]).lower())')" = "false"
+          for path in /api/refuse-streets /api/app-config /docs /redoc /openapi.json /api/tiles/unpublished/11/0/0.pbf; do
+            test "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:18080${path}")" = "404"
+          done
+          test -z "$(find "${smoke_data}" -mindepth 1 -print -quit)"
+          docker rm -f nyc-sanitation-map-test >/dev/null
+
           docker run --rm --entrypoint python \
             -v "${smoke_data}:/smoke-data" \
             nyc-sanitation-map:test \
             scripts/build_smoke_release.py --data-dir /smoke-data >"${fixture_json}"
+          docker run --rm --entrypoint python -v "${smoke_data}:/smoke-data:ro" nyc-sanitation-map:test -c \
+            'import json,sqlite3,pathlib; f=json.load(open("/smoke-data/data_manifest.json")); d=pathlib.Path("/smoke-data")/f["release_path"]/"app.sqlite3"; c=sqlite3.connect(d); cols={r[1] for r in c.execute("pragma table_info(block_faces)")}; tables={r[0] for r in c.execute("select name from sqlite_master where type in (?,?)",("table","view"))}; assert cols=={"block_face_id","origin_block_face_id","segment_id","borough","street_name","side","geometry_wkt"}; assert not {"lookup_cache","block_face_rtree_map","block_faces_rtree"}&tables; assert dict(c.execute("select key,value from dataset_metadata"))["database_schema_revision"]=="1"'
 
           docker run -d --name nyc-sanitation-map-test \
-            -e APP_ENV=ci-smoke \
+            -e APP_ENV=production \
             -e DATA_REFRESH_ENABLED=false \
             -p 18080:8000 \
             -v "${smoke_data}:/app/data" \
@@ -77,7 +99,8 @@ jobs:
           config = json.load(open(sys.argv[2], encoding="utf-8"))
           fixture = json.load(open(sys.argv[3], encoding="utf-8"))
           assert health["status"] == "ok"
-          assert health["environment"] == "ci-smoke"
+          assert health["environment"] == "production"
+          assert health["data_manifest"] == 4
           assert health["map_available"] is True
           assert health["artifact_integrity"] == "verified"
           assert health["dataset_version"] == fixture["version"]

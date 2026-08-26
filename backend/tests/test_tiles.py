@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app import api
 from app.database import initialize
 from app.main import app
+from app.tiles import read_metadata
 from scripts.build_tiles import (
     DEFAULT_MAX_COMPRESSED_TILE_BYTES,
     DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES,
@@ -26,7 +27,7 @@ def _write_mbtiles(
     *,
     version: str = "dataset-v1",
     tile: bytes | None = b"encoded-pbf",
-    tile_schema_revision: int = 2,
+    tile_schema_revision: int = 4,
 ) -> None:
     layer_metadata = {
         "vector_layers": [
@@ -35,7 +36,13 @@ def _write_mbtiles(
                 "fields": {"id": "String"},
                 "minzoom": 1,
                 "maxzoom": 2,
-            }
+            },
+            {
+                "id": "collection_unknowns",
+                "fields": {"street_name": "String"},
+                "minzoom": 1,
+                "maxzoom": 2,
+            },
         ]
     }
     with sqlite3.connect(path) as connection:
@@ -51,6 +58,8 @@ def _write_mbtiles(
                 ("version", version),
                 ("tile_schema_revision", str(tile_schema_revision)),
                 ("source_layer", "collection_streets"),
+                ("unknown_source_layer", "collection_unknowns"),
+                ("unknown_minzoom", "1"),
                 ("minzoom", "1"),
                 ("maxzoom", "2"),
                 ("bounds", "-74.3,40.4,-73.6,40.95"),
@@ -71,11 +80,13 @@ def _source_database(path, *, include_schedule: bool = True) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(
             """INSERT INTO block_faces
-               (block_face_id, origin_block_face_id, segment_id, borough, street_name, side, geometry_wkt,
-                min_x, min_y, max_x, max_y)
+               (block_face_id, origin_block_face_id, segment_id, borough, street_name, side, geometry_wkt)
                VALUES ('bf-1', 'bf-1', 'seg-1', 'BROOKLYN', 'EXAMPLE STREET', 'LEFT',
-                       'LINESTRING (-74.0 40.6, -73.99 40.61)',
-                       -74.0, 40.6, -73.99, 40.61)"""
+                       'LINESTRING (-74.0 40.6, -73.99 40.61)')"""
+        )
+        connection.executemany(
+            "INSERT INTO dataset_metadata(key, value) VALUES (?, ?)",
+            [("dataset_version", "database-v4")],
         )
         if include_schedule:
             connection.executemany(
@@ -98,10 +109,34 @@ def _source_database(path, *, include_schedule: bool = True) -> None:
             )
 
 
+def _runtime_pointer(tmp_path, archive, *, version="dataset-v1"):
+    data = tmp_path / "data"
+    release = data / "releases" / version
+    release.mkdir(parents=True)
+    target = release / "collection_streets.mbtiles"
+    target.write_bytes(archive.read_bytes())
+    database = release / "app.sqlite3"
+    database.write_bytes(b"runtime-binding")
+    pointer = data / "data_manifest.json"
+    pointer.write_text(json.dumps({
+        "manifest_version": 4,
+        "dataset_version": version,
+        "release_path": f"releases/{version}",
+        "artifacts": {
+            "database": {"path": "app.sqlite3", "sha256": hashlib.sha256(database.read_bytes()).hexdigest(), "database_schema_revision": 1},
+            "tileset": {"path": "collection_streets.mbtiles", "sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "tile_schema_revision": 4},
+        },
+        "database": {"database_schema_revision": 1},
+        "tileset": {"tile_schema_revision": 4},
+        "previous_releases": [],
+    }), encoding="utf-8")
+    return pointer
+
+
 def test_map_config_and_tile_response(tmp_path, monkeypatch) -> None:
     archive = tmp_path / "streets.mbtiles"
     _write_mbtiles(archive)
-    monkeypatch.setattr(api, "TILESET_PATH", str(archive))
+    monkeypatch.setattr(api, "DATA_MANIFEST_PATH", str(_runtime_pointer(tmp_path, archive)))
     client = TestClient(app)
 
     config_response = client.get("/api/map-config")
@@ -109,12 +144,11 @@ def test_map_config_and_tile_response(tmp_path, monkeypatch) -> None:
     assert config_response.json() == {
         "available": True,
         "version": "dataset-v1",
-        "tile_schema_revision": 2,
+        "tile_schema_revision": 4,
         "tiles_url": "/api/tiles/dataset-v1/{z}/{x}/{y}.pbf",
         "source_layer": "collection_streets",
-        "known_source_layer": "collection_streets",
-        "unknown_source_layer": None,
-        "unknown_minzoom": None,
+        "unknown_source_layer": "collection_unknowns",
+        "unknown_minzoom": 1,
         "minzoom": 1,
         "maxzoom": 2,
         "bounds": [-74.3, 40.4, -73.6, 40.95],
@@ -137,10 +171,19 @@ def test_map_config_and_tile_response(tmp_path, monkeypatch) -> None:
     assert cached_response.status_code == 304
 
 
+@pytest.mark.parametrize("tile_revision", [2, 3, 5])
+def test_runtime_rejects_noncurrent_tile_schema(tmp_path, tile_revision) -> None:
+    archive = tmp_path / f"schema-{tile_revision}.mbtiles"
+    _write_mbtiles(archive, tile_schema_revision=tile_revision)
+
+    with pytest.raises(ValueError, match="schema revision must be 4"):
+        read_metadata(archive)
+
+
 def test_tile_route_validates_version_coordinates_and_missing_tiles(tmp_path, monkeypatch) -> None:
     archive = tmp_path / "streets.mbtiles"
     _write_mbtiles(archive)
-    monkeypatch.setattr(api, "TILESET_PATH", str(archive))
+    monkeypatch.setattr(api, "DATA_MANIFEST_PATH", str(_runtime_pointer(tmp_path, archive)))
     client = TestClient(app)
 
     assert client.get("/api/tiles/old/1/0/0.pbf").status_code == 404
@@ -151,13 +194,13 @@ def test_tile_route_validates_version_coordinates_and_missing_tiles(tmp_path, mo
 
 def test_manifest_serves_current_and_retained_previous_but_not_uncommitted(tmp_path, monkeypatch) -> None:
     data = tmp_path / "data"
-    current_dir = data / "releases" / "current-v2"
-    previous_dir = data / "releases" / "previous-v2"
-    uncommitted_dir = data / "releases" / "uncommitted-v2"
+    current_dir = data / "releases" / "current-v4"
+    previous_dir = data / "releases" / "previous-v4"
+    uncommitted_dir = data / "releases" / "uncommitted-v4"
     for directory, version, tile in (
-        (current_dir, "current-v2", b"current"),
-        (previous_dir, "previous-v2", b"previous"),
-        (uncommitted_dir, "uncommitted-v2", b"uncommitted"),
+        (current_dir, "current-v4", b"current"),
+        (previous_dir, "previous-v4", b"previous"),
+        (uncommitted_dir, "uncommitted-v4", b"uncommitted"),
     ):
         directory.mkdir(parents=True)
         _write_mbtiles(directory / "collection_streets.mbtiles", version=version, tile=tile)
@@ -169,27 +212,32 @@ def test_manifest_serves_current_and_retained_previous_but_not_uncommitted(tmp_p
     pointer.write_text(
         json.dumps(
             {
-                "manifest_version": 2,
-                "dataset_version": "current-v2",
-                "release_path": "releases/current-v2",
+                "manifest_version": 4,
+                "dataset_version": "current-v4",
+                "release_path": "releases/current-v4",
                 "artifacts": {
                     "database": {
                         "path": "app.sqlite3",
                         "sha256": hashlib.sha256(current_database.read_bytes()).hexdigest(),
+                        "database_schema_revision": 1,
                     },
                     "tileset": {
                         "path": "collection_streets.mbtiles",
                         "sha256": hashlib.sha256(current_tileset.read_bytes()).hexdigest(),
+                        "tile_schema_revision": 4,
                     },
                 },
+                "database": {"database_schema_revision": 1},
+                "tileset": {"tile_schema_revision": 4},
                 "previous_releases": [
                     {
-                        "dataset_version": "previous-v2",
-                        "release_path": "releases/previous-v2",
+                        "dataset_version": "previous-v4",
+                        "release_path": "releases/previous-v4",
                         "artifacts": {
                             "tileset": {
                                 "path": "collection_streets.mbtiles",
                                 "sha256": hashlib.sha256(previous_tileset.read_bytes()).hexdigest(),
+                                "tile_schema_revision": 4,
                             }
                         },
                     }
@@ -199,17 +247,16 @@ def test_manifest_serves_current_and_retained_previous_but_not_uncommitted(tmp_p
         encoding="utf-8",
     )
     monkeypatch.setattr(api, "DATA_MANIFEST_PATH", str(pointer))
-    monkeypatch.setattr(api, "TILESET_PATH", str(tmp_path / "legacy-must-not-be-used.mbtiles"))
     client = TestClient(app)
 
-    assert client.get("/api/map-config").json()["version"] == "current-v2"
-    assert client.get("/api/tiles/current-v2/1/0/0.pbf").content == b"current"
-    assert client.get("/api/tiles/previous-v2/1/0/0.pbf").content == b"previous"
-    assert client.get("/api/tiles/uncommitted-v2/1/0/0.pbf").status_code == 404
+    assert client.get("/api/map-config").json()["version"] == "current-v4"
+    assert client.get("/api/tiles/current-v4/1/0/0.pbf").content == b"current"
+    assert client.get("/api/tiles/previous-v4/1/0/0.pbf").content == b"previous"
+    assert client.get("/api/tiles/uncommitted-v4/1/0/0.pbf").status_code == 404
 
 
 def test_map_config_reports_unavailable_archive(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(api, "TILESET_PATH", str(tmp_path / "missing.mbtiles"))
+    monkeypatch.setattr(api, "DATA_MANIFEST_PATH", str(tmp_path / "missing-manifest.json"))
     response = TestClient(app).get("/api/map-config")
     assert response.status_code == 200
     assert response.json()["available"] is False
@@ -407,21 +454,19 @@ def test_builder_reconciles_subgrid_scheduled_face_without_blocking_release(tmp_
     with sqlite3.connect(database) as connection:
         connection.execute(
             """UPDATE block_faces
-               SET geometry_wkt = 'LINESTRING (-74 40.6, -73.999999999 40.600000001)',
-                   min_x = -74, min_y = 40.6,
-                   max_x = -73.999999999, max_y = 40.600000001
+               SET geometry_wkt = 'LINESTRING (-74 40.6, -73.999999999 40.600000001)'
                WHERE block_face_id = 'bf-1'"""
         )
         connection.execute(
             """INSERT INTO unknown_block_faces
                (unknown_id, technical_identity, segment_id, borough, street_name, side,
                 reason_code, reason, identity_method, geometry_method, geometry_wkt,
-                min_x, min_y, max_x, max_y, evidence_json)
+                evidence_json)
                VALUES ('unknown-visible', 'LION:2:LEFT', '2', 'BROOKLYN', 'VISIBLE GAP', 'LEFT',
                        'OUTSIDE_DSNY_COVERAGE', 'No exact polygon coverage', 'UNRESOLVED',
                        'DIRECT_SIDE_TRACE_UNRESOLVED',
                        'LINESTRING (-74.0 40.6, -73.99 40.61)',
-                       -74.0, 40.6, -73.99, 40.61, '{}')"""
+                       '{}')"""
         )
 
     report = build_tiles(database, archive, minzoom=16, maxzoom=16, simplify_pixels=0)
@@ -457,12 +502,12 @@ def test_builder_reconciles_subgrid_unknown_without_fabricating_geometry(tmp_pat
             """INSERT INTO unknown_block_faces
                (unknown_id, technical_identity, segment_id, borough, street_name, side,
                 reason_code, reason, identity_method, geometry_method, geometry_wkt,
-                min_x, min_y, max_x, max_y, evidence_json)
+                evidence_json)
                VALUES ('unknown-tiny', 'LION:3:RIGHT', '3', 'QUEENS', 'TINY GAP', 'RIGHT',
                        'PARTIAL_GEOMETRY_GAP', 'Tiny uncovered source fragment',
                        'LION_BLOCK_FACE_ID', 'DIRECT_SIDE_TRACE_UNRESOLVED',
                        'LINESTRING (-74 40.6, -73.999999999 40.600000001)',
-                       -74, 40.6, -73.999999999, 40.600000001, '{}')"""
+                       '{}')"""
         )
 
     report = build_tiles(database, archive, minzoom=16, maxzoom=16, simplify_pixels=0)
@@ -542,16 +587,16 @@ def test_v4_unknown_layer_has_only_frontend_properties_and_survives_maxzoom(tmp_
             """INSERT INTO unknown_block_faces
                (unknown_id, technical_identity, segment_id, borough, street_name, side,
                 reason_code, reason, identity_method, geometry_method, geometry_wkt,
-                min_x, min_y, max_x, max_y, evidence_json)
+                evidence_json)
                VALUES (?, ?, ?, 'BROOKLYN', ?, 'LEFT', ?, ?, 'UNRESOLVED',
-                       'DIRECT_SIDE_TRACE_UNRESOLVED', ?, ?, ?, ?, ?, '{}')""",
+                       'DIRECT_SIDE_TRACE_UNRESOLVED', ?, '{}')""",
             [
                 ('unknown-1', 'LION:1:LEFT', '1', 'UNKNOWN STREET',
                  'OUTSIDE_DSNY_COVERAGE', 'No exact polygon coverage',
-                 'LINESTRING (-74.0 40.6, -73.99 40.61)', -74.0, 40.6, -73.99, 40.61),
+                 'LINESTRING (-74.0 40.6, -73.99 40.61)'),
                 ('unknown-2', 'LION:2:LEFT', '2', 'EVIDENCE STREET',
                  'INSUFFICIENT_ADDRESS_EVIDENCE', 'Insufficient address evidence',
-                 'LINESTRING (-73.99 40.61, -73.98 40.62)', -73.99, 40.61, -73.98, 40.62),
+                 'LINESTRING (-73.99 40.61, -73.98 40.62)'),
             ],
         )
 
@@ -589,10 +634,10 @@ def test_v4_unknown_mvt_ids_are_compact_stable_and_unique(tmp_path) -> None:
             """INSERT INTO unknown_block_faces
                (unknown_id, technical_identity, segment_id, borough, street_name, side,
                 reason_code, reason, identity_method, geometry_method, geometry_wkt,
-                min_x, min_y, max_x, max_y, evidence_json)
+                evidence_json)
                VALUES (?, ?, ?, 'BROOKLYN', ?, ?, 'OUTSIDE_DSNY_COVERAGE',
                        'No exact polygon coverage', 'UNRESOLVED',
-                       'DIRECT_SIDE_TRACE_UNRESOLVED', ?, ?, ?, ?, ?, '{}')""",
+                       'DIRECT_SIDE_TRACE_UNRESOLVED', ?, '{}')""",
             [
                 (
                     "unknown-z",
@@ -601,10 +646,6 @@ def test_v4_unknown_mvt_ids_are_compact_stable_and_unique(tmp_path) -> None:
                     "ZULU UNKNOWN",
                     "RIGHT",
                     "LINESTRING (-73.98 40.62, -73.97 40.63)",
-                    -73.98,
-                    40.62,
-                    -73.97,
-                    40.63,
                 ),
                 (
                     "unknown-a",
@@ -613,10 +654,6 @@ def test_v4_unknown_mvt_ids_are_compact_stable_and_unique(tmp_path) -> None:
                     "ALPHA UNKNOWN",
                     "LEFT",
                     "LINESTRING (-74.0 40.6, -73.99 40.61)",
-                    -74.0,
-                    40.6,
-                    -73.99,
-                    40.61,
                 ),
             ],
         )

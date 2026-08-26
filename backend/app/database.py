@@ -3,6 +3,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Iterator
 
+DATABASE_SCHEMA_REVISION = 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS block_faces (
@@ -12,14 +13,7 @@ CREATE TABLE IF NOT EXISTS block_faces (
     borough TEXT NOT NULL,
     street_name TEXT NOT NULL,
     side TEXT NOT NULL CHECK (side IN ('LEFT', 'RIGHT')),
-    geometry_wkt TEXT NOT NULL,
-    min_x REAL NOT NULL,
-    min_y REAL NOT NULL,
-    max_x REAL NOT NULL,
-    max_y REAL NOT NULL,
-    sample_address TEXT,
-    sample_latitude REAL,
-    sample_longitude REAL
+    geometry_wkt TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS block_face_lion_components (
@@ -80,44 +74,12 @@ CREATE TABLE IF NOT EXISTS unknown_block_faces (
     identity_method TEXT NOT NULL,
     geometry_method TEXT NOT NULL,
     geometry_wkt TEXT NOT NULL,
-    min_x REAL NOT NULL,
-    min_y REAL NOT NULL,
-    max_x REAL NOT NULL,
-    max_y REAL NOT NULL,
     evidence_json TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS lookup_cache (
-    lookup_key TEXT PRIMARY KEY,
-    input_address TEXT NOT NULL,
-    borough TEXT,
-    bin TEXT,
-    bbl TEXT,
-    latitude REAL,
-    longitude REAL,
-    refuse_days_json TEXT,
-    raw_response_json TEXT,
-    http_status INTEGER,
-    lookup_status TEXT NOT NULL,
-    error_message TEXT,
-    queried_at TEXT NOT NULL,
-    source TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS dataset_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS block_face_rtree_map (
-    rtree_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    block_face_id TEXT NOT NULL UNIQUE REFERENCES block_faces(block_face_id)
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS block_faces_rtree USING rtree(
-    rtree_id,
-    min_x, max_x,
-    min_y, max_y
 );
 
 """
@@ -127,11 +89,6 @@ SECONDARY_INDEXES = {
     "idx_schedule_type_day_face": "ON collection_schedules(collection_type, weekday, block_face_id)",
     "idx_collection_state_type": "ON block_face_collection_states(collection_type, state)",
     "idx_unknown_reason": "ON unknown_block_faces(reason_code)",
-    "idx_block_face_bbox": "ON block_faces(min_x, max_x, min_y, max_y)",
-    "idx_block_face_min_x": "ON block_faces(min_x)",
-    "idx_block_face_max_x": "ON block_faces(max_x)",
-    "idx_block_face_min_y": "ON block_faces(min_y)",
-    "idx_block_face_max_y": "ON block_faces(max_y)",
     "idx_block_face_borough": "ON block_faces(borough)",
     "idx_block_face_origin": "ON block_faces(origin_block_face_id)",
     "idx_dsny_source_object": "ON block_face_dsny_sources(dsny_object_id)",
@@ -159,16 +116,10 @@ def initialize(database_path: str | Path, *, create_indexes: bool = True) -> Non
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(database_path)) as connection:
         connection.executescript(SCHEMA)
-        columns = {
-            str(row[1])
-            for row in connection.execute("PRAGMA table_info(block_faces)")
-        }
-        if "origin_block_face_id" not in columns:
-            connection.execute("ALTER TABLE block_faces ADD COLUMN origin_block_face_id TEXT")
-            connection.execute(
-                "UPDATE block_faces SET origin_block_face_id = block_face_id "
-                "WHERE origin_block_face_id IS NULL"
-            )
+        connection.execute(
+            "INSERT OR REPLACE INTO dataset_metadata(key, value) VALUES (?, ?)",
+            ("database_schema_revision", str(DATABASE_SCHEMA_REVISION)),
+        )
         if create_indexes:
             create_secondary_indexes(connection)
         connection.commit()

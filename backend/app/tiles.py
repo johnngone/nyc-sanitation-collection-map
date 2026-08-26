@@ -14,6 +14,7 @@ from pathlib import Path
 
 SOURCE_LAYER = "collection_streets"
 UNKNOWN_SOURCE_LAYER = "collection_unknowns"
+TILE_SCHEMA_REVISION = 4
 VECTOR_TILE_MEDIA_TYPE = "application/vnd.mapbox-vector-tile"
 VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -23,8 +24,8 @@ class TilesetMetadata:
     version: str
     tile_schema_revision: int
     source_layer: str
-    unknown_source_layer: str | None
-    unknown_minzoom: int | None
+    unknown_source_layer: str
+    unknown_minzoom: int
     minzoom: int
     maxzoom: int
     bounds: tuple[float, float, float, float]
@@ -72,13 +73,13 @@ def _cached_metadata(path_string: str, mtime_ns: int, size: int) -> TilesetMetad
     ):
         raise ValueError("tileset metadata has invalid geographic bounds")
     try:
-        tile_schema_revision = int(values.get("tile_schema_revision", "1"))
+        tile_schema_revision = int(values["tile_schema_revision"])
     except (TypeError, ValueError) as error:
         raise ValueError("tileset metadata has an invalid schema revision") from error
-    if tile_schema_revision <= 0:
-        raise ValueError("tileset metadata has an invalid schema revision")
+    if tile_schema_revision != TILE_SCHEMA_REVISION:
+        raise ValueError(f"tileset schema revision must be {TILE_SCHEMA_REVISION}")
 
-    source_layer = values.get("source_layer", SOURCE_LAYER)
+    source_layer = values.get("source_layer")
     vector_metadata = values.get("json")
     layer_ids: set[object] = set()
     if vector_metadata:
@@ -89,19 +90,19 @@ def _cached_metadata(path_string: str, mtime_ns: int, size: int) -> TilesetMetad
         layer_ids = {layer.get("id") for layer in layers if isinstance(layer, dict)}
         if source_layer not in layer_ids:
             raise ValueError("tileset metadata does not describe its source layer")
+    else:
+        raise ValueError("tileset vector layer metadata is missing")
     if source_layer != SOURCE_LAYER:
         raise ValueError(f"tileset source layer must be {SOURCE_LAYER}")
-    unknown_source_layer = values.get("unknown_source_layer") or None
-    unknown_minzoom: int | None = None
-    if tile_schema_revision >= 3:
-        if unknown_source_layer != UNKNOWN_SOURCE_LAYER or unknown_source_layer not in layer_ids:
-            raise ValueError("v3 tileset metadata does not describe its unknown source layer")
-        try:
-            unknown_minzoom = int(values["unknown_minzoom"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("v3 tileset metadata has invalid unknown minimum zoom") from error
-        if not minzoom <= unknown_minzoom <= maxzoom:
-            raise ValueError("v3 unknown minimum zoom is outside tileset bounds")
+    unknown_source_layer = values.get("unknown_source_layer") or ""
+    if unknown_source_layer != UNKNOWN_SOURCE_LAYER or unknown_source_layer not in layer_ids:
+        raise ValueError("tileset metadata does not describe its unknown source layer")
+    try:
+        unknown_minzoom = int(values["unknown_minzoom"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("tileset metadata has invalid unknown minimum zoom") from error
+    if not minzoom <= unknown_minzoom <= maxzoom:
+        raise ValueError("unknown minimum zoom is outside tileset bounds")
 
     return TilesetMetadata(
         version=version,

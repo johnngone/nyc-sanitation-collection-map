@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.app.database import initialize
+from backend.app.database import DATABASE_SCHEMA_REVISION, initialize
 from backend.app.releases import MANIFEST_VERSION, VERSION_PATTERN
 from scripts.build_tiles import build_tiles
 from scripts.release_validation import (
@@ -36,22 +36,10 @@ def _build_database(path: Path, version: str) -> None:
         connection.execute(
             """INSERT INTO block_faces
                (block_face_id, origin_block_face_id, segment_id, borough,
-                street_name, side, geometry_wkt, min_x, min_y, max_x, max_y)
+                street_name, side, geometry_wkt)
                VALUES ('smoke-face', 'smoke-origin', 'smoke-segment', 'QUEENS',
                        'SMOKE TEST STREET', 'LEFT',
-                       'LINESTRING (-73.99 40.70, -73.98 40.71)',
-                       ?, ?, ?, ?)""",
-            (WEST, SOUTH, EAST, NORTH),
-        )
-        connection.execute(
-            "INSERT INTO block_face_rtree_map(block_face_id) VALUES ('smoke-face')"
-        )
-        rtree_id = connection.execute(
-            "SELECT rtree_id FROM block_face_rtree_map WHERE block_face_id = 'smoke-face'"
-        ).fetchone()[0]
-        connection.execute(
-            "INSERT INTO block_faces_rtree VALUES (?, ?, ?, ?, ?)",
-            (rtree_id, WEST, EAST, SOUTH, NORTH),
+                       'LINESTRING (-73.99 40.70, -73.98 40.71)')"""
         )
         connection.execute(
             """INSERT INTO block_face_lion_components
@@ -90,7 +78,7 @@ def _build_database(path: Path, version: str) -> None:
 
 
 def build_smoke_release(data_dir: str | Path, version: str = DEFAULT_VERSION) -> dict[str, object]:
-    """Create a checked SQLite/MBTiles pair and commit its v2 pointer last."""
+    """Create a checked SQLite/MBTiles pair and commit its v4 pointer last."""
 
     if not VERSION_PATTERN.fullmatch(version):
         raise ValueError("version must be a URL-safe release identifier")
@@ -144,6 +132,7 @@ def build_smoke_release(data_dir: str | Path, version: str = DEFAULT_VERSION) ->
             "database": {
                 "path": database.name,
                 "sha256": database_summary["sha256"],
+                "database_schema_revision": DATABASE_SCHEMA_REVISION,
             },
             "tileset": {
                 "path": tileset.name,

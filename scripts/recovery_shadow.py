@@ -1,6 +1,6 @@
 """Fail-closed evidence gates for identity and geometry recovery.
 
-The initial v3 rollout records candidates and source versions only.  Promotion
+The current rollout records candidates and source versions only. Promotion
 stays disabled until matching releases, deterministic shadow builds, and the
 required manual samples have all been recorded.
 """

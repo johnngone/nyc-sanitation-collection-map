@@ -39,6 +39,7 @@ from scripts.release_validation import (
     validate_tile_build_report,
     validate_tileset,
 )
+from backend.app.database import DATABASE_SCHEMA_REVISION
 from backend.app.releases import MANIFEST_VERSION, read_current_release
 from scripts.recovery_shadow import (
     GEOMETRY_RULE_VERSION,
@@ -56,7 +57,7 @@ ADDRESSPOINT_METADATA_URL = "https://data.cityofnewyork.us/api/views/6xyb-j5pk"
 LION_METADATA_URL = "https://data.cityofnewyork.us/api/views/2v4z-66xt"
 PAD_METADATA_URL = "https://data.cityofnewyork.us/api/views/bc8t-ecyu"
 CSCL_METADATA_URL = "https://services.arcgis.com/uKN48PkxmWiqJM9q/ArcGIS/rest/services/cscl/FeatureServer/1"
-USER_AGENT = "nyc-sanitation-map/1.0"
+USER_AGENT = "nyc-sanitation-map/2.0"
 DOWNLOAD_PROGRESS_BYTES = 16 * 1024 * 1024
 DOWNLOAD_PROGRESS_SECONDS = 30.0
 REFRESH_FINGERPRINT_VERSION = 1
@@ -132,6 +133,8 @@ def processing_fingerprint(
         "schemas": {
             "manifest_version": MANIFEST_VERSION,
             "processed_geojson_revision": 3,
+            "ingestion_audit_version": 3,
+            "database_schema_revision": DATABASE_SCHEMA_REVISION,
             "tile_schema_revision": EXPECTED_TILE_SCHEMA_REVISION,
         },
         "code_sha256": code_sha256,
@@ -591,6 +594,7 @@ def _bind_database_metadata(
     audit_sha256: str,
 ) -> None:
     values = {
+        "database_schema_revision": str(DATABASE_SCHEMA_REVISION),
         "dataset_version": dataset_version,
         "processed_sha256": processed_sha256,
         "processed_semantic_sha256": processed_semantic_sha256,
@@ -1212,6 +1216,7 @@ def main() -> None:
             "artifacts": {
                 "database": _artifact(
                     staged_db,
+                    database_schema_revision=DATABASE_SCHEMA_REVISION,
                     dataset_version=dataset_version,
                     block_faces=database_summary["block_faces"],
                     schedule_count=database_summary["schedule_count"],

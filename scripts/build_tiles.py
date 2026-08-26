@@ -61,7 +61,7 @@ DAY_FIELDS = {
     "ORGANICS": "organics_days",
     "BULK": "bulk_days",
 }
-OPTIONAL_SOURCE_ID_COLUMNS = ("origin_block_face_id", "source_block_face_id")
+SOURCE_ID_COLUMNS = ("origin_block_face_id",)
 VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -220,17 +220,12 @@ def _source_database_version(
 ) -> str:
     if explicit_version:
         return explicit_version
-    if "dataset_metadata" in {
-        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }:
-        metadata = dict(connection.execute("SELECT key, value FROM dataset_metadata"))
-        for key in ("dataset_version", "source_version", "version", "manifest_version"):
-            value = str(metadata.get(key, "")).strip()
-            if value:
-                return value
-    # A raw file digest is an exact, always-available source revision even for
-    # databases that predate dataset_metadata versioning.
-    return database_sha256
+    del database_sha256
+    metadata = dict(connection.execute("SELECT key, value FROM dataset_metadata"))
+    value = str(metadata.get("dataset_version", "")).strip()
+    if not value:
+        raise RuntimeError("source database is missing dataset_metadata.dataset_version")
+    return value
 
 
 def _load_features(
@@ -244,9 +239,10 @@ def _load_features(
 ) -> SourceSnapshot:
     source_block_face_count, source_schedule_count, source_schedule_group_count = _validate_source(connection)
     block_face_columns = _table_columns(connection, "block_faces")
-    optional_source_id_fields = tuple(
-        field for field in OPTIONAL_SOURCE_ID_COLUMNS if field in block_face_columns
-    )
+    missing_source_id_fields = set(SOURCE_ID_COLUMNS) - block_face_columns
+    if missing_source_id_fields:
+        raise RuntimeError(f"source database is missing source ID columns: {sorted(missing_source_id_fields)}")
+    optional_source_id_fields = SOURCE_ID_COLUMNS
     encoder_version = importlib.metadata.version("mapbox-vector-tile")
     content_hash = hashlib.sha256()
     content_hash.update(
@@ -293,7 +289,7 @@ def _load_features(
             value = "" if row[field] is None else str(row[field]).strip()
             if not value:
                 raise RuntimeError(
-                    f"block face {properties['id']!r} has blank optional source ID column {field}"
+                    f"block face {properties['id']!r} has blank source ID column {field}"
                 )
             properties[field] = value
         blank = [key for key, value in properties.items() if not value]
@@ -1217,12 +1213,12 @@ def main() -> None:
     parser.add_argument(
         "--database",
         type=Path,
-        default=Path(os.getenv("DATABASE_PATH", "data/app.sqlite3")),
+        default=Path("data/app.sqlite3"),
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(os.getenv("TILESET_PATH", "data/collection_streets.mbtiles")),
+        default=Path("data/collection_streets.mbtiles"),
     )
     parser.add_argument("--minzoom", type=int, default=int(os.getenv("TILE_MIN_ZOOM", str(DEFAULT_MIN_ZOOM))))
     parser.add_argument("--maxzoom", type=int, default=int(os.getenv("TILE_MAX_ZOOM", str(DEFAULT_MAX_ZOOM))))

@@ -116,6 +116,17 @@ def geojson_feature(
             "side": "LEFT",
             "refuse_days": normalized_schedules["REFUSE"],
             "schedules": normalized_schedules,
+            "schedule_states": {
+                collection_type: {
+                    "state": "SOURCE_EXPLICIT" if days else "UNKNOWN_SOURCE_BLANK",
+                    "source_field": f"FREQ_{collection_type}",
+                    "raw_value": ",".join(days) if days else None,
+                    "rule_id": None,
+                    "source_policy_conflict": False,
+                    "provenance": "DSNY test fixture",
+                }
+                for collection_type, days in normalized_schedules.items()
+            },
             "dsny_object_ids": dsny_object_ids or ["101"],
             "dsny_sources": [
                 {"frequency_row": 0, "object_id": object_id}
@@ -134,6 +145,20 @@ def geojson_feature(
             "retrieved_at": "2026-08-19",
         },
     }
+
+
+@pytest.mark.parametrize("revision", [None, 2, 4])
+def test_loader_rejects_noncurrent_processed_schema(revision) -> None:
+    payload = {
+        "type": "FeatureCollection",
+        "schema_revision": revision,
+        "features": [
+            geojson_feature("face-1", "segment-1", [(-74.0, 40.7), (-73.99, 40.7)])
+        ],
+    }
+
+    with pytest.raises(ValueError, match="schema_revision must be 3"):
+        prepare_features(payload)
 
 
 def test_lion_source_read_projects_used_fields_and_applies_limit(monkeypatch) -> None:
@@ -1112,10 +1137,10 @@ def test_explicit_organics_conflict_is_preserved_and_flagged() -> None:
 
 def test_processed_digest_binds_exact_deterministic_payload_bytes() -> None:
     payload = {
-        "type": "FeatureCollection",
+        "type": "FeatureCollection", "schema_revision": 3,
         "features": [geojson_feature("face-1", "segment-1", [(-74.0, 40.7), (-73.99, 40.7)])],
     }
-    differently_ordered = {"features": payload["features"], "type": "FeatureCollection"}
+    differently_ordered = {"features": payload["features"], "type": "FeatureCollection", "schema_revision": 3}
 
     processed_bytes = serialize_processed_payload(payload)
     assert processed_bytes == serialize_processed_payload(differently_ordered)
@@ -1129,7 +1154,7 @@ def test_processed_digest_binds_exact_deterministic_payload_bytes() -> None:
 def test_loader_aggregates_duplicate_ids_and_removes_stale_schedules(tmp_path) -> None:
     database = tmp_path / "app.sqlite3"
     first_payload = {
-        "type": "FeatureCollection",
+        "type": "FeatureCollection", "schema_revision": 3,
         "features": [
             geojson_feature("shared", "segment-1", [(-74.0, 40.7), (-73.99, 40.7)]),
             geojson_feature(
@@ -1169,7 +1194,7 @@ def test_loader_aggregates_duplicate_ids_and_removes_stale_schedules(tmp_path) -
         "BULK": [],
     }
     replacement = {
-        "type": "FeatureCollection",
+        "type": "FeatureCollection", "schema_revision": 3,
         "features": [
             geojson_feature(
                 "shared",
@@ -1186,11 +1211,6 @@ def test_loader_aggregates_duplicate_ids_and_removes_stale_schedules(tmp_path) -
             "idx_schedule_type_day_face",
             "idx_collection_state_type",
             "idx_unknown_reason",
-            "idx_block_face_bbox",
-            "idx_block_face_min_x",
-            "idx_block_face_max_x",
-            "idx_block_face_min_y",
-            "idx_block_face_max_y",
             "idx_block_face_borough",
             "idx_block_face_origin",
             "idx_dsny_source_object",
@@ -1208,8 +1228,6 @@ def test_loader_aggregates_duplicate_ids_and_removes_stale_schedules(tmp_path) -
         ).fetchall()
         assert rows == [("REFUSE", "TUE")]
         assert connection.execute("SELECT COUNT(*) FROM block_faces").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM block_face_rtree_map").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM block_faces_rtree").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM block_face_dsny_sources").fetchone()[0] == 1
         assert connection.execute(
             "SELECT COUNT(*) FROM block_faces WHERE origin_block_face_id IS NOT NULL"
@@ -1271,7 +1289,7 @@ def test_loader_persists_split_feature_keys_origins_and_source_provenance(tmp_pa
 def test_loader_validates_before_writes_and_rejects_conflicting_duplicates(tmp_path) -> None:
     database = tmp_path / "app.sqlite3"
     conflicting = {
-        "type": "FeatureCollection",
+        "type": "FeatureCollection", "schema_revision": 3,
         "features": [
             geojson_feature("shared", "segment-1", [(-74.0, 40.7), (-73.99, 40.7)]),
             geojson_feature(
@@ -1293,7 +1311,7 @@ def test_loader_requires_exactly_four_schedule_types() -> None:
     del feature["properties"]["schedules"]["BULK"]
 
     with pytest.raises(ValueError, match="must contain exactly"):
-        prepare_features({"type": "FeatureCollection", "features": [feature]})
+        prepare_features({"type": "FeatureCollection", "schema_revision": 3, "features": [feature]})
 
 
 def test_loader_requires_component_segment_union_to_match_feature() -> None:
@@ -1301,7 +1319,7 @@ def test_loader_requires_component_segment_union_to_match_feature() -> None:
     feature["properties"]["segment_ids"].append("segment-2")
 
     with pytest.raises(ValueError, match="component segment IDs must exactly match"):
-        prepare_features({"type": "FeatureCollection", "features": [feature]})
+        prepare_features({"type": "FeatureCollection", "schema_revision": 3, "features": [feature]})
 
 
 def test_loader_requires_component_dsny_union_to_match_feature() -> None:
@@ -1314,7 +1332,7 @@ def test_loader_requires_component_dsny_union_to_match_feature() -> None:
     feature["properties"]["lion_components"][0]["dsny_object_ids"] = ["101"]
 
     with pytest.raises(ValueError, match="component DSNY IDs must exactly match"):
-        prepare_features({"type": "FeatureCollection", "features": [feature]})
+        prepare_features({"type": "FeatureCollection", "schema_revision": 3, "features": [feature]})
 
 
 @pytest.mark.parametrize(
@@ -1332,11 +1350,11 @@ def test_loader_requires_aligned_source_record_provenance(mutation, message: str
     mutation(source_record)
 
     with pytest.raises(ValueError, match=message):
-        prepare_features({"type": "FeatureCollection", "features": [feature]})
+        prepare_features({"type": "FeatureCollection", "schema_revision": 3, "features": [feature]})
 
 
 def test_loader_rejects_zero_length_geometry() -> None:
     feature = geojson_feature("face-1", "segment-1", [(-74.0, 40.7), (-74.0, 40.7)])
 
     with pytest.raises(ValueError, match="valid non-empty"):
-        prepare_features({"type": "FeatureCollection", "features": [feature]})
+        prepare_features({"type": "FeatureCollection", "schema_revision": 3, "features": [feature]})

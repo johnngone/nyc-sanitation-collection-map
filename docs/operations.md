@@ -21,14 +21,16 @@ official DSNY + LION sources
 
 FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not encode geometry during a request. The same standalone container runs the geospatial refresh scheduler in the background; completed release artifacts remain on the mounted data volume.
 
+`GET /api/live` is process liveness and backs the container health check. `GET /api/health` is release readiness and returns `503` until a committed release is fully verified. Production disables `/docs`, `/redoc`, and `/openapi.json`; development retains them.
+
 ## Vector-tile contract
 
-The default v4 archive is an MBTiles SQLite file covering zooms 11–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 14–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 14. The runtime continues to read retained v2 and v3 releases during rollout.
+The tile-v4 archive is an MBTiles SQLite file covering zooms 11–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 14–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 14. The runtime accepts only manifest v4 releases and tile schema v4.
 
 | Property | Meaning |
 |---|---|
 | `id` | Unique stored feature key |
-| `origin_block_face_id` | Original LION block-face ID when that column is present |
+| `origin_block_face_id` | Original LION block-face ID |
 | `street_name` | Display street name |
 | `borough`, `side` | Borough and `LEFT`/`RIGHT` side |
 | `refuse_days` | Comma-separated weekday codes |
@@ -89,7 +91,9 @@ The dataset version combines the processing timestamp and processed-data digest.
 
 Every attempt downloads and hashes the authoritative source snapshots first. If those bytes and revisions, the processing code/runtime, and the relevant build configuration exactly match the committed release, the refresh reruns the regression floors and then skips extraction, processing, SQLite loading, and tile generation.
 
-For a changed release, processed GeoJSON is parsed and normalized once; the same validated objects feed semantic hashing and SQLite loading. The final bundle gate reuses those in-process Stage 5-7 results while rechecking every artifact hash and cross-artifact binding. It then atomically renames the private directory into `releases/` on the same filesystem—without copying the multi-gigabyte bundle—and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. Malformed committed v2 or v3 manifest pointers fail closed instead of falling back to loose legacy files.
+For a changed release, processed GeoJSON is parsed and normalized once; the same validated objects feed semantic hashing and SQLite loading. The final bundle gate reuses those in-process Stage 5-7 results while rechecking every artifact hash and cross-artifact binding. It then atomically renames the private directory into `releases/` on the same filesystem—without copying the multi-gigabyte bundle—and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. Every present non-v4 manifest fails closed; loose database, tileset, and `.previous` files are never served.
+
+The complete persisted contract is manifest v4, processed GeoJSON schema v3, ingestion audit v3, database schema v1, and tile schema v4. Missing `data_manifest.json` is the only valid pre-release state. The database revision is bound in `dataset_metadata`, the manifest database summary, and the database artifact descriptor.
 
 On first access to a new production-sized release, the app hashes the committed database and tileset once on a background worker. While this single-flight check is running, `/api/health` returns HTTP `503` with `Committed artifact checksums are verifying`, and `/api/map-config` reports `available: false`; the frontend retries both after 0.5 seconds and exponentially backs off to a 15-second cap. Verified results are cached against the artifact path, size, modification time, and expected digest. `HEALTH_SYNC_HASH_MAX_BYTES` is the maximum total artifact size verified inline (16 MiB by default). Lowering it moves more checks to the background; raising it can make a health request block on more I/O. Every artifact is still hashed.
 
@@ -120,7 +124,7 @@ The background refresh will not change the manifest unless all of these pass:
 1. Complete source download and stable DSNY snapshot checks.
 2. Full LION row, LION-side, and DSNY-frequency reconciliation with zero fatal audit outcomes.
 3. Processed GeoJSON byte digest, per-feature semantic digest, and count binding.
-4. Exact processed-to-SQLite identity/geometry/schedule/provenance reconciliation plus integrity, foreign-key, and RTree checks.
+4. Exact database-schema-v1 and processed-to-SQLite identity/geometry/schedule/provenance reconciliation plus integrity and foreign-key checks.
 5. Decoded all-zoom tile-property reconciliation to SQLite, maximum-zoom rendered/nonrenderable reconciliation with independent source-geometry verification, gzip, coordinate, and tile-size checks.
 6. Cross-artifact SHA-256, version, and count checks for the whole release bundle.
 7. Count floors and regression limits.
@@ -140,16 +144,20 @@ python scripts/run_refresh.py --allow-large-run
 
 The `--allow-large-run` flag is required. Useful expert overrides include `--tile-minzoom`, `--tile-maxzoom`, `--side-offset-feet`, `--release-retention`, the three count-floor flags, and `--max-count-drop-percent`.
 
-## Legacy GeoJSON endpoint
+## Fresh v2 deployment and rollback
 
-`GET /api/refuse-streets` remains available for compatibility and diagnostics. It accepts `day`, comma-separated `types`, and an optional complete `west/south/east/north` bounding box. It is capped at 20,000 features and returns HTTP `413` rather than silently truncating an oversized query. The production frontend does not use this endpoint.
+Deploy v2 with a new empty data directory. Before switching, record the current image digest, dataset version, health/counts, per-type schedule counts, and disk usage; set the three first-release floors to at least 90% of the recorded LION, DSNY, and output-feature counts. Stop v1, move its data directory to a timestamped backup, create an empty replacement, and start the immutable v2 image with startup refresh enabled.
+
+During the first eight-stage refresh, `/api/live` and the frontend are available, `/api/health` is `503`, `/api/map-config` reports `available: false`, and the UI is basemap-only. After publication require health `200`, manifest v4, database schema v1, tile schema v4, verified integrity, acceptable counts, a real gzip tile response, and browser checks of every control.
+
+If verification fails, stop v2, preserve its failed data directory for diagnosis, restore the untouched v1 backup, and redeploy the pinned v1 image. Keep the backup through at least one later successful v2 refresh and a tested activation rollback between retained v4 releases.
 
 ## Troubleshooting checklist
 
 | Symptom | Check |
 |---|---|
 | Basemap only on a new install | The first refresh may still be running; watch the container log and `/api/map-config`. |
-| `/api/health` shows `map_available: false` | No valid tileset has been committed yet, or the configured/shared volume is wrong. |
+| `/api/health` returns `503` on a new volume | No valid release has been committed yet; monitor `/api/live`, `/api/map-config`, and the refresh log. |
 | Refresh exits before promotion | Read the first validation error in the container log; the previous release remains live. |
 | Refresh repeatedly starts after recreation | Set `DATA_REFRESH_ON_STARTUP=false` after initialization. |
 | Health returns `503` with checksums `verifying` | Expected briefly after startup or a release switch; keep polling while the single background hash completes. |

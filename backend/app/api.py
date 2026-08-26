@@ -1,20 +1,16 @@
 import logging
-import re
 import sqlite3
 from contextlib import closing
-from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pathlib import Path
-import json
 
 from .config import (
-    DATABASE_PATH,
     DATA_MANIFEST_PATH,
     HEALTH_SYNC_HASH_MAX_BYTES,
-    TILESET_PATH,
 )
+from .database import DATABASE_SCHEMA_REVISION
 from .releases import (
     CurrentRelease,
     ReleaseManifestError,
@@ -24,14 +20,10 @@ from .releases import (
     release_checksum_status,
     tileset_for_version,
 )
-from .tiles import VECTOR_TILE_MEDIA_TYPE, read_metadata, read_tile
+from .tiles import TILE_SCHEMA_REVISION, VECTOR_TILE_MEDIA_TYPE, read_metadata, read_tile
 
 LOGGER = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
-VALID_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
-VALID_TYPES = ("REFUSE", "RECYCLING", "ORGANICS", "BULK")
-LEGACY_FEATURE_LIMIT = 20_000
-SUPPORTED_RUNTIME_TILE_SCHEMA_REVISIONS = {2, 3, 4}
 
 
 def _read_only_database(path: str | Path) -> sqlite3.Connection:
@@ -65,7 +57,6 @@ def _unavailable_map_config() -> dict[str, object]:
         "tile_schema_revision": None,
         "tiles_url": None,
         "source_layer": "collection_streets",
-        "known_source_layer": "collection_streets",
         "unknown_source_layer": None,
         "unknown_minzoom": None,
         "minzoom": None,
@@ -87,12 +78,10 @@ def _expected_tile_schema_revision(manifest: dict[str, object]) -> int | None:
         if isinstance(tileset_descriptor, dict)
         else None
     )
-    if declared is None:
-        declared = 3 if manifest.get("manifest_version") == 3 else 2
     if (
         not isinstance(declared, int)
         or isinstance(declared, bool)
-        or declared not in SUPPORTED_RUNTIME_TILE_SCHEMA_REVISIONS
+        or declared != TILE_SCHEMA_REVISION
     ):
         return None
     return declared
@@ -105,16 +94,17 @@ def map_config() -> JSONResponse:
     except ReleaseManifestError:
         LOGGER.exception("Committed dataset manifest is invalid path=%s", DATA_MANIFEST_PATH)
         return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
-    if release is not None:
-        checksum_status = _current_release_integrity(release)
-        if checksum_status != "verified":
-            LOGGER.warning(
-                "Committed map artifacts are not checksum-ready status=%s version=%s",
-                checksum_status,
-                release.dataset_version,
-            )
-            return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
-    tileset_path = release.tileset_path if release is not None else Path(TILESET_PATH)
+    if release is None:
+        return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
+    checksum_status = _current_release_integrity(release)
+    if checksum_status != "verified":
+        LOGGER.warning(
+            "Committed map artifacts are not checksum-ready status=%s version=%s",
+            checksum_status,
+            release.dataset_version,
+        )
+        return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
+    tileset_path = release.tileset_path
     try:
         metadata = read_metadata(tileset_path)
     except FileNotFoundError:
@@ -123,24 +113,17 @@ def map_config() -> JSONResponse:
     except (OSError, sqlite3.Error, ValueError):
         LOGGER.warning("Vector tileset is unavailable path=%s", tileset_path, exc_info=True)
         return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
-    if release is not None:
-        expected_tile_revision = _expected_tile_schema_revision(release.manifest)
-        if (
-            metadata.version != release.dataset_version
-            or expected_tile_revision is None
-            or metadata.tile_schema_revision != expected_tile_revision
-        ):
-            LOGGER.error("Committed tileset does not match the runtime release contract")
-            return JSONResponse(
-                _unavailable_map_config(),
-                headers={"Cache-Control": "no-cache"},
-            )
-    elif metadata.tile_schema_revision not in SUPPORTED_RUNTIME_TILE_SCHEMA_REVISIONS:
-        LOGGER.error(
-            "Legacy tileset schema revision is unsupported actual=%s",
-            metadata.tile_schema_revision,
+    expected_tile_revision = _expected_tile_schema_revision(release.manifest)
+    if (
+        metadata.version != release.dataset_version
+        or expected_tile_revision is None
+        or metadata.tile_schema_revision != expected_tile_revision
+    ):
+        LOGGER.error("Committed tileset does not match the runtime release contract")
+        return JSONResponse(
+            _unavailable_map_config(),
+            headers={"Cache-Control": "no-cache"},
         )
-        return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
     return JSONResponse(
         {
             "available": True,
@@ -148,7 +131,6 @@ def map_config() -> JSONResponse:
             "tile_schema_revision": metadata.tile_schema_revision,
             "tiles_url": f"/api/tiles/{metadata.version}/{{z}}/{{x}}/{{y}}.pbf",
             "source_layer": metadata.source_layer,
-            "known_source_layer": metadata.source_layer,
             "unknown_source_layer": metadata.unknown_source_layer,
             "unknown_minzoom": metadata.unknown_minzoom,
             "minzoom": metadata.minzoom,
@@ -190,11 +172,7 @@ def vector_tile(version: str, z: int, x: int, y: int, request: Request) -> Respo
                 )
         candidates = (selected.path,) if selected is not None else ()
     else:
-        configured_tileset = Path(TILESET_PATH)
-        candidates = (
-            configured_tileset,
-            configured_tileset.with_suffix(configured_tileset.suffix + ".previous"),
-        )
+        candidates = ()
     for candidate in candidates:
         try:
             candidate_metadata = read_metadata(candidate)
@@ -246,38 +224,32 @@ def health() -> dict[str, object]:
     except ReleaseManifestError:
         LOGGER.exception("Committed dataset manifest is invalid path=%s", DATA_MANIFEST_PATH)
         raise HTTPException(status_code=503, detail="Committed data release is invalid") from None
-    if release is not None:
-        metadata = release.manifest
-        database_path = release.database_path
-        tileset_path = release.tileset_path
-        _require_verified_current_release(release)
-        try:
-            tile_metadata = read_metadata(tileset_path)
-        except (FileNotFoundError, OSError, sqlite3.Error, ValueError):
-            LOGGER.exception("Health check could not validate committed tileset metadata")
-            raise HTTPException(status_code=503, detail="Committed tileset metadata is invalid") from None
-        expected_tile_revision = _expected_tile_schema_revision(release.manifest)
-        if (
-            expected_tile_revision is None
-            or tile_metadata.version != release.dataset_version
-            or tile_metadata.tile_schema_revision != expected_tile_revision
-        ):
-            raise HTTPException(status_code=503, detail="Committed tileset release binding is invalid")
-    else:
-        database_path = Path(DATABASE_PATH)
-        tileset_path = Path(TILESET_PATH)
-        manifest = Path(DATA_MANIFEST_PATH)
-        try:
-            parsed = json.loads(manifest.read_text(encoding="utf-8"))
-            if isinstance(parsed, dict):
-                metadata = parsed
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            LOGGER.exception("Could not read legacy dataset manifest path=%s", DATA_MANIFEST_PATH)
+    if release is None:
+        raise HTTPException(status_code=503, detail="No committed data release")
+    metadata = release.manifest
+    database_path = release.database_path
+    tileset_path = release.tileset_path
+    _require_verified_current_release(release)
+    try:
+        tile_metadata = read_metadata(tileset_path)
+    except (FileNotFoundError, OSError, sqlite3.Error, ValueError):
+        LOGGER.exception("Health check could not validate committed tileset metadata")
+        raise HTTPException(status_code=503, detail="Committed tileset metadata is invalid") from None
+    expected_tile_revision = _expected_tile_schema_revision(release.manifest)
+    if (
+        expected_tile_revision is None
+        or tile_metadata.version != release.dataset_version
+        or tile_metadata.tile_schema_revision != expected_tile_revision
+    ):
+        raise HTTPException(status_code=503, detail="Committed tileset release binding is invalid")
     try:
         with closing(_read_only_database(database_path)) as connection:
             connection.execute("SELECT 1 FROM block_faces LIMIT 1").fetchone()
+            database_revision = connection.execute(
+                "SELECT value FROM dataset_metadata WHERE key = 'database_schema_revision'"
+            ).fetchone()
+            if database_revision is None or database_revision[0] != str(DATABASE_SCHEMA_REVISION):
+                raise HTTPException(status_code=503, detail="Database schema revision is invalid")
             count = metadata.get("block_faces")
             schedule_counts = metadata.get("schedule_counts")
             if not isinstance(count, int) or not isinstance(schedule_counts, dict):
@@ -316,7 +288,7 @@ def health() -> dict[str, object]:
                 }
     except sqlite3.Error:
         LOGGER.exception("Health check could not inspect the local database")
-        raise
+        raise HTTPException(status_code=503, detail="Committed database is invalid") from None
     quality = metadata.get("ingestion_audit")
     quality_record = quality if isinstance(quality, dict) else {}
     return {
@@ -334,155 +306,12 @@ def health() -> dict[str, object]:
         "unresolved_counts": unresolved_counts,
         "policy_conflicts": policy_conflicts,
         "policy_rule_version": quality_record.get("policy_rule_version"),
-        "quality_status": quality_record.get("quality_status", "legacy_verified"),
+        "quality_status": quality_record.get("quality_status", "verified"),
         "map_available": tileset_path.is_file(),
-        "artifact_integrity": "verified" if release is not None else "legacy-unverified",
+        "artifact_integrity": "verified",
     }
 
 
-def _validate_bounds(west: float | None, south: float | None, east: float | None, north: float | None) -> None:
-    supplied = [west, south, east, north]
-    if any(value is not None for value in supplied) and any(value is None for value in supplied):
-        raise HTTPException(status_code=422, detail="west, south, east, and north must be supplied together")
-    if west is not None and east is not None and west >= east:
-        raise HTTPException(status_code=422, detail="west must be less than east")
-    if south is not None and north is not None and south >= north:
-        raise HTTPException(status_code=422, detail="south must be less than north")
-    if west is not None and not -180 <= west <= 180:
-        raise HTTPException(status_code=422, detail="west is outside longitude range")
-    if east is not None and not -180 <= east <= 180:
-        raise HTTPException(status_code=422, detail="east is outside longitude range")
-    if south is not None and not -90 <= south <= 90:
-        raise HTTPException(status_code=422, detail="south is outside latitude range")
-    if north is not None and not -90 <= north <= 90:
-        raise HTTPException(status_code=422, detail="north is outside latitude range")
-
-
-@router.get("/refuse-streets")
-def refuse_streets(
-    day: Annotated[str, Query(min_length=3, max_length=3)],
-    types: str = "REFUSE",
-    west: float | None = None,
-    south: float | None = None,
-    east: float | None = None,
-    north: float | None = None,
-) -> JSONResponse:
-    day = day.upper()
-    if day not in VALID_DAYS:
-        raise HTTPException(status_code=422, detail=f"day must be one of {', '.join(VALID_DAYS)}")
-    collection_types = list(dict.fromkeys(value.strip().upper() for value in types.split(",") if value.strip()))
-    if not collection_types or not set(collection_types).issubset(VALID_TYPES):
-        raise HTTPException(status_code=422, detail=f"types must contain only {', '.join(VALID_TYPES)}")
-    _validate_bounds(west, south, east, north)
-
-    try:
-        release = read_current_release(DATA_MANIFEST_PATH)
-    except ReleaseManifestError:
-        LOGGER.exception("Committed dataset manifest is invalid path=%s", DATA_MANIFEST_PATH)
-        raise HTTPException(status_code=503, detail="Committed data release is invalid") from None
-    if release is not None:
-        _require_verified_current_release(release)
-    database_path = release.database_path if release is not None else Path(DATABASE_PATH)
-    parameters: list[object] = [*collection_types, day]
-    try:
-        with closing(_read_only_database(database_path)) as connection:
-            columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(block_faces)")
-            }
-            origin_expression = (
-                "COALESCE(NULLIF(TRIM(bf.origin_block_face_id), ''), bf.block_face_id)"
-                if "origin_block_face_id" in columns
-                else "bf.block_face_id"
-            )
-            query = """
-                SELECT {origin} AS origin_block_face_id,
-                       bf.block_face_id AS feature_id,
-                       bf.street_name, bf.borough, bf.side, bf.geometry_wkt,
-                       cs.collection_type, cs.source, cs.retrieved_at,
-                       (SELECT GROUP_CONCAT(all_cs.weekday)
-                        FROM collection_schedules all_cs
-                        WHERE all_cs.block_face_id = cs.block_face_id
-                          AND all_cs.collection_type = cs.collection_type) AS collection_days
-                FROM collection_schedules cs
-                JOIN block_faces bf ON bf.block_face_id = cs.block_face_id
-                WHERE cs.collection_type IN ({types}) AND cs.weekday = ?
-            """.format(
-                origin=origin_expression,
-                types=",".join("?" for _ in collection_types),
-            )
-            if west is not None:
-                query += " AND bf.block_face_id IN (SELECT bm.block_face_id FROM block_face_rtree_map bm JOIN block_faces_rtree br ON br.rtree_id = bm.rtree_id WHERE br.max_x >= ? AND br.min_x <= ? AND br.max_y >= ? AND br.min_y <= ?)"
-                parameters.extend([west, east, south, north])
-            if west is not None and connection.execute("SELECT 1 FROM block_faces_rtree LIMIT 1").fetchone() is None:
-                query = query.replace("bf.block_face_id IN (SELECT bm.block_face_id FROM block_face_rtree_map bm JOIN block_faces_rtree br ON br.rtree_id = bm.rtree_id WHERE br.max_x >= ? AND br.min_x <= ? AND br.max_y >= ? AND br.min_y <= ?)", "bf.max_x >= ? AND bf.min_x <= ? AND bf.max_y >= ? AND bf.min_y <= ?")
-            query += " LIMIT ?"
-            parameters.append(LEGACY_FEATURE_LIMIT + 1)
-            rows = list(connection.execute(query, tuple(parameters)))
-    except sqlite3.Error:
-        LOGGER.exception("Map query failed day=%s bounds=%s", day, parameters[1:])
-        raise HTTPException(status_code=500, detail="Map data query failed") from None
-    if len(rows) > LEGACY_FEATURE_LIMIT:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Legacy GeoJSON response exceeds {LEGACY_FEATURE_LIMIT} features; "
-                "request a smaller bounding box or use vector tiles"
-            ),
-        )
-
-    features = []
-    for row in rows:
-        geometry = _parse_geometry(row["geometry_wkt"])
-        if geometry is None:
-            LOGGER.error("Invalid stored geometry feature_id=%s", row["feature_id"])
-            raise HTTPException(status_code=500, detail="Stored map geometry is invalid")
-        properties = {
-            "block_face_id": row["origin_block_face_id"],
-            "feature_id": row["feature_id"],
-            "street_name": row["street_name"],
-            "borough": row["borough"],
-            "side": row["side"],
-            "collection_type": row["collection_type"],
-            "collection_days": sorted(set(row["collection_days"].split(","))),
-            "source": row["source"] if "source" in row.keys() else "DSNY",
-            "retrieved_at": row["retrieved_at"] if "retrieved_at" in row.keys() else "",
-        }
-        if row["collection_type"] == "REFUSE":
-            properties["refuse_days"] = properties["collection_days"]
-        features.append({
-            "type": "Feature",
-            "geometry": geometry,
-            "properties": properties,
-        })
-    return JSONResponse({"type": "FeatureCollection", "features": features})
-
-
-def _parse_geometry(wkt: str) -> dict[str, object] | None:
-    line_match = re.fullmatch(r"LINESTRING\s*\(\s*([^()]*)\s*\)", wkt, re.IGNORECASE)
-    if line_match:
-        coordinates = _parse_coordinate_pairs(line_match.group(1))
-        return {"type": "LineString", "coordinates": coordinates} if coordinates else None
-    multi_match = re.fullmatch(
-        r"MULTILINESTRING\s*\(\s*(\([^()]*\)(?:\s*,\s*\([^()]*\))*)\s*\)",
-        wkt,
-        re.IGNORECASE,
-    )
-    if multi_match:
-        parts = re.findall(r"\(([^()]*)\)", multi_match.group(1))
-        lines = [_parse_coordinate_pairs(part) for part in parts]
-        lines = [line for line in lines if line]
-        return {"type": "MultiLineString", "coordinates": lines} if lines else None
-    return None
-
-
-def _parse_coordinate_pairs(value: str) -> list[list[float]] | None:
-    coordinates = []
-    for pair in value.split(","):
-        values = pair.strip().split()
-        if len(values) != 2:
-            return None
-        try:
-            coordinates.append([float(values[0]), float(values[1])])
-        except ValueError:
-            return None
-    return coordinates if len(coordinates) >= 2 else None
+@router.get("/live")
+def live() -> dict[str, str]:
+    return {"status": "ok"}

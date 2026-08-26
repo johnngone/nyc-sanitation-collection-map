@@ -184,6 +184,8 @@ def _committed_refresh(tmp_path, processing: dict[str, object]):
         artifact = release_dir / filename
         artifact.write_bytes(f"fixture:{name}".encode())
         artifacts[name] = {"path": filename, "sha256": file_sha256(artifact)}
+    artifacts["database"]["database_schema_revision"] = 1
+    artifacts["tileset"]["tile_schema_revision"] = 4
     input_sha256 = {
         "dsny": artifacts["source_dsny"]["sha256"],
         "lion": artifacts["source_lion"]["sha256"],
@@ -194,12 +196,14 @@ def _committed_refresh(tmp_path, processing: dict[str, object]):
         _source_identity(input_sha256=input_sha256),
     )
     manifest = {
-        "manifest_version": 3,
+        "manifest_version": 4,
         "dataset_version": version,
         "release_path": f"releases/{version}",
         "refresh_fingerprint": fingerprint,
         "input_sha256": input_sha256,
         "artifacts": artifacts,
+        "database": {"database_schema_revision": 1},
+        "tileset": {"tile_schema_revision": 4},
         "counts": {
             "raw_lion_rows": 200_000,
             "dsny_frequency_rows": 600,

@@ -17,8 +17,7 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 
-MANIFEST_VERSION = 3
-SUPPORTED_MANIFEST_VERSIONS = {2, 3}
+MANIFEST_VERSION = 4
 VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -45,11 +44,7 @@ class CurrentRelease:
 
 
 def read_current_release(manifest_path: str | Path) -> CurrentRelease | None:
-    """Return a committed v2/v3 release, or ``None`` for legacy/no manifest.
-
-    A malformed v2 manifest fails closed.  Falling back in that case could
-    silently combine a legacy database with tiles from a different release.
-    """
+    """Return the committed current-format release, or ``None`` before one exists."""
 
     pointer = Path(manifest_path)
     try:
@@ -65,9 +60,7 @@ def read_current_release(manifest_path: str | Path) -> CurrentRelease | None:
     if not isinstance(manifest, dict):
         raise ReleaseManifestError("dataset manifest must be a JSON object")
     manifest_version = manifest.get("manifest_version")
-    if type(manifest_version) is int and manifest_version == 1:
-        return None
-    if type(manifest_version) is not int or manifest_version not in SUPPORTED_MANIFEST_VERSIONS:
+    if type(manifest_version) is not int or manifest_version != MANIFEST_VERSION:
         raise ReleaseManifestError("dataset manifest version is unsupported or missing")
 
     has_release_path = "release_path" in manifest
@@ -80,11 +73,25 @@ def read_current_release(manifest_path: str | Path) -> CurrentRelease | None:
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ReleaseManifestError("dataset manifest is missing artifacts")
+    database_summary = manifest.get("database")
+    if (
+        not isinstance(database_summary, dict)
+        or database_summary.get("database_schema_revision") != 1
+    ):
+        raise ReleaseManifestError("dataset manifest database schema revision must be 1")
+    tileset_summary = manifest.get("tileset")
+    if (
+        not isinstance(tileset_summary, dict)
+        or tileset_summary.get("tile_schema_revision") != 4
+    ):
+        raise ReleaseManifestError("dataset manifest tile schema revision must be 4")
     database_path, database_hash = _artifact(
-        release_root, artifacts, "database", "app.sqlite3"
+        release_root, artifacts, "database", "app.sqlite3",
+        revision_field="database_schema_revision", revision=1,
     )
     tileset_path, tileset_hash = _artifact(
-        release_root, artifacts, "tileset", "collection_streets.mbtiles"
+        release_root, artifacts, "tileset", "collection_streets.mbtiles",
+        revision_field="tile_schema_revision", revision=4,
     )
 
     previous_tilesets: list[TilesetRelease] = []
@@ -117,6 +124,8 @@ def read_current_release(manifest_path: str | Path) -> CurrentRelease | None:
             previous_artifacts,
             "tileset",
             "collection_streets.mbtiles",
+            revision_field="tile_schema_revision",
+            revision=4,
         )
         previous_tilesets.append(TilesetRelease(version, previous_path, previous_hash))
 
@@ -305,6 +314,9 @@ def _artifact(
     artifacts: dict[str, object],
     name: str,
     expected_filename: str,
+    *,
+    revision_field: str,
+    revision: int,
 ) -> tuple[Path, str]:
     descriptor = artifacts.get(name)
     if not isinstance(descriptor, dict):
@@ -317,6 +329,10 @@ def _artifact(
     checksum = descriptor.get("sha256")
     if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
         raise ReleaseManifestError(f"manifest artifact {name!r} has an invalid sha256")
+    if descriptor.get(revision_field) != revision:
+        raise ReleaseManifestError(
+            f"manifest artifact {name!r} must declare {revision_field}={revision}"
+        )
     return _contained(release_root, relative, f"artifacts.{name}.path"), checksum
 
 

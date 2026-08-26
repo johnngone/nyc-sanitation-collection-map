@@ -25,6 +25,7 @@ from shapely.geometry import GeometryCollection, LineString, MultiLineString, bo
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 
+from backend.app.database import DATABASE_SCHEMA_REVISION
 from backend.app.releases import MANIFEST_VERSION, VERSION_PATTERN, read_current_release
 from scripts.load_processed import (
     PreparedPayload,
@@ -60,7 +61,6 @@ SOURCE_ROW_OUTCOMES = {
 FATAL_SIDE_OUTCOMES = {"ambiguous", "invalid", "conflicts"}
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_TILE_SCHEMA_REVISION = 4
-SUPPORTED_TILE_SCHEMA_REVISIONS = {3, EXPECTED_TILE_SCHEMA_REVISION}
 MAX_RELEASE_COMPRESSED_TILE_BYTES = 1_572_864
 MAX_RELEASE_UNCOMPRESSED_TILE_BYTES = 6_291_456
 TILE_SOURCE_LAYER = "collection_streets"
@@ -89,44 +89,12 @@ TILE_V4_REQUIRED_PROPERTIES = {
     "organics_conflict",
     "bulk_conflict",
 }
-TILE_OPTIONAL_PROPERTIES = {"source_block_face_id"}
-TILE_V3_STATE_PROPERTIES = {
-    f"{kind}_{suffix}"
-    for kind in ("refuse", "recycling", "organics", "bulk")
-    for suffix in ("rule", "conflict", "provenance")
-}
-TILE_V3_REQUIRED_PROPERTIES = (
-    TILE_V4_REQUIRED_PROPERTIES
-    - {
-        "refuse_conflict",
-        "recycling_conflict",
-        "organics_conflict",
-        "bulk_conflict",
-    }
-    | {
-        "name",
-        "identity_method",
-        "geometry_method",
-    }
-    | TILE_V3_STATE_PROPERTIES
-)
+TILE_OPTIONAL_PROPERTIES: set[str] = set()
 UNKNOWN_TILE_V4_REQUIRED_PROPERTIES = {
     "street_name",
     "side",
     "reason_code",
     "reason",
-}
-UNKNOWN_TILE_V3_REQUIRED_PROPERTIES = {
-    "id",
-    "technical_identity",
-    "segment_id",
-    "borough",
-    "street_name",
-    "side",
-    "reason_code",
-    "reason",
-    "identity_method",
-    "geometry_method",
 }
 
 
@@ -243,8 +211,28 @@ def validate_database(
         block_face_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(block_faces)")
         }
-        if "origin_block_face_id" not in block_face_columns:
-            raise RuntimeError("staged database is missing origin block-face provenance")
+        expected_block_face_columns = {
+            "block_face_id", "origin_block_face_id", "segment_id", "borough",
+            "street_name", "side", "geometry_wkt",
+        }
+        if block_face_columns != expected_block_face_columns:
+            raise RuntimeError(
+                "staged database block_faces schema is not revision 1 "
+                f"expected={sorted(expected_block_face_columns)} actual={sorted(block_face_columns)}"
+            )
+        unknown_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(unknown_block_faces)")
+        }
+        expected_unknown_columns = {
+            "unknown_id", "technical_identity", "segment_id", "borough",
+            "street_name", "side", "reason_code", "reason", "identity_method",
+            "geometry_method", "geometry_wkt", "evidence_json",
+        }
+        if unknown_columns != expected_unknown_columns:
+            raise RuntimeError(
+                "staged database unknown_block_faces schema is not revision 1 "
+                f"expected={sorted(expected_unknown_columns)} actual={sorted(unknown_columns)}"
+            )
         blank_origins = connection.execute(
             "SELECT COUNT(*) FROM block_faces WHERE TRIM(origin_block_face_id) = ''"
         ).fetchone()[0]
@@ -275,14 +263,6 @@ def validate_database(
                    WHERE cs.block_face_id = bf.block_face_id
                )"""
         ).fetchone()[0]
-        rtree_rows = connection.execute("SELECT COUNT(*) FROM block_faces_rtree").fetchone()[0]
-        rtree_map_rows = connection.execute("SELECT COUNT(*) FROM block_face_rtree_map").fetchone()[0]
-        missing_rtree_rows = connection.execute(
-            """SELECT COUNT(*) FROM block_faces bf
-               LEFT JOIN block_face_rtree_map bm ON bm.block_face_id = bf.block_face_id
-               LEFT JOIN block_faces_rtree br ON br.rtree_id = bm.rtree_id
-               WHERE bm.rtree_id IS NULL OR br.rtree_id IS NULL"""
-        ).fetchone()[0]
         validation_counts = dict(
             connection.execute(
                 "SELECT validation_status, COUNT(*) FROM collection_schedules GROUP BY validation_status"
@@ -295,6 +275,13 @@ def validate_database(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+        obsolete_tables = {
+            "lookup_cache", "block_face_rtree_map", "block_faces_rtree",
+        }
+        if obsolete_tables & provenance_tables:
+            raise RuntimeError(
+                f"staged database contains obsolete tables: {sorted(obsolete_tables & provenance_tables)}"
+            )
         required_provenance = {"block_face_lion_components", "block_face_dsny_sources"}
         if not required_provenance.issubset(provenance_tables):
             raise RuntimeError("staged database is missing provenance tables")
@@ -334,13 +321,8 @@ def validate_database(
         )
     if invalid_unknown_schedule_overlap:
         raise RuntimeError("unknown features may not have collection schedules")
-    if rtree_rows != block_faces or rtree_map_rows != block_faces or missing_rtree_rows:
-        raise RuntimeError(
-            "staged database spatial index is incomplete "
-            f"block_faces={block_faces} map={rtree_map_rows} rtree={rtree_rows} "
-            f"missing={missing_rtree_rows}"
-        )
     expected_metadata = {
+        "database_schema_revision": str(DATABASE_SCHEMA_REVISION),
         "dataset_version": expected_version,
         "processed_sha256": expected_processed_sha256,
         "processed_semantic_sha256": expected_processed_semantic_sha256,
@@ -365,7 +347,7 @@ def validate_database(
         "schedule_counts": schedule_counts,
         "validation_counts": validation_counts,
         "faces_without_schedules": faces_without_schedules,
-        "rtree_rows": rtree_rows,
+        "database_schema_revision": DATABASE_SCHEMA_REVISION,
         "lion_provenance_faces": lion_provenance_faces,
         "dsny_provenance_faces": dsny_provenance_faces,
         "collection_state_count": state_count,
@@ -432,7 +414,7 @@ def validate_tileset(
         minzoom = _metadata_int(metadata, "minzoom")
         maxzoom = _metadata_int(metadata, "maxzoom")
         tile_schema_revision = _metadata_int(metadata, "tile_schema_revision")
-        if tile_schema_revision not in SUPPORTED_TILE_SCHEMA_REVISIONS:
+        if tile_schema_revision != EXPECTED_TILE_SCHEMA_REVISION:
             raise RuntimeError(
                 "staged tileset schema revision is unsupported "
                 f"actual={tile_schema_revision}"
@@ -458,7 +440,6 @@ def validate_tileset(
             metadata,
             minzoom=minzoom,
             maxzoom=maxzoom,
-            tile_schema_revision=tile_schema_revision,
         )
     if tile_count <= 0:
         raise RuntimeError("staged tileset contains no tiles")
@@ -489,7 +470,7 @@ def validate_tileset(
             if key in {"source_database_sha256", "source_database_version"}
             else _metadata_int(metadata, key)
         )
-    if binding["tile_schema_revision"] not in SUPPORTED_TILE_SCHEMA_REVISIONS:
+    if binding["tile_schema_revision"] != EXPECTED_TILE_SCHEMA_REVISION:
         raise RuntimeError(
             "staged tileset schema revision is unsupported "
             f"actual={binding['tile_schema_revision']}"
@@ -530,11 +511,10 @@ def validate_tileset(
         raise RuntimeError(
             "staged tileset decoded unknown maxzoom ID coverage does not match metadata"
         )
-    if tile_schema_revision == 4:
-        decoded_unknown_ids = set(payload_validation["unknown_properties_by_id"])
-        allowed_unknown_ids = set(range(1, int(binding["unknown_feature_count"]) + 1))
-        if not decoded_unknown_ids.issubset(allowed_unknown_ids):
-            raise RuntimeError("staged tileset contains an out-of-range unknown MVT ID")
+    decoded_unknown_ids = set(payload_validation["unknown_properties_by_id"])
+    allowed_unknown_ids = set(range(1, int(binding["unknown_feature_count"]) + 1))
+    if not decoded_unknown_ids.issubset(allowed_unknown_ids):
+        raise RuntimeError("staged tileset contains an out-of-range unknown MVT ID")
     maxzoom_nonrenderable_features: list[dict[str, object]] = []
     maxzoom_nonrenderable_unknowns: list[dict[str, object]] = []
     if expected_database is not None:
@@ -553,20 +533,14 @@ def validate_tileset(
         }
         _require_equal_fields(binding, expected_bindings, "MBTiles/database binding")
         database_path = Path(expected_database_path)
-        expected_properties = _expected_tile_properties(
-            database_path,
-            tile_schema_revision=int(binding["tile_schema_revision"]),
-        )
+        expected_properties = _expected_tile_properties(database_path)
         expected_geometries = _expected_tile_geometries(database_path)
         (
             expected_unknown_properties,
             expected_unknown_geometries,
             unknown_source_ids,
         ) = (
-            _expected_unknown_tile_records(
-                database_path,
-                tile_schema_revision=int(binding["tile_schema_revision"]),
-            )
+            _expected_unknown_tile_records(database_path)
         )
         maxzoom_nonrenderable_features = _validated_nonrenderable_records(
             expected_properties,
@@ -671,7 +645,6 @@ def _validate_tile_payloads(
     *,
     minzoom: int,
     maxzoom: int,
-    tile_schema_revision: int,
 ) -> dict[str, object]:
     if metadata.get("source_layer") != TILE_SOURCE_LAYER:
         raise RuntimeError(f"staged tileset source layer must be {TILE_SOURCE_LAYER}")
@@ -701,16 +674,8 @@ def _validate_tile_payloads(
     sizes_by_zoom: dict[int, list[tuple[int, int]]] = {}
     ids_by_zoom: dict[int, set[str]] = {}
     maxzoom_ids: set[str] = set()
-    known_required_properties = (
-        TILE_V4_REQUIRED_PROPERTIES
-        if tile_schema_revision == 4
-        else TILE_V3_REQUIRED_PROPERTIES
-    )
-    unknown_required_properties = (
-        UNKNOWN_TILE_V4_REQUIRED_PROPERTIES
-        if tile_schema_revision == 4
-        else UNKNOWN_TILE_V3_REQUIRED_PROPERTIES
-    )
+    known_required_properties = TILE_V4_REQUIRED_PROPERTIES
+    unknown_required_properties = UNKNOWN_TILE_V4_REQUIRED_PROPERTIES
     maxzoom_unknown_ids: set[str | int] = set()
     properties_by_id: dict[str, dict[str, object]] = {}
     unknown_properties_by_id: dict[str | int, dict[str, object]] = {}
@@ -767,10 +732,7 @@ def _validate_tile_payloads(
                     "staged tile feature has unexpected properties: "
                     f"{sorted(unexpected_properties)}"
                 )
-            _validate_tile_properties(
-                properties,
-                tile_schema_revision=tile_schema_revision,
-            )
+            _validate_tile_properties(properties)
             feature_id = str(properties["id"])
             if feature_id in tile_ids:
                 raise RuntimeError(f"staged tile contains duplicate feature ID {feature_id!r}")
@@ -803,33 +765,24 @@ def _validate_tile_payloads(
                 )
             if any(key.endswith("_days") or key.endswith("_status") for key in properties):
                 raise RuntimeError("staged unknown tile feature contains schedule properties")
-            blankable_unknown_properties = (
-                {"technical_identity", "borough"}
-                if tile_schema_revision == 3
-                else set()
-            )
             for key in unknown_required_properties:
                 if not isinstance(properties.get(key), str) or (
-                    key not in blankable_unknown_properties
-                    and not str(properties[key]).strip()
+                    not str(properties[key]).strip()
                 ):
                     raise RuntimeError(
                         f"staged unknown tile property {key!r} has an invalid string value"
                     )
             if properties["side"] not in {"LEFT", "RIGHT"}:
                 raise RuntimeError("staged unknown tile feature has an invalid side")
-            if tile_schema_revision == 4:
-                feature_id = feature.get("id") if isinstance(feature, dict) else None
-                if (
-                    not isinstance(feature_id, int)
-                    or isinstance(feature_id, bool)
-                    or feature_id <= 0
-                ):
-                    raise RuntimeError(
-                        "staged unknown tile feature must have a positive integer MVT ID"
-                    )
-            else:
-                feature_id = str(properties["id"])
+            feature_id = feature.get("id") if isinstance(feature, dict) else None
+            if (
+                not isinstance(feature_id, int)
+                or isinstance(feature_id, bool)
+                or feature_id <= 0
+            ):
+                raise RuntimeError(
+                    "staged unknown tile feature must have a positive integer MVT ID"
+                )
             if feature_id in unknown_tile_ids:
                 raise RuntimeError(f"staged tile contains duplicate unknown ID {feature_id!r}")
             unknown_tile_ids.add(feature_id)
@@ -881,24 +834,13 @@ def _validate_tile_payloads(
 
 def _validate_tile_properties(
     properties: dict[str, object],
-    *,
-    tile_schema_revision: int,
 ) -> None:
-    required_properties = (
-        TILE_V4_REQUIRED_PROPERTIES
-        if tile_schema_revision == 4
-        else TILE_V3_REQUIRED_PROPERTIES
-    )
+    required_properties = TILE_V4_REQUIRED_PROPERTIES
     blankable_properties = {
         "recycling_days",
         "organics_days",
         "bulk_days",
     }
-    if tile_schema_revision == 3:
-        blankable_properties.update(
-            f"{kind}_rule"
-            for kind in ("refuse", "recycling", "organics", "bulk")
-        )
     required_nonblank = required_properties - blankable_properties
     for key in required_properties:
         if not isinstance(properties.get(key), str):
@@ -923,27 +865,18 @@ def _validate_tile_properties(
 
 def _expected_tile_properties(
     database: Path,
-    *,
-    tile_schema_revision: int,
 ) -> dict[str, dict[str, object]]:
     with closing(
         sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
     ) as connection:
         connection.row_factory = sqlite3.Row
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(block_faces)")}
-        optional_ids = tuple(
-            field
-            for field in ("origin_block_face_id", "source_block_face_id")
-            if field in columns
-        )
-        optional_select = "".join(f", {field}" for field in optional_ids)
         expected: dict[str, dict[str, object]] = {}
         day_sets: dict[str, dict[str, set[str]]] = {}
         sources: dict[str, set[str]] = {}
         retrieval_times: dict[str, set[str]] = {}
         for row in connection.execute(
-            "SELECT block_face_id, street_name, borough, side"
-            f"{optional_select} FROM block_faces ORDER BY block_face_id"
+            "SELECT block_face_id, origin_block_face_id, street_name, borough, side "
+            "FROM block_faces ORDER BY block_face_id"
         ):
             feature_id = str(row["block_face_id"]).strip()
             properties: dict[str, object] = {
@@ -952,9 +885,7 @@ def _expected_tile_properties(
                 "borough": str(row["borough"]).strip(),
                 "side": str(row["side"]).strip().upper(),
             }
-            if tile_schema_revision == 3:
-                properties["name"] = properties["street_name"]
-            properties.update({field: str(row[field]).strip() for field in optional_ids})
+            properties["origin_block_face_id"] = str(row["origin_block_face_id"]).strip()
             expected[feature_id] = properties
             day_sets[feature_id] = {kind: set() for kind in COLLECTION_DAY_FIELDS}
             sources[feature_id] = set()
@@ -983,11 +914,6 @@ def _expected_tile_properties(
             prefix = collection_type.lower()
             expected[feature_id][f"{prefix}_status"] = str(row["state"])
             expected[feature_id][f"{prefix}_conflict"] = "1" if int(row["source_policy_conflict"]) else "0"
-            if tile_schema_revision == 3:
-                expected[feature_id][f"{prefix}_rule"] = (
-                    "" if row["rule_id"] is None else str(row["rule_id"])
-                )
-                expected[feature_id][f"{prefix}_provenance"] = str(row["provenance"])
 
     for feature_id, properties in expected.items():
         if len(sources[feature_id]) != 1 or len(retrieval_times[feature_id]) != 1:
@@ -1000,9 +926,6 @@ def _expected_tile_properties(
             )
         properties["source"] = next(iter(sources[feature_id]))
         properties["retrieved_at"] = next(iter(retrieval_times[feature_id]))
-        if tile_schema_revision == 3:
-            properties["identity_method"] = "LION_BLOCK_FACE_ID"
-            properties["geometry_method"] = "DIRECT_SIDE_TRACE"
     return expected
 
 
@@ -1020,8 +943,6 @@ def _expected_tile_geometries(database: Path) -> dict[str, BaseGeometry]:
 
 def _expected_unknown_tile_records(
     database: Path,
-    *,
-    tile_schema_revision: int,
 ) -> tuple[
     dict[str | int, dict[str, object]],
     dict[str | int, BaseGeometry],
@@ -1041,34 +962,20 @@ def _expected_unknown_tile_records(
         )
         for ordinal, row in enumerate(rows, start=1):
             source_id = str(row["unknown_id"])
-            feature_id: str | int = ordinal if tile_schema_revision == 4 else source_id
-            if tile_schema_revision == 4:
-                source_ids_by_id[ordinal] = source_id
+            feature_id: str | int = ordinal
+            source_ids_by_id[ordinal] = source_id
             properties: dict[str, object] = {
                 "street_name": str(row["street_name"]),
                 "side": str(row["side"]),
                 "reason_code": str(row["reason_code"]),
                 "reason": str(row["reason"]),
             }
-            if tile_schema_revision == 3:
-                properties.update({
-                    "id": source_id,
-                    "technical_identity": (
-                        ""
-                        if row["technical_identity"] is None
-                        else str(row["technical_identity"])
-                    ),
-                    "segment_id": str(row["segment_id"]),
-                    "borough": "" if row["borough"] is None else str(row["borough"]),
-                    "identity_method": str(row["identity_method"]),
-                    "geometry_method": str(row["geometry_method"]),
-                })
             properties_by_id[feature_id] = properties
             geometries_by_id[feature_id] = force_2d(wkt.loads(str(row["geometry_wkt"])))
     return (
         properties_by_id,
         geometries_by_id,
-        source_ids_by_id if tile_schema_revision == 4 else None,
+        source_ids_by_id,
     )
 
 
@@ -1314,6 +1221,8 @@ def validate_ingestion_audit(
     expected_processed_features: int | None = None,
 ) -> dict[str, object]:
     audit = read_json_object(path, "ingestion audit")
+    if audit.get("audit_version") != 3:
+        raise RuntimeError("ingestion audit version must be 3")
     required = {
         "source_rows",
         "frequency_rows",
@@ -2084,6 +1993,7 @@ def validate_release_bundle(
             "path": RELEASE_FILENAMES["database"],
             "sha256": database["sha256"],
             "dataset_version": version,
+            "database_schema_revision": DATABASE_SCHEMA_REVISION,
             "block_faces": database["block_faces"],
             "schedule_count": database["schedule_count"],
             "processed_sha256": processed["sha256"],
@@ -2320,6 +2230,7 @@ def _rebind_prevalidated_components(
         database,
         {
             "sha256": verified_hashes["database"],
+            "database_schema_revision": DATABASE_SCHEMA_REVISION,
             "block_faces": expected_feature_count,
             "semantic_sha256": processed["semantic_sha256"],
             "semantic_feature_count": expected_feature_count,
@@ -2329,6 +2240,7 @@ def _rebind_prevalidated_components(
     _require_equal_fields(
         metadata,
         {
+            "database_schema_revision": str(DATABASE_SCHEMA_REVISION),
             "dataset_version": version,
             "processed_sha256": processed["sha256"],
             "processed_semantic_sha256": processed["semantic_sha256"],

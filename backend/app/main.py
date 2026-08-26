@@ -2,7 +2,6 @@ import logging
 import html
 import json
 import re
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -14,15 +13,13 @@ from starlette.responses import HTMLResponse, PlainTextResponse, Response
 from .api import router
 from .config import (
     APP_BROWSER_TITLE,
+    APP_ENV,
     APP_META_DESCRIPTION,
     APP_PUBLIC_URL,
     APP_ROBOTS_TXT,
     APP_SUBTITLE,
     APP_TITLE,
-    DATABASE_PATH,
-    DATA_MANIFEST_PATH,
 )
-from .database import initialize
 
 logging.basicConfig(
     level=logging.INFO,
@@ -129,21 +126,13 @@ class FrontendStaticFiles(StaticFiles):
         return response
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    # Existing root databases are legacy snapshots and must remain readable as
-    # deployed while the background refresh builds the first immutable v2 release.
-    # Only bootstrap storage when neither form of data exists.
-    if not Path(DATABASE_PATH).exists() and not Path(DATA_MANIFEST_PATH).exists():
-        initialize(DATABASE_PATH)
-    yield
-
-
 app = FastAPI(
     title="NYC Sanitation Map API",
-    version="0.1.0",
+    version="2.0.0",
     license_info={"name": "MIT License", "identifier": "MIT"},
-    lifespan=lifespan,
+    docs_url=None if APP_ENV.strip().casefold() == "production" else "/docs",
+    redoc_url=None if APP_ENV.strip().casefold() == "production" else "/redoc",
+    openapi_url=None if APP_ENV.strip().casefold() == "production" else "/openapi.json",
 )
 
 

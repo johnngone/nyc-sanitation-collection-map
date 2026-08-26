@@ -11,7 +11,7 @@ import mapbox_vector_tile
 import pytest
 from shapely.geometry import LineString
 
-from app.database import initialize
+from app.database import DATABASE_SCHEMA_REVISION, initialize
 from app.releases import ReleaseManifestError, read_current_release, tileset_for_version
 from scripts.build_tiles import build_tiles
 from scripts.load_processed import load_prepared_payload
@@ -57,7 +57,7 @@ def _audit(processed_sha256: str) -> dict[str, object]:
     }
     frequency_outcomes = {"used_valid": 1, "unused_valid": 0, "invalid": 0}
     return {
-        "audit_version": 2,
+        "audit_version": 3,
         "source_rows": 1,
         "raw_source_rows": 1,
         "raw_lion_rows": 1,
@@ -196,18 +196,9 @@ def _database(
         connection.execute(
             """INSERT INTO block_faces
                (block_face_id, origin_block_face_id, segment_id, borough, street_name,
-                side, geometry_wkt, min_x, min_y, max_x, max_y)
+                side, geometry_wkt)
                VALUES ('face-1', 'origin-1', 'segment-1', 'QUEENS', 'TEST STREET',
-                       'LEFT', 'LINESTRING (-73.9 40.7, -73.89 40.71)',
-                       -73.9, 40.7, -73.89, 40.71)"""
-        )
-        connection.execute("INSERT INTO block_face_rtree_map(block_face_id) VALUES ('face-1')")
-        rtree_id = connection.execute(
-            "SELECT rtree_id FROM block_face_rtree_map WHERE block_face_id = 'face-1'"
-        ).fetchone()[0]
-        connection.execute(
-            "INSERT INTO block_faces_rtree VALUES (?, ?, ?, ?, ?)",
-            (rtree_id, -73.9, -73.89, 40.7, 40.71),
+                       'LEFT', 'LINESTRING (-73.9 40.7, -73.89 40.71)')"""
         )
         connection.execute(
             """INSERT INTO block_face_lion_components
@@ -334,7 +325,7 @@ def _bundle(tmp_path, version: str):
         expected_database_path=database,
     )
     manifest = {
-        "manifest_version": 3,
+        "manifest_version": 4,
         "dataset_version": version,
         "release_path": f"releases/{version}",
         "processed_at": "2026-08-19T12:00:00+00:00",
@@ -373,6 +364,7 @@ def _bundle(tmp_path, version: str):
             "database": _artifact(
                 database,
                 dataset_version=version,
+                database_schema_revision=DATABASE_SCHEMA_REVISION,
                 block_faces=1,
                 schedule_count=4,
                 processed_sha256=processed_hash,
@@ -413,139 +405,6 @@ def _bundle(tmp_path, version: str):
     return bundle
 
 
-def _rewrite_bundle_tileset_as_v3(bundle) -> None:
-    """Turn the compact v4 fixture into a valid retained v3 release."""
-
-    manifest_path = bundle / "release_manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    version = manifest["dataset_version"]
-    database = bundle / "app.sqlite3"
-    tileset = bundle / "collection_streets.mbtiles"
-    expected_properties = release_validation._expected_tile_properties(
-        database,
-        tile_schema_revision=3,
-    )
-
-    with closing(sqlite3.connect(tileset)) as connection:
-        rows = connection.execute(
-            "SELECT rowid, tile_data FROM tiles ORDER BY rowid"
-        ).fetchall()
-        for rowid, payload in rows:
-            decoded = mapbox_vector_tile.decode(gzip.decompress(bytes(payload)))
-            layer = decoded["collection_streets"]
-            features = copy.deepcopy(layer["features"])
-            for feature in features:
-                feature_id = str(feature["properties"]["id"])
-                feature["properties"] = expected_properties[feature_id]
-            encoded = mapbox_vector_tile.encode(
-                {"name": "collection_streets", "features": features},
-                default_options={
-                    "quantize_bounds": (0, 0, 4096, 4096),
-                    "y_coord_down": True,
-                },
-            )
-            connection.execute(
-                "UPDATE tiles SET tile_data = ? WHERE rowid = ?",
-                (gzip.compress(encoded, compresslevel=9, mtime=0), rowid),
-            )
-
-        tilejson = json.loads(
-            connection.execute(
-                "SELECT value FROM metadata WHERE name = 'json'"
-            ).fetchone()[0]
-        )
-        tilejson["vector_layers"][0]["fields"] = {
-            name: "String"
-            for name in sorted(next(iter(expected_properties.values())))
-        }
-        connection.execute(
-            "UPDATE metadata SET value = '3' WHERE name = 'tile_schema_revision'"
-        )
-        connection.execute(
-            "UPDATE metadata SET value = ? WHERE name = 'json'",
-            (json.dumps(tilejson, sort_keys=True, separators=(",", ":")),),
-        )
-        sizes_by_zoom: dict[int, list[tuple[int, int]]] = {}
-        for zoom, raw in connection.execute(
-            "SELECT zoom_level, tile_data FROM tiles ORDER BY zoom_level"
-        ):
-            compressed = bytes(raw)
-            sizes_by_zoom.setdefault(zoom, []).append(
-                (len(compressed), len(gzip.decompress(compressed)))
-            )
-        connection.execute(
-            "UPDATE metadata SET value = ? WHERE name = 'tile_size_metrics'",
-            (
-                json.dumps(
-                    _tile_size_metrics(sizes_by_zoom, 10),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            ),
-        )
-        connection.commit()
-
-    database_summary = manifest["database"]
-    tileset_summary = validate_tileset(
-        tileset,
-        version,
-        expected_database=database_summary,
-        expected_database_path=database,
-    )
-    report_path = bundle / "tile_build_report.json"
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    report.update(
-        {
-            "tile_count": tileset_summary["tile_count"],
-            "tile_schema_revision": 3,
-            "minzoom": tileset_summary["minzoom"],
-            "maxzoom": tileset_summary["maxzoom"],
-            "maxzoom_feature_count": tileset_summary["maxzoom_feature_count"],
-            "maxzoom_nonrenderable_feature_count": tileset_summary[
-                "maxzoom_nonrenderable_feature_count"
-            ],
-            "maxzoom_nonrenderable_feature_ids_sha256": tileset_summary[
-                "maxzoom_nonrenderable_feature_ids_sha256"
-            ],
-            "maxzoom_unknown_feature_count": tileset_summary[
-                "maxzoom_unknown_feature_count"
-            ],
-            "maxzoom_nonrenderable_unknown_feature_count": tileset_summary[
-                "maxzoom_nonrenderable_unknown_feature_count"
-            ],
-            "maxzoom_nonrenderable_unknown_ids_sha256": tileset_summary[
-                "maxzoom_nonrenderable_unknown_ids_sha256"
-            ],
-            "maxzoom_nonrenderable_features": tileset_summary[
-                "maxzoom_nonrenderable_features"
-            ],
-            "maxzoom_nonrenderable_unknowns": tileset_summary[
-                "maxzoom_nonrenderable_unknowns"
-            ],
-            "tile_feature_count": tileset_summary["decoded_tile_feature_count"],
-            "simplify_pixels": tileset_summary["simplify_pixels"],
-            "buffer_pixels": tileset_summary["buffer_pixels"],
-            "tile_size_metrics": tileset_summary["tile_size_metrics"],
-            "tile_size_limits": tileset_summary["tile_size_limits"],
-            "bounds": tileset_summary["bounds"],
-            "sha256": tileset_summary["sha256"],
-            "bytes": tileset_summary["bytes"],
-        }
-    )
-    atomic_json(report_path, report)
-
-    manifest["tileset"] = tileset_summary
-    manifest["artifacts"]["tileset"] = _artifact(
-        tileset,
-        version=version,
-        tile_schema_revision=3,
-        feature_count=1,
-        source_database_sha256=database_summary["sha256"],
-    )
-    manifest["artifacts"]["tile_build_report"] = _artifact(report_path)
-    atomic_json(manifest_path, manifest)
-
-
 def test_release_artifacts_reconcile_and_are_cross_bound(tmp_path) -> None:
     bundle = _bundle(tmp_path, "release-1")
 
@@ -554,6 +413,35 @@ def test_release_artifacts_reconcile_and_are_cross_bound(tmp_path) -> None:
     assert validated["database"]["block_faces"] == 1
     assert validated["tileset"]["version"] == "release-1"
     assert validated["audit"]["classified_sides"] == 2
+
+
+@pytest.mark.parametrize("audit_version", [None, 1, 2, 4])
+def test_ingestion_audit_rejects_noncurrent_revision(tmp_path, audit_version) -> None:
+    path = tmp_path / "audit.json"
+    payload = _audit("a" * 64)
+    payload["audit_version"] = audit_version
+    atomic_json(path, payload)
+
+    with pytest.raises(RuntimeError, match="version must be 3"):
+        validate_ingestion_audit(path)
+
+
+@pytest.mark.parametrize("database_revision", [None, "0", "2"])
+def test_database_rejects_missing_or_wrong_revision(tmp_path, database_revision) -> None:
+    bundle = _bundle(tmp_path, f"database-revision-{database_revision or 'missing'}")
+    database = bundle / "app.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM dataset_metadata WHERE key = 'database_schema_revision'"
+        )
+        if database_revision is not None:
+            connection.execute(
+                "INSERT INTO dataset_metadata(key, value) VALUES ('database_schema_revision', ?)",
+                (database_revision,),
+            )
+
+    with pytest.raises(RuntimeError, match="database_schema_revision"):
+        validate_database(database)
 
 
 def test_processed_snapshot_loads_without_a_second_normalization(tmp_path, monkeypatch) -> None:
@@ -740,12 +628,12 @@ def test_tileset_validation_reconciles_subgrid_unknown_against_database(tmp_path
             """INSERT INTO unknown_block_faces
                (unknown_id, technical_identity, segment_id, borough, street_name, side,
                 reason_code, reason, identity_method, geometry_method, geometry_wkt,
-                min_x, min_y, max_x, max_y, evidence_json)
+                evidence_json)
                VALUES ('unknown-tiny', 'LION:3:RIGHT', '3', 'QUEENS', 'TINY GAP', 'RIGHT',
                        'PARTIAL_GEOMETRY_GAP', 'Tiny uncovered source fragment',
                        'LION_BLOCK_FACE_ID', 'DIRECT_SIDE_TRACE_UNRESOLVED',
                        'LINESTRING (-74 40.6, -73.999999999 40.600000001)',
-                       -74, 40.6, -73.999999999, 40.600000001, '{}')"""
+                       '{}')"""
         )
     database_summary = validate_database(database)
     tileset = tmp_path / "subgrid-unknown.mbtiles"
@@ -990,21 +878,20 @@ def test_atomic_pointer_selects_only_current_and_retained_previous(tmp_path) -> 
     assert tileset_for_version(rolled_back, "release-2") is not None
 
 
-def test_atomic_pointer_can_roll_back_to_retained_v3_tiles(tmp_path) -> None:
+def test_atomic_pointer_rolls_back_between_retained_v4_releases(tmp_path) -> None:
     pointer = tmp_path / "data" / "data_manifest.json"
-    previous = _bundle(tmp_path, "schema-v3")
-    _rewrite_bundle_tileset_as_v3(previous)
+    previous = _bundle(tmp_path, "schema-v4-previous")
     current = _bundle(tmp_path, "schema-v4")
 
-    assert validate_release_bundle(previous)["tileset"]["tile_schema_revision"] == 3
+    assert validate_release_bundle(previous)["tileset"]["tile_schema_revision"] == 4
     publish_release(previous, pointer, retention=2)
     publish_release(current, pointer, retention=2)
-    activate_release("schema-v3", pointer, retention=2)
+    activate_release("schema-v4-previous", pointer, retention=2)
 
     rolled_back = read_current_release(pointer)
     assert rolled_back is not None
-    assert rolled_back.dataset_version == "schema-v3"
-    assert rolled_back.manifest["tileset"]["tile_schema_revision"] == 3
+    assert rolled_back.dataset_version == "schema-v4-previous"
+    assert rolled_back.manifest["tileset"]["tile_schema_revision"] == 4
     assert tileset_for_version(rolled_back, "schema-v4") is not None
 
 
@@ -1036,7 +923,7 @@ def test_manifest_path_traversal_fails_closed(tmp_path) -> None:
     pointer.write_text(
         json.dumps(
             {
-                "manifest_version": 2,
+                "manifest_version": 4,
                 "dataset_version": "release-1",
                 "release_path": "../release-1",
                 "artifacts": {
@@ -1058,9 +945,11 @@ def test_manifest_path_traversal_fails_closed(tmp_path) -> None:
 @pytest.mark.parametrize(
     "manifest",
     [
+        {"manifest_version": 1, "dataset_version": "old-v1"},
         {"manifest_version": 2, "dataset_version": "truncated-v2"},
+        {"manifest_version": 3, "dataset_version": "old-v3"},
         {"dataset_version": "missing-version"},
-        {"manifest_version": 3, "dataset_version": "future-version"},
+        {"manifest_version": 5, "dataset_version": "future-version"},
         {"manifest_version": 2.0, "dataset_version": "float-version"},
     ],
 )
@@ -1072,11 +961,12 @@ def test_truncated_or_unknown_manifest_never_falls_back(tmp_path, manifest) -> N
         read_current_release(pointer)
 
 
-def test_explicit_v1_manifest_uses_legacy_paths(tmp_path) -> None:
+def test_explicit_v1_manifest_is_rejected(tmp_path) -> None:
     pointer = tmp_path / "data_manifest.json"
     pointer.write_text(json.dumps({"manifest_version": 1}), encoding="utf-8")
 
-    assert read_current_release(pointer) is None
+    with pytest.raises(ReleaseManifestError):
+        read_current_release(pointer)
 
 
 def test_regression_gate_rejects_a_self_consistent_large_drop() -> None:
