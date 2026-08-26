@@ -1,7 +1,6 @@
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from typing import Iterator
 
 DATABASE_SCHEMA_REVISION = 1
 
@@ -123,7 +122,3 @@ def initialize(database_path: str | Path, *, create_indexes: bool = True) -> Non
         if create_indexes:
             create_secondary_indexes(connection)
         connection.commit()
-
-
-def iter_rows(connection: sqlite3.Connection, query: str, parameters: tuple[object, ...] = ()) -> Iterator[sqlite3.Row]:
-    yield from connection.execute(query, parameters)

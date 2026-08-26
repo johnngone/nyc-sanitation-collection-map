@@ -21,7 +21,7 @@ official DSNY + LION sources
 
 FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not encode geometry during a request. The same standalone container runs the geospatial refresh scheduler in the background; completed release artifacts remain on the mounted data volume.
 
-`GET /api/live` is process liveness and backs the container health check. `GET /api/health` is release readiness and returns `503` until a committed release is fully verified. Production disables `/docs`, `/redoc`, and `/openapi.json`; development retains them.
+`GET /api/live` is process liveness and backs the container health check. `GET /api/health` is release readiness and returns `503` until a committed release is fully verified. Health reads the required manifest-v4 summary and database-v1 tables directly; it has no compatibility reconstruction for missing metadata or older schemas. Production disables `/docs`, `/redoc`, and `/openapi.json`; development retains them.
 
 ## Vector-tile contract
 
@@ -93,7 +93,7 @@ Every attempt downloads and hashes the authoritative source snapshots first. If 
 
 For a changed release, processed GeoJSON is parsed and normalized once; the same validated objects feed semantic hashing and SQLite loading. The final bundle gate reuses those in-process Stage 5-7 results while rechecking every artifact hash and cross-artifact binding. It then atomically renames the private directory into `releases/` on the same filesystem—without copying the multi-gigabyte bundle—and atomically replaces `data_manifest.json` last. That manifest is the sole commit pointer, so the app never intentionally combines a database from one refresh with tiles from another. Every present non-v4 manifest fails closed; loose database, tileset, and `.previous` files are never served.
 
-The complete persisted contract is manifest v4, processed GeoJSON schema v3, ingestion audit v3, database schema v1, and tile schema v4. Missing `data_manifest.json` is the only valid pre-release state. The database revision is bound in `dataset_metadata`, the manifest database summary, and the database artifact descriptor.
+The complete persisted contract is manifest v4, processed GeoJSON schema v3, ingestion audit v3, database schema v1, and tile schema v4. Missing `/app/data/data_manifest.json` is the only valid pre-release state in the container. Its location is fixed to the mounted data volume; loose database and tileset paths are not configurable. The database revision is bound in `dataset_metadata`, the manifest database summary, and the database artifact descriptor.
 
 On first access to a new production-sized release, the app hashes the committed database and tileset once on a background worker. While this single-flight check is running, `/api/health` returns HTTP `503` with `Committed artifact checksums are verifying`, and `/api/map-config` reports `available: false`; the frontend retries both after 0.5 seconds and exponentially backs off to a 15-second cap. Verified results are cached against the artifact path, size, modification time, and expected digest. `HEALTH_SYNC_HASH_MAX_BYTES` is the maximum total artifact size verified inline (16 MiB by default). Lowering it moves more checks to the background; raising it can make a health request block on more I/O. Every artifact is still hashed.
 
@@ -163,5 +163,4 @@ If verification fails, stop v2, preserve its failed data directory for diagnosis
 | Health returns `503` with checksums `verifying` | Expected briefly after startup or a release switch; keep polling while the single background hash completes. |
 | Health returns `503` with checksums `invalid` or another integrity error | The manifest, checksum, or database/tileset metadata is invalid; restore a backup or activate a retained valid release. |
 | Tile request returns `404` | The version is not current/retained, the zoom is outside the archive range, or coordinates are invalid. |
-| Legacy request returns `413` | Use vector tiles or a smaller bounding box. |
 | Refresh cannot publish | Verify the container's `/app/data` mount is writable and has free space. |

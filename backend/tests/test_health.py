@@ -76,14 +76,6 @@ def test_api_routes_are_before_frontend_catch_all() -> None:
         assert routes.index("/api/health") < routes.index("/")
 
 
-def test_removed_app_config_route_returns_404() -> None:
-    assert TestClient(app).get("/api/app-config").status_code == 404
-
-
-def test_refuse_streets_is_removed() -> None:
-    assert TestClient(app).get("/api/refuse-streets?day=MON").status_code == 404
-
-
 def test_api_documentation_is_development_only() -> None:
     client = TestClient(app)
     assert client.get("/docs").status_code == 200

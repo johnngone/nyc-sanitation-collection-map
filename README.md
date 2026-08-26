@@ -84,8 +84,17 @@ The Docker image refreshes data on startup and every 14 days. Set these environm
 | `DATA_REFRESH_ON_STARTUP` | `true` | Start a refresh when the container starts |
 | `DATA_REFRESH_ENABLED` | `true` | Run the background refresh scheduler |
 | `DATA_REFRESH_INTERVAL_DAYS` | `14` | Days between scheduled refreshes |
+| `DATA_REFRESH_FAILURE_RETRY_MINUTES` | `30` | Minutes before retrying a failed refresh |
 | `DATA_RELEASE_RETENTION` | `2` | Validated releases kept on the data volume |
 | `HEALTH_SYNC_HASH_MAX_BYTES` | `16777216` | Artifact bytes checked during a health request before validation continues in the background |
+| `MIN_LION_SOURCE_ROWS` | `200000` | Minimum raw LION rows required for a first release |
+| `MIN_DSNY_SOURCE_ROWS` | `500` | Minimum DSNY polygons required for a first release |
+| `MIN_OUTPUT_FEATURES` | `100000` | Minimum processed features required for a first release |
+| `MAX_COUNT_DROP_PERCENT` | `10` | Maximum permitted count decline from the current release |
+| `TILE_MIN_ZOOM` | `11` | Lowest generated vector-tile zoom |
+| `TILE_MAX_ZOOM` | `16` | Highest generated vector-tile zoom |
+| `TILE_MAX_COMPRESSED_BYTES` | `1572864` | Per-tile compressed-size gate; may only lower the hard ceiling |
+| `TILE_MAX_UNCOMPRESSED_BYTES` | `6291456` | Per-tile decoded-size gate; may only lower the hard ceiling |
 | `VITE_BASEMAP_TILEJSON_URL` | OpenFreeMap | Basemap TileJSON URL used while building the image |
 
 `VITE_BASEMAP_TILEJSON_URL` is a build setting. Rebuild the image after changing it. The remaining settings apply when the container starts.
@@ -97,7 +106,7 @@ docker compose up -d --build
 docker compose logs -f app
 ```
 
-Compose mounts `./data` at `/app/data`.
+Compose mounts `./data` at `/app/data`. The container's manifest pointer is fixed at `/app/data/data_manifest.json`; there is no separate loose database or tileset path to configure.
 
 ## Documentation
 
@@ -118,7 +127,7 @@ Compose mounts `./data` at `/app/data`.
 | `GET /api/map-config` | Current vector tile URL and map availability |
 | `GET /api/tiles/{version}/{z}/{x}/{y}.pbf` | Gzip vector tiles used by the map |
 
-Before the first release is committed, `/api/live` and the frontend return `200`, `/api/health` returns `503`, `/api/map-config` returns `available: false`, and tile URLs return `404`. The basemap remains usable while the frontend retries. `/api/refuse-streets` and `/api/app-config` do not exist.
+Before the first release is committed, `/api/live` and the frontend return `200`, `/api/health` returns `503`, `/api/map-config` returns `available: false`, and tile URLs return `404`. The basemap remains usable while the frontend retries. After publication, health requires the committed v4 summary and database-v1 tables directly; it does not reconstruct missing release metadata or tolerate older table layouts. `/api/refuse-streets` and `/api/app-config` do not exist.
 
 Interactive API documentation is available at `/docs`, `/redoc`, and `/openapi.json` in development. All three routes return `404` when `APP_ENV=production`.
 

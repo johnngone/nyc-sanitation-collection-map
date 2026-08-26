@@ -961,14 +961,6 @@ def test_truncated_or_unknown_manifest_never_falls_back(tmp_path, manifest) -> N
         read_current_release(pointer)
 
 
-def test_explicit_v1_manifest_is_rejected(tmp_path) -> None:
-    pointer = tmp_path / "data_manifest.json"
-    pointer.write_text(json.dumps({"manifest_version": 1}), encoding="utf-8")
-
-    with pytest.raises(ReleaseManifestError):
-        read_current_release(pointer)
-
-
 def test_regression_gate_rejects_a_self_consistent_large_drop() -> None:
     current = {
         "counts": {

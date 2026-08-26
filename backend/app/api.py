@@ -252,40 +252,24 @@ def health() -> dict[str, object]:
                 raise HTTPException(status_code=503, detail="Database schema revision is invalid")
             count = metadata.get("block_faces")
             schedule_counts = metadata.get("schedule_counts")
-            if not isinstance(count, int) or not isinstance(schedule_counts, dict):
-                count = connection.execute("SELECT COUNT(*) FROM block_faces").fetchone()[0]
-                schedule_counts = {
-                    row[0]: row[1]
-                    for row in connection.execute(
-                        "SELECT collection_type, COUNT(*) FROM collection_schedules GROUP BY collection_type"
-                    )
-                }
-            tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+            if type(count) is not int or not isinstance(schedule_counts, dict):
+                raise HTTPException(status_code=503, detail="Committed release summary is invalid")
+            schedule_state_counts: dict[str, dict[str, int]] = {}
+            for collection_type, state, state_count in connection.execute(
+                """SELECT collection_type, state, COUNT(*)
+                   FROM block_face_collection_states
+                   GROUP BY collection_type, state"""
+            ):
+                schedule_state_counts.setdefault(str(collection_type), {})[str(state)] = int(state_count)
+            policy_conflicts = int(connection.execute(
+                "SELECT COUNT(*) FROM block_face_collection_states WHERE source_policy_conflict = 1"
+            ).fetchone()[0])
+            unresolved_counts = {
+                str(reason): int(reason_count)
+                for reason, reason_count in connection.execute(
+                    "SELECT reason_code, COUNT(*) FROM unknown_block_faces GROUP BY reason_code"
                 )
             }
-            schedule_state_counts: dict[str, dict[str, int]] = {}
-            unresolved_counts: dict[str, int] = {}
-            policy_conflicts = 0
-            if "block_face_collection_states" in tables:
-                for collection_type, state, state_count in connection.execute(
-                    """SELECT collection_type, state, COUNT(*)
-                       FROM block_face_collection_states
-                       GROUP BY collection_type, state"""
-                ):
-                    schedule_state_counts.setdefault(str(collection_type), {})[str(state)] = int(state_count)
-                policy_conflicts = int(connection.execute(
-                    "SELECT COUNT(*) FROM block_face_collection_states WHERE source_policy_conflict = 1"
-                ).fetchone()[0])
-            if "unknown_block_faces" in tables:
-                unresolved_counts = {
-                    str(reason): int(reason_count)
-                    for reason, reason_count in connection.execute(
-                        "SELECT reason_code, COUNT(*) FROM unknown_block_faces GROUP BY reason_code"
-                    )
-                }
     except sqlite3.Error:
         LOGGER.exception("Health check could not inspect the local database")
         raise HTTPException(status_code=503, detail="Committed database is invalid") from None

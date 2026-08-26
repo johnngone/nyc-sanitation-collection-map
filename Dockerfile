@@ -15,7 +15,7 @@ WORKDIR /app
 LABEL org.opencontainers.image.source="https://github.com/johnngone/nyc-sanitation-collection-map"
 LABEL org.opencontainers.image.licenses="MIT"
 COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./
-COPY backend ./backend
+COPY backend/app ./backend/app
 COPY scripts ./scripts
 COPY --from=frontend-build /app/frontend/dist ./frontend-dist
 RUN pip install --no-cache-dir ".[refresh]" \
