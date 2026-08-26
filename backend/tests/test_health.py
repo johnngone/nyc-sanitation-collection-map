@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 import sys
@@ -68,6 +69,20 @@ def test_live_is_independent_of_release_readiness(tmp_path, monkeypatch) -> None
     assert response.headers["permissions-policy"] == (
         "geolocation=(self), accelerometer=(self), gyroscope=(self), magnetometer=(self)"
     )
+
+
+def test_production_logs_failed_requests_but_not_successes(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.setattr(main, "REQUEST_LOG_MIN_STATUS", 400)
+    monkeypatch.setattr(api, "DATA_MANIFEST_PATH", str(tmp_path / "missing.json"))
+    client = TestClient(app)
+
+    with caplog.at_level(logging.WARNING):
+        assert client.get("/api/live").status_code == 200
+        assert client.get("/api/health").status_code == 503
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("path=/api/live" in message for message in messages)
+    assert any("path=/api/health status=503" in message for message in messages)
 
 
 def test_api_routes_are_before_frontend_catch_all() -> None:

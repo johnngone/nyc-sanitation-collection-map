@@ -9,7 +9,7 @@ if [ "${DATA_REFRESH_ENABLED:-true}" = "true" ]; then
   refresh_pid="$!"
 fi
 
-uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --no-access-log &
 app_pid="$!"
 
 shutdown() {

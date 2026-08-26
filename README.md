@@ -131,6 +131,8 @@ Before the first release is committed, `/api/live` and the frontend return `200`
 
 Interactive API documentation is available at `/docs`, `/redoc`, and `/openapi.json` in development. All three routes return `404` when `APP_ENV=production`.
 
+Development keeps the complete HTTP request-access log. Production suppresses successful request lines but logs every `4xx` and `5xx` response, including `/api/health` readiness failures. Refresh progress and actionable application failures remain in the container log.
+
 ## Troubleshooting
 
 | Problem | Check |

@@ -98,11 +98,6 @@ def map_config() -> JSONResponse:
         return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
     checksum_status = _current_release_integrity(release)
     if checksum_status != "verified":
-        LOGGER.warning(
-            "Committed map artifacts are not checksum-ready status=%s version=%s",
-            checksum_status,
-            release.dataset_version,
-        )
         return JSONResponse(_unavailable_map_config(), headers={"Cache-Control": "no-cache"})
     tileset_path = release.tileset_path
     try:

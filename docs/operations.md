@@ -23,6 +23,8 @@ FastAPI serves the compiled frontend and `/api/*` on port `8000`. It does not en
 
 `GET /api/live` is process liveness and backs the container health check. `GET /api/health` is release readiness and returns `503` until a committed release is fully verified. Health reads the required manifest-v4 summary and database-v1 tables directly; it has no compatibility reconstruction for missing metadata or older schemas. Production disables `/docs`, `/redoc`, and `/openapi.json`; development retains them.
 
+The application owns one HTTP logging policy: development records every response, while production records only `4xx` and `5xx` responses. Successful browser polling, tiles, assets, and container liveness probes therefore remain quiet in production while `/api/health` readiness failures and other HTTP problems stay visible. Dataset-refresh progress, warnings, invalid release errors, and server failures remain visible in both environments.
+
 ## Vector-tile contract
 
 The tile-v4 archive is an MBTiles SQLite file covering zooms 11–16. `collection_streets` contains known schedule geometry; `collection_unknowns` contains schedule-free unresolved geometry at zooms 14–16. Source-coverage gaps and segments with insufficient address evidence both appear from zoom 14. The runtime accepts only manifest v4 releases and tile schema v4.

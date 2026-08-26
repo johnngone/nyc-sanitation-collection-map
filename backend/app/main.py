@@ -30,6 +30,8 @@ SENSOR_PERMISSIONS_POLICY = (
     "geolocation=(self), accelerometer=(self), gyroscope=(self), magnetometer=(self)"
 )
 RUNTIME_SEO_MARKER = "<!-- runtime-seo -->"
+IS_PRODUCTION = APP_ENV.strip().casefold() == "production"
+REQUEST_LOG_MIN_STATUS = 400 if IS_PRODUCTION else 0
 
 
 def render_frontend_index(
@@ -130,16 +132,27 @@ app = FastAPI(
     title="NYC Sanitation Map API",
     version="2.0.0",
     license_info={"name": "MIT License", "identifier": "MIT"},
-    docs_url=None if APP_ENV.strip().casefold() == "production" else "/docs",
-    redoc_url=None if APP_ENV.strip().casefold() == "production" else "/redoc",
-    openapi_url=None if APP_ENV.strip().casefold() == "production" else "/openapi.json",
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
 )
 
 
 @app.middleware("http")
-async def add_sensor_permissions_policy(request, call_next):
+async def finalize_response(request, call_next):
     response = await call_next(request)
     response.headers["Permissions-Policy"] = SENSOR_PERMISSIONS_POLICY
+    if response.status_code >= REQUEST_LOG_MIN_STATUS:
+        client = request.client
+        client_address = f"{client.host}:{client.port}" if client is not None else "unknown"
+        logger.log(
+            logging.WARNING if response.status_code >= 400 else logging.INFO,
+            "HTTP request method=%s path=%s status=%s client=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            client_address,
+        )
     return response
 
 
