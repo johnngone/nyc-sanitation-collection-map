@@ -1,5 +1,7 @@
 # NYC Sanitation Collection Map
 
+ 🌐 [Open the live map: trashmap.nyc](https://trashmap.nyc)
+
 Map NYC sanitation collection schedules by street. Pick a day and filter by refuse, recycling, organics, or bulk trash. The map also supports live browser location tracking. Hostable as a standalone Docker container.
 
 ## Quick start
