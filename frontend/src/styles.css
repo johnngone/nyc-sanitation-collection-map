@@ -328,7 +328,7 @@ input:focus-visible {
 
 .brand-lockup.is-expanded .brand-copy,
 .brand-button:focus-visible .brand-copy {
-  max-width: min(23rem, calc(100vw - 5rem));
+  max-width: calc(100vw - 6rem);
   opacity: 1;
 }
 
@@ -663,7 +663,7 @@ label input[type="checkbox"] {
 
   .brand-lockup.is-expanded .brand-copy,
   .brand-button:focus-visible .brand-copy {
-    max-width: min(17.5rem, calc(100vw - 4.8rem));
+    max-width: calc(100vw - 6.5rem);
   }
 
   .brand-copy strong { font-size: .82rem; }
