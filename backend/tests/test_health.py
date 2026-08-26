@@ -11,6 +11,8 @@ def test_runtime_seo_metadata_is_injected_and_escaped() -> None:
         """<title id="runtime-browser-title">Default</title>
         <meta id="runtime-meta-description" name="description" content="Default" />
         <!-- runtime-seo -->""",
+        app_title="Pickup <Map> & More",
+        app_subtitle="Schedules by street > block",
         browser_title='Pickup <Map>',
         meta_description='Schedules for "everyone" & neighbors.',
         public_url="https://map.example.com",
@@ -21,6 +23,9 @@ def test_runtime_seo_metadata_is_injected_and_escaped() -> None:
     assert '<link rel="canonical" href="https://map.example.com" />' in rendered
     assert '<meta property="og:image" content="https://map.example.com/logo.png" />' in rendered
     assert '"url": "https://map.example.com"' in rendered
+    assert 'id="runtime-app-config"' in rendered
+    assert '"title": "Pickup \\u003cMap\\u003e \\u0026 More"' in rendered
+    assert '"subtitle": "Schedules by street \\u003e block"' in rendered
     assert "runtime-seo" not in rendered
 
 
@@ -67,6 +72,10 @@ def test_api_routes_are_before_frontend_catch_all() -> None:
     routes = [getattr(route, "path", None) for route in app.routes]
     if "/" in routes:
         assert routes.index("/api/health") < routes.index("/")
+
+
+def test_removed_app_config_route_returns_404() -> None:
+    assert TestClient(app).get("/api/app-config").status_code == 404
 
 
 def test_refuse_streets_reaches_api_router(tmp_path, monkeypatch) -> None:

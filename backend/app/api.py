@@ -10,9 +10,6 @@ from pathlib import Path
 import json
 
 from .config import (
-    APP_BROWSER_TITLE,
-    APP_SUBTITLE,
-    APP_TITLE,
     DATABASE_PATH,
     DATA_MANIFEST_PATH,
     HEALTH_SYNC_HASH_MAX_BYTES,
@@ -35,18 +32,6 @@ VALID_DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT")
 VALID_TYPES = ("REFUSE", "RECYCLING", "ORGANICS", "BULK")
 LEGACY_FEATURE_LIMIT = 20_000
 SUPPORTED_RUNTIME_TILE_SCHEMA_REVISIONS = {2, 3, 4}
-
-
-@router.get("/app-config")
-def app_config() -> JSONResponse:
-    return JSONResponse(
-        {
-            "title": APP_TITLE,
-            "subtitle": APP_SUBTITLE,
-            "browser_title": APP_BROWSER_TITLE,
-        },
-        headers={"Cache-Control": "no-cache"},
-    )
 
 
 def _read_only_database(path: str | Path) -> sqlite3.Connection:

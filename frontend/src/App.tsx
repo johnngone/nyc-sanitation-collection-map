@@ -17,9 +17,10 @@ const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Satur
 type Weekday = (typeof weekdays)[number];
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
 const basemapTileJsonUrl = import.meta.env.VITE_BASEMAP_TILEJSON_URL?.trim() || DEFAULT_BASEMAP_TILEJSON_URL;
-const defaultAppTitle = "NYC Sanitation – Collection Map";
-const defaultAppSubtitle = "See collection schedules by street and day.";
-const defaultBrowserTitle = "NYC Sanitation Collection Map";
+const defaultAppConfig = {
+  title: "NYC Sanitation – Collection Map",
+  subtitle: "See collection schedules by street and day.",
+};
 const sourceId = "collection-streets";
 const mobileControlsMediaQuery = "(max-width: 700px), (max-height: 520px) and (pointer: coarse)";
 const collectionTypes = [
@@ -52,8 +53,30 @@ interface MapConfig {
 interface AppConfig {
   title: string;
   subtitle: string;
-  browser_title: string;
 }
+
+function isValidAppConfig(payload: unknown): payload is AppConfig {
+  if (!payload || typeof payload !== "object") return false;
+  const candidate = payload as Partial<AppConfig>;
+  return typeof candidate.title === "string"
+    && Boolean(candidate.title.trim())
+    && typeof candidate.subtitle === "string"
+    && Boolean(candidate.subtitle.trim());
+}
+
+function readInitialAppConfig(): AppConfig {
+  const element = document.getElementById("runtime-app-config");
+  if (!element?.textContent) return defaultAppConfig;
+  try {
+    const payload: unknown = JSON.parse(element.textContent);
+    return isValidAppConfig(payload) ? payload : defaultAppConfig;
+  } catch (error: unknown) {
+    console.error("Could not parse initial application branding", error);
+    return defaultAppConfig;
+  }
+}
+
+const initialAppConfig = readInitialAppConfig();
 
 function dayCode(day: Weekday): string {
   return day.slice(0, 3).toUpperCase();
@@ -101,9 +124,8 @@ export function App() {
   const updateTileStatusRef = useRef<(() => void) | null>(null);
   const tileErrorRef = useRef<string | null>(null);
   const [selectedDay, setSelectedDay] = useState<Weekday>(selectedDayRef.current);
-  const [appTitle, setAppTitle] = useState(defaultAppTitle);
-  const [appSubtitle, setAppSubtitle] = useState(defaultAppSubtitle);
-  const [browserTitle, setBrowserTitle] = useState(defaultBrowserTitle);
+  const appTitle = initialAppConfig.title;
+  const appSubtitle = initialAppConfig.subtitle;
   const [backendConnection, setBackendConnection] = useState<BackendConnection>("checking");
   const [mappedFeatureCount, setMappedFeatureCount] = useState<number | null>(null);
   const [mapStatus, setMapStatus] = useState("Loading map tiles…");
@@ -118,27 +140,6 @@ export function App() {
   const [isMobileViewport, setIsMobileViewport] = useState(
     () => window.matchMedia(mobileControlsMediaQuery).matches,
   );
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void fetchAppConfig(controller.signal)
-      .then((config) => {
-        if (controller.signal.aborted) return;
-        setAppTitle(config.title);
-        setAppSubtitle(config.subtitle);
-        setBrowserTitle(config.browser_title);
-      })
-      .catch((error: unknown) => {
-        if ((error as { name?: string }).name !== "AbortError") {
-          console.error("Could not load application branding", error);
-        }
-      });
-    return () => controller.abort();
-  }, []);
-
-  useEffect(() => {
-    document.title = browserTitle;
-  }, [browserTitle]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia(mobileControlsMediaQuery);
@@ -689,25 +690,6 @@ async function fetchMapConfig(signal: AbortSignal): Promise<MapConfig> {
     throw new Error("The backend returned an invalid map tile configuration");
   }
   return payload as MapConfig;
-}
-
-async function fetchAppConfig(signal: AbortSignal): Promise<AppConfig> {
-  const response = await fetch(apiUrl("/api/app-config"), { signal });
-  if (!response.ok) throw new Error(`Application configuration request failed with HTTP ${response.status}`);
-  const payload: unknown = await response.json();
-  if (
-    !payload
-    || typeof payload !== "object"
-    || typeof (payload as Partial<AppConfig>).title !== "string"
-    || !(payload as Partial<AppConfig>).title?.trim()
-    || typeof (payload as Partial<AppConfig>).subtitle !== "string"
-    || !(payload as Partial<AppConfig>).subtitle?.trim()
-    || typeof (payload as Partial<AppConfig>).browser_title !== "string"
-    || !(payload as Partial<AppConfig>).browser_title?.trim()
-  ) {
-    throw new Error("The backend returned an invalid application configuration");
-  }
-  return payload as AppConfig;
 }
 
 function lowZoomLayerId(type: CollectionType): string {

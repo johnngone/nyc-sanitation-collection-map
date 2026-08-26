@@ -10,22 +10,6 @@ from app.database import initialize
 from app.main import app
 
 
-def test_app_config_exposes_runtime_branding(monkeypatch) -> None:
-    monkeypatch.setattr(api, "APP_TITLE", "Neighborhood Pickup Map")
-    monkeypatch.setattr(api, "APP_SUBTITLE", "Find your next collection day.")
-    monkeypatch.setattr(api, "APP_BROWSER_TITLE", "Pickup Map | Example Organization")
-
-    response = TestClient(app).get("/api/app-config")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "title": "Neighborhood Pickup Map",
-        "subtitle": "Find your next collection day.",
-        "browser_title": "Pickup Map | Example Organization",
-    }
-    assert response.headers["cache-control"] == "no-cache"
-
-
 def test_runtime_tile_contract_rejects_unsupported_declared_revision() -> None:
     assert api._expected_tile_schema_revision(
         {

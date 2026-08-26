@@ -17,6 +17,8 @@ from .config import (
     APP_META_DESCRIPTION,
     APP_PUBLIC_URL,
     APP_ROBOTS_TXT,
+    APP_SUBTITLE,
+    APP_TITLE,
     DATABASE_PATH,
     DATA_MANIFEST_PATH,
 )
@@ -36,6 +38,8 @@ RUNTIME_SEO_MARKER = "<!-- runtime-seo -->"
 def render_frontend_index(
     template: str,
     *,
+    app_title: str = APP_TITLE,
+    app_subtitle: str = APP_SUBTITLE,
     browser_title: str = APP_BROWSER_TITLE,
     meta_description: str = APP_META_DESCRIPTION,
     public_url: str = APP_PUBLIC_URL,
@@ -86,6 +90,23 @@ def render_frontend_index(
             ]
         )
         structured_data["url"] = public_url
+    runtime_app_config = json.dumps(
+        {
+            "title": app_title,
+            "subtitle": app_subtitle,
+        },
+        ensure_ascii=False,
+    )
+    runtime_app_config = (
+        runtime_app_config
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+    metadata.append(
+        '<script id="runtime-app-config" type="application/json">'
+        f"{runtime_app_config}</script>"
+    )
     json_ld = json.dumps(structured_data, ensure_ascii=False).replace("<", "\\u003c")
     metadata.append(f'<script type="application/ld+json">{json_ld}</script>')
     return rendered.replace(RUNTIME_SEO_MARKER, "\n    ".join(metadata), 1)

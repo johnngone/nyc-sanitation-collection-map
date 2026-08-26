@@ -111,7 +111,6 @@ Compose mounts `./data` at `/app/data`.
 
 | Endpoint | Use |
 | --- | --- |
-| `GET /api/app-config` | Runtime title and subtitle used by the frontend |
 | `GET /api/health` | Release status record counts and artifact checks |
 | `GET /api/map-config` | Current vector tile URL and map availability |
 | `GET /api/tiles/{version}/{z}/{x}/{y}.pbf` | Gzip vector tiles used by the map |
