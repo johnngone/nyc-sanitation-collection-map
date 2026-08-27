@@ -28,6 +28,7 @@ def test_runtime_seo_metadata_is_injected_and_escaped() -> None:
     assert '<link rel="canonical" href="https://map.example.com" />' in rendered
     assert '<meta property="og:image" content="https://map.example.com/logo.png" />' in rendered
     assert '"url": "https://map.example.com"' in rendered
+    assert '"operatingSystem": "Any operating system with a modern web browser"' in rendered
     assert 'id="runtime-app-config"' in rendered
     assert '"title": "Pickup \\u003cMap\\u003e \\u0026 More"' in rendered
     assert '"subtitle": "Schedules by street \\u003e block"' in rendered

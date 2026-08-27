@@ -76,6 +76,7 @@ def render_frontend_index(
         "name": browser_title,
         "description": meta_description,
         "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "Any operating system with a modern web browser",
     }
     if public_url:
         escaped_url = html.escape(public_url, quote=True)
