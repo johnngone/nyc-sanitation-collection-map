@@ -4,6 +4,8 @@
 
 Map NYC sanitation collection schedules by street. Pick a day and filter by refuse, recycling, organics, or bulk trash. The map also supports live browser location tracking. Hostable as a standalone Docker container.
 
+<p align="center"><img width="600" alt="Screenshot of trashmap.nyc" src="https://github.com/user-attachments/assets/90b6505a-f896-452e-86ca-f929e23c0b62" /></p>
+
 ## Quick start
 
 Pull the published GHCR image and mount a persistent data directory. The container listens on port `8000`. Set `HOST_PORT` to the port people will use in their browser.
