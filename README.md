@@ -82,6 +82,7 @@ The Docker image refreshes data on startup and every 14 days. Set these environm
 | `APP_TITLE` | `NYC Sanitation – Collection Map` | Visible and accessible map heading |
 | `APP_SUBTITLE` | `See collection schedules by street and day.` | Text beneath the map title |
 | `APP_BROWSER_TITLE` | `NYC Sanitation Collection Map` | Browser-tab, search-result, Open Graph, and Twitter title |
+| `APP_SHORT_NAME` | `Trash Map` | Home-screen and installed-app label |
 | `APP_META_DESCRIPTION` | `Map NYC sanitation collection schedules by street and day.` | Search-result, Open Graph, and Twitter description |
 | `APP_PUBLIC_URL` | empty | Public HTTPS origin used for canonical, Open Graph, JSON-LD, robots, and sitemap URLs |
 | `APP_ROBOTS_TXT` | empty (`Disallow: /`) | Complete `/robots.txt` override using literal `\n` line separators; set an explicit allow policy to make the site crawlable |

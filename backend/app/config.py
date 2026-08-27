@@ -11,6 +11,7 @@ APP_BROWSER_TITLE = (
     os.getenv("APP_BROWSER_TITLE", "NYC Sanitation Collection Map").strip()
     or "NYC Sanitation Collection Map"
 )
+APP_SHORT_NAME = os.getenv("APP_SHORT_NAME", "Trash Map").strip() or "Trash Map"
 APP_META_DESCRIPTION = (
     os.getenv(
         "APP_META_DESCRIPTION",

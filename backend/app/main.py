@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import HTMLResponse, PlainTextResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from .api import router
 from .config import (
@@ -17,6 +17,7 @@ from .config import (
     APP_META_DESCRIPTION,
     APP_PUBLIC_URL,
     APP_ROBOTS_TXT,
+    APP_SHORT_NAME,
     APP_SUBTITLE,
     APP_TITLE,
 )
@@ -40,15 +41,29 @@ def render_frontend_index(
     app_title: str = APP_TITLE,
     app_subtitle: str = APP_SUBTITLE,
     browser_title: str = APP_BROWSER_TITLE,
+    app_short_name: str = APP_SHORT_NAME,
     meta_description: str = APP_META_DESCRIPTION,
     public_url: str = APP_PUBLIC_URL,
 ) -> str:
     escaped_title = html.escape(browser_title, quote=True)
+    escaped_short_name = html.escape(app_short_name, quote=True)
     escaped_description = html.escape(meta_description, quote=True)
     rendered = re.sub(
         r'<title id="runtime-browser-title">.*?</title>',
         f'<title id="runtime-browser-title">{escaped_title}</title>',
         template,
+        count=1,
+        flags=re.DOTALL,
+    )
+    rendered = re.sub(
+        r'<meta id="runtime-apple-mobile-web-app-title" '
+        r'name="apple-mobile-web-app-title" content=".*?"\s*/?>',
+        (
+            '<meta id="runtime-apple-mobile-web-app-title" '
+            'name="apple-mobile-web-app-title" '
+            f'content="{escaped_short_name}" />'
+        ),
+        rendered,
         count=1,
         flags=re.DOTALL,
     )
@@ -192,6 +207,39 @@ def sitemap() -> Response:
         f"{entry}</urlset>"
     )
     return Response(content, media_type="application/xml", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/site.webmanifest", include_in_schema=False)
+def site_manifest() -> JSONResponse:
+    return JSONResponse(
+        {
+            "name": APP_BROWSER_TITLE,
+            "short_name": APP_SHORT_NAME,
+            "description": APP_META_DESCRIPTION,
+            "id": "/",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "background_color": "#eef2f5",
+            "theme_color": "#eef2f5",
+            "icons": [
+                {
+                    "src": "/web-app-manifest-192x192.png",
+                    "sizes": "192x192",
+                    "type": "image/png",
+                    "purpose": "any maskable",
+                },
+                {
+                    "src": "/web-app-manifest-512x512.png",
+                    "sizes": "512x512",
+                    "type": "image/png",
+                    "purpose": "any maskable",
+                },
+            ],
+        },
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 frontend_directory = Path(__file__).resolve().parents[2] / "frontend-dist"
 if frontend_directory.is_dir():
