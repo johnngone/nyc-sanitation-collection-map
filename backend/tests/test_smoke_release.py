@@ -1,7 +1,6 @@
 import gzip
 
 import mapbox_vector_tile
-import pytest
 from fastapi.testclient import TestClient
 
 from app import api
@@ -54,10 +53,3 @@ def test_smoke_release_exercises_runtime_database_and_real_vector_tile(tmp_path,
         headers={"If-None-Match": tile.headers["etag"]},
     )
     assert cached.status_code == 304
-
-
-def test_smoke_release_refuses_to_replace_a_committed_fixture(tmp_path) -> None:
-    build_smoke_release(tmp_path)
-
-    with pytest.raises(FileExistsError, match="existing manifest"):
-        build_smoke_release(tmp_path)

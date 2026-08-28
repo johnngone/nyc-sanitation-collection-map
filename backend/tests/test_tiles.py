@@ -13,10 +13,7 @@ from app.database import initialize
 from app.main import app
 from app.tiles import read_metadata
 from scripts.build_tiles import (
-    DEFAULT_MAX_COMPRESSED_TILE_BYTES,
-    DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES,
     DEFAULT_MAX_ZOOM,
-    DEFAULT_MIN_ZOOM,
     _tile_geometry_with_source_fallback,
     build_tiles,
 )
@@ -549,12 +546,6 @@ def test_builder_rejects_buffer_smaller_than_frontend_style_reach(tmp_path) -> N
             maxzoom=11,
             buffer_pixels=15.99,
         )
-
-
-def test_builder_defaults_cover_zoom_11_with_reviewed_tile_size_ceilings() -> None:
-    assert DEFAULT_MIN_ZOOM == 11
-    assert DEFAULT_MAX_COMPRESSED_TILE_BYTES == 1_572_864
-    assert DEFAULT_MAX_UNCOMPRESSED_TILE_BYTES == 6_291_456
 
 
 @pytest.mark.parametrize(

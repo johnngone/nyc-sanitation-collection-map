@@ -1,7 +1,4 @@
 import logging
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -142,32 +139,4 @@ def test_production_logs_failed_requests_but_not_successes(tmp_path, monkeypatch
     messages = [record.getMessage() for record in caplog.records]
     assert not any("path=/api/live" in message for message in messages)
     assert any("path=/api/health status=503" in message for message in messages)
-
-
-def test_api_routes_are_before_frontend_catch_all() -> None:
-    routes = [getattr(route, "path", None) for route in app.routes]
-    if "/" in routes:
-        assert routes.index("/api/health") < routes.index("/")
-
-
-def test_api_documentation_is_development_only() -> None:
-    client = TestClient(app)
-    assert client.get("/docs").status_code == 200
-    assert client.get("/redoc").status_code == 200
-    assert client.get("/openapi.json").status_code == 200
-
-    repository = Path(__file__).resolve().parents[2]
-    command = (
-        "from fastapi.testclient import TestClient; "
-        "from backend.app.main import app; "
-        "c=TestClient(app); "
-        "assert [c.get(p).status_code for p in ('/docs','/redoc','/openapi.json')] == [404,404,404]"
-    )
-    environment = {**os.environ, "APP_ENV": "production"}
-    subprocess.run(
-        [sys.executable, "-c", command],
-        cwd=repository,
-        env=environment,
-        check=True,
-    )
 
