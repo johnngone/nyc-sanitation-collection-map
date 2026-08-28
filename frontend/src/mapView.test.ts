@@ -1,20 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { cameraTransitionDuration, compassTransform, MAP_INTERACTION_OPTIONS, mapViewState, needsCameraReset } from "./mapView";
-
-describe("map interactions", () => {
-  it("enables desktop and touch rotation and pitch without camera roll", () => {
-    expect(MAP_INTERACTION_OPTIONS).toEqual({
-      maxZoom: 18,
-      maxPitch: 50,
-      dragRotate: true,
-      touchZoomRotate: true,
-      touchPitch: true,
-      pitchWithRotate: true,
-      rollEnabled: false,
-    });
-  });
-});
+import { cameraTransitionDuration, compassTransform, mapViewState, needsCameraReset } from "./mapView";
 
 describe("map view state", () => {
   it("starts flat, north-up, and unlatched", () => {

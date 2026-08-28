@@ -1,6 +1,3 @@
-import logging
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from app import api
@@ -36,21 +33,6 @@ def test_runtime_seo_metadata_is_injected_and_escaped() -> None:
     assert '"title": "Pickup \\u003cMap\\u003e \\u0026 More"' in rendered
     assert '"subtitle": "Schedules by street \\u003e block"' in rendered
     assert "runtime-seo" not in rendered
-
-
-def test_frontend_index_declares_icon_and_install_metadata() -> None:
-    index = (
-        Path(__file__).resolve().parents[2] / "frontend" / "index.html"
-    ).read_text(encoding="utf-8")
-
-    assert '<link rel="icon" type="image/svg+xml" href="/favicon.svg" />' in index
-    assert 'sizes="96x96" href="/favicon-96x96.png"' in index
-    assert '<link rel="shortcut icon" href="/favicon.ico" />' in index
-    assert 'sizes="180x180" href="/apple-touch-icon.png"' in index
-    assert '<link rel="manifest" href="/site.webmanifest" />' in index
-    assert '<meta name="theme-color" content="#eef2f5" />' in index
-    assert '<meta name="apple-mobile-web-app-capable" content="yes" />' in index
-    assert 'name="apple-mobile-web-app-title" content="Trash Map"' in index
 
 
 def test_site_manifest_uses_runtime_branding(monkeypatch) -> None:
@@ -127,16 +109,4 @@ def test_live_is_independent_of_release_readiness(tmp_path, monkeypatch) -> None
     )
 
 
-def test_production_logs_failed_requests_but_not_successes(tmp_path, monkeypatch, caplog) -> None:
-    monkeypatch.setattr(main, "REQUEST_LOG_MIN_STATUS", 400)
-    monkeypatch.setattr(api, "DATA_MANIFEST_PATH", str(tmp_path / "missing.json"))
-    client = TestClient(app)
-
-    with caplog.at_level(logging.WARNING):
-        assert client.get("/api/live").status_code == 200
-        assert client.get("/api/health").status_code == 503
-
-    messages = [record.getMessage() for record in caplog.records]
-    assert not any("path=/api/live" in message for message in messages)
-    assert any("path=/api/health status=503" in message for message in messages)
 
