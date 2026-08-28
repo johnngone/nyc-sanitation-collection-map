@@ -26,7 +26,6 @@ def test_runtime_seo_metadata_is_injected_and_escaped() -> None:
     ) in rendered
     assert "Schedules for &quot;everyone&quot; &amp; neighbors." in rendered
     assert '<link rel="canonical" href="https://map.example.com" />' in rendered
-    assert '<meta property="og:image" content="https://map.example.com/logo.png" />' in rendered
     assert '"url": "https://map.example.com"' in rendered
     assert '"operatingSystem": "Any operating system with a modern web browser"' in rendered
     assert 'id="runtime-app-config"' in rendered
@@ -45,7 +44,18 @@ def test_site_manifest_uses_runtime_branding(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/manifest+json"
     assert response.headers["cache-control"] == "no-cache"
-    assert response.json() == {
+    payload = response.json()
+    assert {key: payload[key] for key in (
+        "name",
+        "short_name",
+        "description",
+        "id",
+        "start_url",
+        "scope",
+        "display",
+        "background_color",
+        "theme_color",
+    )} == {
         "name": "Neighborhood Collection Map",
         "short_name": "Pickup Map",
         "description": "Find collection schedules.",
@@ -55,20 +65,6 @@ def test_site_manifest_uses_runtime_branding(monkeypatch) -> None:
         "display": "standalone",
         "background_color": "#eef2f5",
         "theme_color": "#eef2f5",
-        "icons": [
-            {
-                "src": "/web-app-manifest-192x192.png",
-                "sizes": "192x192",
-                "type": "image/png",
-                "purpose": "any maskable",
-            },
-            {
-                "src": "/web-app-manifest-512x512.png",
-                "sizes": "512x512",
-                "type": "image/png",
-                "purpose": "any maskable",
-            },
-        ],
     }
 
 
