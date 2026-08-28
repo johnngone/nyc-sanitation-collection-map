@@ -1,3 +1,4 @@
+from base64 import b64decode
 import struct
 import zlib
 from pathlib import Path
@@ -71,19 +72,22 @@ def decode_rgba_png(path: Path) -> tuple[int, int, bytes]:
     return width, height, b"".join(rows)
 
 
-def test_svg_favicon_is_true_vector_artwork() -> None:
+def test_svg_favicon_embeds_authoritative_logo_without_redrawing() -> None:
     source = (PUBLIC / "favicon.svg").read_text(encoding="utf-8")
     root = ElementTree.fromstring(source)
     namespace = {"svg": "http://www.w3.org/2000/svg"}
+    images = root.findall(".//svg:image", namespace)
 
     assert root.attrib["viewBox"] == "0 0 512 512"
-    assert len(root.findall(".//svg:circle", namespace)) == 2
-    assert len(root.findall(".//svg:path", namespace)) >= 1
-    assert not root.findall(".//svg:image", namespace)
-    assert "data:image" not in source
-    assert {"#f04035", "#18bfe6", "#fecd01"} <= set(
-        element.attrib.get("fill") for element in root.iter()
-    )
+    assert len(images) == 1
+    assert images[0].attrib["x"] == "25.6"
+    assert images[0].attrib["y"] == "25.6"
+    assert images[0].attrib["width"] == "460.8"
+    assert images[0].attrib["height"] == "460.8"
+    prefix = "data:image/png;base64,"
+    embedded = images[0].attrib["href"]
+    assert embedded.startswith(prefix)
+    assert b64decode(embedded.removeprefix(prefix)) == (PUBLIC / "logo.png").read_bytes()
 
 
 def test_png_icons_have_expected_dimensions_and_backgrounds() -> None:
