@@ -525,9 +525,8 @@ export function App() {
     sheetGesturePointerIdRef.current = event.pointerId;
     sheetGestureHandledRef.current = false;
 
-    const target = event.target;
-    const toggle = target instanceof Element ? target.closest<HTMLButtonElement>(".sheet-toggle") : null;
-    toggle?.setPointerCapture(event.pointerId);
+    const captureTarget = event.target instanceof Element ? event.target : event.currentTarget;
+    captureTarget.setPointerCapture(event.pointerId);
   }
 
   function finishSheetGesture(event: React.PointerEvent<HTMLElement>) {

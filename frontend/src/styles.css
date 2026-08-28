@@ -757,10 +757,12 @@ label input[type="checkbox"] {
     max-height: calc(min(72dvh, 620px) - var(--mobile-sheet-peek));
     overflow: auto;
     overscroll-behavior: contain;
-    touch-action: pan-down;
+    touch-action: none;
     padding: .2rem 1rem calc(1rem + env(safe-area-inset-bottom));
     transition: opacity 160ms ease;
   }
+
+  .map-overlay.is-full .sheet-content { touch-action: pan-y; }
 
   .core-controls,
   .advanced-controls-inner { gap: 1rem; }
