@@ -71,13 +71,30 @@ def decode_rgba_png(path: Path) -> tuple[int, int, bytes]:
     return width, height, b"".join(rows)
 
 
+def non_white_bounds(width: int, pixels: bytes) -> tuple[int, int, int, int]:
+    coordinates = [
+        (offset // 4 % width, offset // 4 // width)
+        for offset in range(0, len(pixels), 4)
+        if pixels[offset : offset + 3] != b"\xff\xff\xff"
+    ]
+    return (
+        min(x for x, _ in coordinates),
+        min(y for _, y in coordinates),
+        max(x for x, _ in coordinates),
+        max(y for _, y in coordinates),
+    )
+
+
 def test_svg_favicon_is_vectorized_and_preserves_pointed_corner() -> None:
     source = (PUBLIC / "favicon.svg").read_text(encoding="utf-8")
     root = ElementTree.fromstring(source)
     namespace = {"svg": "http://www.w3.org/2000/svg"}
     paths = root.findall(".//svg:path", namespace)
+    groups = root.findall(".//svg:g", namespace)
 
     assert root.attrib["viewBox"] == "0 0 512 512"
+    assert len(groups) == 1
+    assert "transform" not in groups[0].attrib
     assert [path.attrib["fill"] for path in paths] == [
         "#f04035",
         "#18bfe6",
@@ -95,16 +112,28 @@ def test_png_icons_have_expected_dimensions_and_backgrounds() -> None:
     assert (favicon_width, favicon_height) == (96, 96)
     assert 0 in favicon[3::4]
     assert 255 in favicon[3::4]
+    favicon_coordinates = [
+        (offset // 4 % favicon_width, offset // 4 // favicon_width)
+        for offset in range(0, len(favicon), 4)
+        if favicon[offset + 3] != 0
+    ]
+    assert (
+        min(x for x, _ in favicon_coordinates),
+        min(y for _, y in favicon_coordinates),
+        max(x for x, _ in favicon_coordinates),
+        max(y for _, y in favicon_coordinates),
+    ) == (0, 0, 95, 95)
 
-    for filename, expected_size in (
-        ("apple-touch-icon.png", 180),
-        ("web-app-manifest-192x192.png", 192),
-        ("web-app-manifest-512x512.png", 512),
+    for filename, expected_size, expected_bounds in (
+        ("apple-touch-icon.png", 180, (36, 36, 143, 143)),
+        ("web-app-manifest-192x192.png", 192, (43, 43, 148, 148)),
+        ("web-app-manifest-512x512.png", 512, (116, 116, 396, 396)),
     ):
         width, height, pixels = decode_rgba_png(PUBLIC / filename)
         assert (width, height) == (expected_size, expected_size)
         assert set(pixels[3::4]) == {255}
         assert pixels[:4] == b"\xff\xff\xff\xff"
+        assert non_white_bounds(width, pixels) == expected_bounds
 
 
 def test_ico_contains_desktop_favicon_sizes() -> None:
