@@ -762,7 +762,7 @@ label input[type="checkbox"] {
     transition: opacity 160ms ease;
   }
 
-  .map-overlay.is-full .sheet-content { touch-action: pan-y; }
+  .map-overlay.is-full .sheet-content { touch-action: pan-down; }
 
   .core-controls,
   .advanced-controls-inner { gap: 1rem; }
