@@ -248,6 +248,7 @@ export function App() {
 
     map.once("style.load", () => {
       viewControl.sync();
+      void userLocationControl.autoStart();
       const loadMapTiles = () => {
         if (controller.signal.aborted || tilesInitialized) return;
         const scheduleRetry = () => {

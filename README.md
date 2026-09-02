@@ -71,6 +71,8 @@ docker run -d \
 
 Live location tracking requires HTTPS. `http://localhost` also works for local use. Put a public or LAN deployment behind an HTTPS reverse proxy and allow the browser location permission.
 
+When the map opens, it centers on the first available fix if location access was already granted. It does not show a permission prompt automatically; the location button lets the user opt in, retry after a timeout, or recenter the map later.
+
 The browser keeps location coordinates in memory. The app does not send them to its API or store them in the data volume.
 
 ## Deployment settings

@@ -1,5 +1,4 @@
 import maplibregl, {
-  type ControlPosition,
   type IControl,
   type Map as MapLibreMap,
   type Marker,
@@ -66,6 +65,19 @@ export function locationStatePresentation(state: UserLocationState): {
   }
 }
 
+export async function locationPermissionIsGranted(
+  permissions: Pick<Permissions, "query"> | undefined,
+): Promise<boolean> {
+  if (!permissions) return false;
+  try {
+    const status = await permissions.query({ name: "geolocation" });
+    return status.state === "granted";
+  } catch {
+    // Some browsers expose Permissions without supporting geolocation queries.
+    return false;
+  }
+}
+
 function screenOrientationAngle(): number {
   return window.screen.orientation?.angle ?? 0;
 }
@@ -119,11 +131,23 @@ export class UserLocationControl implements IControl {
   private movementHeading?: number;
   private centeredFirstFix = false;
   private orientationListening = false;
+  private orientationRequestPending = false;
   private state: UserLocationState = "inactive";
   private blockedReason?: string;
 
-  getDefaultPosition(): ControlPosition {
-    return "top-right";
+  trigger(): boolean {
+    if (!this.map) return false;
+    this.activate(false);
+    return true;
+  }
+
+  async autoStart(): Promise<boolean> {
+    if (!this.map || this.blockedReason) return false;
+    // Never turn a page load into a permission prompt. A real button press is
+    // still available when the state is "prompt" or cannot be queried.
+    const permissions = "permissions" in navigator ? navigator.permissions : undefined;
+    if (!await locationPermissionIsGranted(permissions)) return false;
+    return this.trigger();
   }
 
   onAdd(map: MapLibreMap): HTMLElement {
@@ -181,26 +205,31 @@ export class UserLocationControl implements IControl {
   }
 
   private handleClick = (): void => {
+    this.activate(true);
+  };
+
+  private activate(canPromptForOrientation: boolean): void {
     if (this.blockedReason) {
       this.showStatus(this.blockedReason);
       return;
     }
     if (this.watchId === undefined) {
-      this.startTracking();
+      this.startTracking(canPromptForOrientation);
       return;
     }
+    if (canPromptForOrientation) this.requestOrientationAccess(true);
     if (this.lastPosition) {
       this.centerOn(this.lastPosition);
     } else {
       this.showStatus("Waiting for your location…");
     }
-  };
+  }
 
-  private startTracking(): void {
+  private startTracking(canPromptForOrientation: boolean): void {
     if (!this.lastPosition) this.centeredFirstFix = false;
     this.state = "requesting";
     this.syncPresentation();
-    this.requestOrientationAccess();
+    this.requestOrientationAccess(canPromptForOrientation);
     try {
       this.watchId = navigator.geolocation.watchPosition(
         this.handlePosition,
@@ -215,15 +244,14 @@ export class UserLocationControl implements IControl {
   }
 
   private handlePosition = (position: GeolocationPosition): void => {
+    if (!this.map || this.watchId === undefined) return;
     this.lastPosition = position;
     this.movementHeading = validHeading(position.coords.heading);
     this.state = "active";
     this.ensureMarkers();
     const coordinates: [number, number] = [position.coords.longitude, position.coords.latitude];
-    if (this.map) {
-      this.accuracyMarker?.setLngLat(coordinates).addTo(this.map);
-      this.marker?.setLngLat(coordinates).addTo(this.map);
-    }
+    this.accuracyMarker?.setLngLat(coordinates).addTo(this.map);
+    this.marker?.setLngLat(coordinates).addTo(this.map);
     this.markerElement?.classList.remove("is-stale");
     this.accuracyElement?.classList.remove("is-stale");
     this.updateMarkerHeading();
@@ -236,6 +264,7 @@ export class UserLocationControl implements IControl {
   };
 
   private handleError = (error: GeolocationPositionError): void => {
+    if (!this.map || this.watchId === undefined) return;
     if (error.code === error.PERMISSION_DENIED) {
       this.state = "denied";
       this.stopWatch();
@@ -255,6 +284,7 @@ export class UserLocationControl implements IControl {
         ? "Location timed out. Press the button to try again."
         : "Your location is currently unavailable.");
       this.stopWatch();
+      this.stopOrientation();
     }
     this.syncPresentation();
   };
@@ -288,7 +318,7 @@ export class UserLocationControl implements IControl {
   private updateAccuracyCircle = (): void => {
     if (!this.map || !this.lastPosition || !this.accuracyElement || !this.accuracyMarker) return;
     const location = this.accuracyMarker.getLngLat();
-    if (!location || !Number.isFinite(this.lastPosition.coords.accuracy)) return;
+    if (!Number.isFinite(this.lastPosition.coords.accuracy)) return;
     const screenPosition = this.map.project(location);
     const comparisonLocation = this.map.unproject([screenPosition.x + 100, screenPosition.y]);
     const pixelsToMeters = location.distanceTo(comparisonLocation) / 100;
@@ -298,15 +328,26 @@ export class UserLocationControl implements IControl {
     this.accuracyElement.style.height = `${diameter.toFixed(2)}px`;
   };
 
-  private requestOrientationAccess(): void {
+  private requestOrientationAccess(canPrompt: boolean): void {
+    if (this.orientationListening || this.orientationRequestPending) return;
     const constructor = window.DeviceOrientationEvent as PermissionCapableOrientationConstructor | undefined;
     if (!constructor) return;
     if (typeof constructor.requestPermission === "function") {
-      void constructor.requestPermission()
+      if (!canPrompt) return;
+      this.orientationRequestPending = true;
+      let permissionRequest: Promise<PermissionResult>;
+      try {
+        permissionRequest = constructor.requestPermission();
+      } catch {
+        this.orientationRequestPending = false;
+        return;
+      }
+      void permissionRequest
         .then((result) => {
-          if (result === "granted" && this.map) this.startOrientation();
+          if (result === "granted" && this.map && this.watchId !== undefined) this.startOrientation();
         })
-        .catch(() => { /* Movement heading remains available as the fallback. */ });
+        .catch(() => { /* Movement heading remains available as the fallback. */ })
+        .finally(() => { this.orientationRequestPending = false; });
       return;
     }
     this.startOrientation();

@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  locationPermissionIsGranted,
   locationStatePresentation,
   normalizeHeading,
   orientationHeading,
   preferredHeading,
   validHeading,
 } from "./userLocation";
+
+function permissionsWithState(state: PermissionState): Pick<Permissions, "query"> {
+  return {
+    query: async () => ({ state }) as PermissionStatus,
+  } as Pick<Permissions, "query">;
+}
 
 describe("user location heading", () => {
   it("normalizes headings to a clockwise 0-360 range", () => {
@@ -52,5 +59,21 @@ describe("user location presentation", () => {
     expect(locationStatePresentation("active")).toEqual({ label: "Center map on your location", pressed: true });
     expect(locationStatePresentation("stale").label).toContain("last known");
     expect(locationStatePresentation("denied").pressed).toBe(false);
+  });
+});
+
+describe("automatic user location", () => {
+  it("starts only when location permission is already granted", async () => {
+    await expect(locationPermissionIsGranted(permissionsWithState("granted"))).resolves.toBe(true);
+    await expect(locationPermissionIsGranted(permissionsWithState("prompt"))).resolves.toBe(false);
+    await expect(locationPermissionIsGranted(permissionsWithState("denied"))).resolves.toBe(false);
+  });
+
+  it("does not auto-start when the permission state cannot be queried", async () => {
+    const unsupported = {
+      query: async () => { throw new Error("unsupported"); },
+    } as unknown as Pick<Permissions, "query">;
+    await expect(locationPermissionIsGranted(undefined)).resolves.toBe(false);
+    await expect(locationPermissionIsGranted(unsupported)).resolves.toBe(false);
   });
 });
