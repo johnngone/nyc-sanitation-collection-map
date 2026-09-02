@@ -59,11 +59,17 @@ describe("user location presentation", () => {
 });
 
 describe("user location startup", () => {
-  it("auto-starts only for an existing grant", () => {
+  it("auto-starts for an existing grant without prompting a first-time visitor", () => {
     expect(permissionAllowsAutoStart("granted")).toBe(true);
     expect(permissionAllowsAutoStart("prompt")).toBe(false);
     expect(permissionAllowsAutoStart("denied")).toBe(false);
     expect(permissionAllowsAutoStart(undefined)).toBe(false);
+  });
+
+  it("uses a remembered opt-in when Firefox does not expose its temporary grant", () => {
+    expect(permissionAllowsAutoStart("prompt", true)).toBe(true);
+    expect(permissionAllowsAutoStart(undefined, true)).toBe(true);
+    expect(permissionAllowsAutoStart("denied", true)).toBe(false);
   });
 
   it("treats the configured collection bounds as inclusive", () => {

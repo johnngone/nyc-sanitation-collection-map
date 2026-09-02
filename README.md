@@ -71,9 +71,9 @@ docker run -d \
 
 Live location tracking requires HTTPS. `http://localhost` also works for local use. Put a public or LAN deployment behind an HTTPS reverse proxy and allow the browser location permission.
 
-The map starts with a citywide NYC overview. If location access was already granted, it automatically starts tracking and moves to the user's neighborhood; otherwise, it waits for the location button so first-time visitors do not receive an unsolicited permission prompt. Locations outside the collection-data bounds leave the automatic startup view on the NYC overview.
+The map starts with a citywide NYC overview centered on U Thant Island. If location access was already granted, or the user previously completed a manual locate in that browser, it automatically starts tracking and moves to the user's neighborhood. Otherwise, it waits for the location button so first-time visitors do not receive an unsolicited permission prompt. Locations outside the collection-data bounds leave the automatic startup view on the NYC overview.
 
-The browser keeps location coordinates in memory. The app does not send them to its API or store them in the data volume.
+The browser keeps location coordinates in memory and stores only the auto-location preference locally. The app does not send coordinates to its API or store them in the data volume. Firefox may ask again after a temporary location permission expires.
 
 ## Deployment settings
 

@@ -21,7 +21,7 @@ const defaultAppConfig = {
   subtitle: "See collection schedules by street and day.",
 };
 const sourceId = "collection-streets";
-const nycFallbackCenter: [number, number] = [-73.98, 40.70];
+const nycFallbackCenter: [number, number] = [-73.964387, 40.746599];
 const nycFallbackZoom = 11;
 const userLocationFirstFixZoom = 13;
 const mobileControlsMediaQuery = "(max-width: 700px), (max-height: 520px) and (pointer: coarse)";

@@ -9,6 +9,7 @@ import { cameraTransitionDuration } from "./mapView";
 
 const COMPASS_FRESHNESS_MS = 5_000;
 const STATUS_DURATION_MS = 5_000;
+const AUTO_LOCATION_PREFERENCE_KEY = "trashmap:auto-location";
 
 export type UserLocationState = "inactive" | "requesting" | "active" | "stale" | "denied" | "unavailable";
 export type LocationBounds = [west: number, south: number, east: number, north: number];
@@ -29,8 +30,35 @@ type CompassOrientationEvent = DeviceOrientationEvent & {
   webkitCompassAccuracy?: number;
 };
 
-export function permissionAllowsAutoStart(state: PermissionState | undefined): boolean {
-  return state === "granted";
+export function permissionAllowsAutoStart(
+  state: PermissionState | undefined,
+  rememberedPreference = false,
+): boolean {
+  return state === "granted" || (state !== "denied" && rememberedPreference);
+}
+
+function readAutoLocationPreference(): boolean {
+  try {
+    return window.localStorage.getItem(AUTO_LOCATION_PREFERENCE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function rememberAutoLocationPreference(): void {
+  try {
+    window.localStorage.setItem(AUTO_LOCATION_PREFERENCE_KEY, "true");
+  } catch {
+    // Location still works when storage is unavailable; it just will not auto-start next time.
+  }
+}
+
+function forgetAutoLocationPreference(): void {
+  try {
+    window.localStorage.removeItem(AUTO_LOCATION_PREFERENCE_KEY);
+  } catch {
+    // A browser denial remains authoritative for this page even when storage is unavailable.
+  }
 }
 
 export function locationIsWithinBounds(
@@ -151,6 +179,7 @@ export class UserLocationControl implements IControl {
   private trackingOrigin?: TrackingOrigin;
   private userInteractedBeforeFirstFix = false;
   private manualActivationAttempted = false;
+  private autoLocationRemembered = false;
   private lifecycleGeneration = 0;
   private orientationListening = false;
   private state: UserLocationState = "inactive";
@@ -172,6 +201,7 @@ export class UserLocationControl implements IControl {
     this.map = map;
     this.manualActivationAttempted = false;
     this.userInteractedBeforeFirstFix = false;
+    this.autoLocationRemembered = readAutoLocationPreference();
     this.container = document.createElement("div");
     this.container.className = "maplibregl-ctrl user-location-control";
     const buttonFrame = document.createElement("div");
@@ -279,6 +309,10 @@ export class UserLocationControl implements IControl {
   }
 
   private handlePosition = (position: GeolocationPosition): void => {
+    if (this.trackingOrigin === "user" && !this.autoLocationRemembered) {
+      this.autoLocationRemembered = true;
+      rememberAutoLocationPreference();
+    }
     this.lastPosition = position;
     this.movementHeading = validHeading(position.coords.heading);
     this.state = "active";
@@ -298,6 +332,8 @@ export class UserLocationControl implements IControl {
 
   private handleError = (error: GeolocationPositionError): void => {
     if (error.code === error.PERMISSION_DENIED) {
+      this.autoLocationRemembered = false;
+      forgetAutoLocationPreference();
       this.state = "denied";
       this.stopWatch();
       this.stopOrientation();
@@ -373,19 +409,26 @@ export class UserLocationControl implements IControl {
   };
 
   private async startAutomaticallyIfGranted(map: MapLibreMap, lifecycleGeneration: number): Promise<void> {
-    if (!this.options.autoStartIfGranted || this.blockedReason || !navigator.permissions) return;
+    if (!this.options.autoStartIfGranted || this.blockedReason) return;
+    let permissionState: PermissionState | undefined;
     try {
-      const permission = await navigator.permissions.query({ name: "geolocation" });
-      if (
-        lifecycleGeneration !== this.lifecycleGeneration
-        || this.map !== map
-        || this.manualActivationAttempted
-        || !permissionAllowsAutoStart(permission.state)
-      ) return;
-      this.startTracking("automatic");
+      permissionState = navigator.permissions
+        ? (await navigator.permissions.query({ name: "geolocation" })).state
+        : undefined;
     } catch {
-      // Unsupported permission queries retain the explicit location-button flow.
+      // Firefox can retain a temporary geolocation grant without exposing it here.
     }
+    if (permissionState === "denied") {
+      this.autoLocationRemembered = false;
+      forgetAutoLocationPreference();
+    }
+    if (
+      lifecycleGeneration !== this.lifecycleGeneration
+      || this.map !== map
+      || this.manualActivationAttempted
+      || !permissionAllowsAutoStart(permissionState, this.autoLocationRemembered)
+    ) return;
+    this.startTracking("automatic");
   }
 
   private updateAccuracyCircle = (): void => {
