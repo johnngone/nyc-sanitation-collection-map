@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   locationStatePresentation,
+  locationIsWithinBounds,
   normalizeHeading,
   orientationHeading,
+  permissionAllowsAutoStart,
   preferredHeading,
+  shouldCenterFirstFix,
   validHeading,
 } from "./userLocation";
 
@@ -52,5 +55,28 @@ describe("user location presentation", () => {
     expect(locationStatePresentation("active")).toEqual({ label: "Center map on your location", pressed: true });
     expect(locationStatePresentation("stale").label).toContain("last known");
     expect(locationStatePresentation("denied").pressed).toBe(false);
+  });
+});
+
+describe("user location startup", () => {
+  it("auto-starts only for an existing grant", () => {
+    expect(permissionAllowsAutoStart("granted")).toBe(true);
+    expect(permissionAllowsAutoStart("prompt")).toBe(false);
+    expect(permissionAllowsAutoStart("denied")).toBe(false);
+    expect(permissionAllowsAutoStart(undefined)).toBe(false);
+  });
+
+  it("treats the configured collection bounds as inclusive", () => {
+    const bounds: [-74.3, 40.4, -73.6, 40.95] = [-74.3, 40.4, -73.6, 40.95];
+    expect(locationIsWithinBounds(-73.98, 40.7, bounds)).toBe(true);
+    expect(locationIsWithinBounds(-74.3, 40.4, bounds)).toBe(true);
+    expect(locationIsWithinBounds(-74.31, 40.7, bounds)).toBe(false);
+  });
+
+  it("does not let an automatic first fix override user navigation", () => {
+    expect(shouldCenterFirstFix("automatic", false, true)).toBe(true);
+    expect(shouldCenterFirstFix("automatic", true, true)).toBe(false);
+    expect(shouldCenterFirstFix("automatic", false, false)).toBe(false);
+    expect(shouldCenterFirstFix("user", true, false)).toBe(true);
   });
 });

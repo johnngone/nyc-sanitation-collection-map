@@ -21,6 +21,9 @@ const defaultAppConfig = {
   subtitle: "See collection schedules by street and day.",
 };
 const sourceId = "collection-streets";
+const nycFallbackCenter: [number, number] = [-73.98, 40.70];
+const nycFallbackZoom = 11;
+const userLocationFirstFixZoom = 13;
 const mobileControlsMediaQuery = "(max-width: 700px), (max-height: 520px) and (pointer: coarse)";
 const collectionTypes = [
   ["REFUSE", "Refuse", "#111111", "refuse_days", 0],
@@ -230,8 +233,8 @@ export function App() {
     let tilesInitialized = false;
     const map = new maplibregl.Map({
       container: mapNode.current,
-      center: [-73.95, 40.72],
-      zoom: 13,
+      center: nycFallbackCenter,
+      zoom: nycFallbackZoom,
       bearing: 0,
       pitch: 0,
       ...MAP_INTERACTION_OPTIONS,
@@ -240,7 +243,10 @@ export function App() {
     });
     mapRef.current = map;
     const viewControl = new MapViewControl();
-    const userLocationControl = new UserLocationControl();
+    const userLocationControl = new UserLocationControl({
+      autoStartIfGranted: true,
+      firstFixZoom: userLocationFirstFixZoom,
+    });
     map.addControl(new maplibregl.AttributionControl({ compact: false }), "bottom-right");
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(userLocationControl, "top-right");
@@ -285,6 +291,7 @@ export function App() {
           }
 
           tilesInitialized = true;
+          userLocationControl.setAutoCenterBounds(config.bounds);
           const hasUnknownLayer = Boolean(config.unknown_source_layer)
             && typeof config.unknown_minzoom === "number";
           setUnknownLayerAvailable(hasUnknownLayer);

@@ -11,6 +11,14 @@ const COMPASS_FRESHNESS_MS = 5_000;
 const STATUS_DURATION_MS = 5_000;
 
 export type UserLocationState = "inactive" | "requesting" | "active" | "stale" | "denied" | "unavailable";
+export type LocationBounds = [west: number, south: number, east: number, north: number];
+
+type TrackingOrigin = "automatic" | "user";
+
+interface UserLocationControlOptions {
+  autoStartIfGranted?: boolean;
+  firstFixZoom?: number;
+}
 
 type PermissionResult = "granted" | "denied";
 type PermissionCapableOrientationConstructor = typeof DeviceOrientationEvent & {
@@ -20,6 +28,26 @@ type CompassOrientationEvent = DeviceOrientationEvent & {
   webkitCompassHeading?: number;
   webkitCompassAccuracy?: number;
 };
+
+export function permissionAllowsAutoStart(state: PermissionState | undefined): boolean {
+  return state === "granted";
+}
+
+export function locationIsWithinBounds(
+  longitude: number,
+  latitude: number,
+  [west, south, east, north]: LocationBounds,
+): boolean {
+  return longitude >= west && longitude <= east && latitude >= south && latitude <= north;
+}
+
+export function shouldCenterFirstFix(
+  origin: TrackingOrigin,
+  userInteracted: boolean,
+  locationIsInBounds: boolean,
+): boolean {
+  return origin === "user" || (!userInteracted && locationIsInBounds);
+}
 
 export function normalizeHeading(heading: number): number {
   return ((heading % 360) + 360) % 360;
@@ -103,6 +131,7 @@ function createLocationControlIcon(): SVGSVGElement {
 }
 
 export class UserLocationControl implements IControl {
+  private readonly options: Required<UserLocationControlOptions>;
   private map?: MapLibreMap;
   private container?: HTMLDivElement;
   private button?: HTMLButtonElement;
@@ -117,17 +146,32 @@ export class UserLocationControl implements IControl {
   private lastPosition?: GeolocationPosition;
   private compassHeading?: number;
   private movementHeading?: number;
-  private centeredFirstFix = false;
+  private autoCenterBounds?: LocationBounds;
+  private firstFixOrigin?: TrackingOrigin;
+  private trackingOrigin?: TrackingOrigin;
+  private userInteractedBeforeFirstFix = false;
+  private manualActivationAttempted = false;
+  private lifecycleGeneration = 0;
   private orientationListening = false;
   private state: UserLocationState = "inactive";
   private blockedReason?: string;
+
+  constructor(options: UserLocationControlOptions = {}) {
+    this.options = {
+      autoStartIfGranted: options.autoStartIfGranted ?? false,
+      firstFixZoom: options.firstFixZoom ?? 13,
+    };
+  }
 
   getDefaultPosition(): ControlPosition {
     return "top-right";
   }
 
   onAdd(map: MapLibreMap): HTMLElement {
+    const lifecycleGeneration = ++this.lifecycleGeneration;
     this.map = map;
+    this.manualActivationAttempted = false;
+    this.userInteractedBeforeFirstFix = false;
     this.container = document.createElement("div");
     this.container.className = "maplibregl-ctrl user-location-control";
     const buttonFrame = document.createElement("div");
@@ -159,10 +203,18 @@ export class UserLocationControl implements IControl {
     map.on("move", this.updateAccuracyCircle);
     map.on("rotate", this.updateAccuracyCircle);
     map.on("pitch", this.updateAccuracyCircle);
+    map.on("movestart", this.handleMapMoveStart);
+    void this.startAutomaticallyIfGranted(map, lifecycleGeneration);
     return this.container;
   }
 
+  setAutoCenterBounds(bounds: LocationBounds): void {
+    this.autoCenterBounds = [...bounds];
+    this.tryCenterFirstFix();
+  }
+
   onRemove(): void {
+    this.lifecycleGeneration += 1;
     this.stopWatch();
     this.stopOrientation();
     if (this.map) {
@@ -170,6 +222,7 @@ export class UserLocationControl implements IControl {
       this.map.off("move", this.updateAccuracyCircle);
       this.map.off("rotate", this.updateAccuracyCircle);
       this.map.off("pitch", this.updateAccuracyCircle);
+      this.map.off("movestart", this.handleMapMoveStart);
     }
     this.button?.removeEventListener("click", this.handleClick);
     this.marker?.remove();
@@ -185,22 +238,33 @@ export class UserLocationControl implements IControl {
       this.showStatus(this.blockedReason);
       return;
     }
+    this.manualActivationAttempted = true;
+    this.trackingOrigin = "user";
+    this.requestOrientationAccess();
     if (this.watchId === undefined) {
-      this.startTracking();
+      this.startTracking("user");
       return;
     }
     if (this.lastPosition) {
       this.centerOn(this.lastPosition);
     } else {
+      this.firstFixOrigin = "user";
       this.showStatus("Waiting for your location…");
     }
   };
 
-  private startTracking(): void {
-    if (!this.lastPosition) this.centeredFirstFix = false;
+  private startTracking(origin: TrackingOrigin): void {
+    if (this.watchId !== undefined) {
+      if (origin === "user" && !this.lastPosition) this.firstFixOrigin = "user";
+      return;
+    }
+    this.trackingOrigin = origin;
+    if (!this.lastPosition) {
+      this.firstFixOrigin = origin;
+    }
     this.state = "requesting";
     this.syncPresentation();
-    this.requestOrientationAccess();
+    if (origin === "automatic") this.startOrientationWithoutPermissionPrompt();
     try {
       this.watchId = navigator.geolocation.watchPosition(
         this.handlePosition,
@@ -210,7 +274,7 @@ export class UserLocationControl implements IControl {
     } catch {
       this.state = "unavailable";
       this.syncPresentation();
-      this.showStatus("Location is unavailable.");
+      if (origin === "user") this.showStatus("Location is unavailable.");
     }
   }
 
@@ -229,10 +293,7 @@ export class UserLocationControl implements IControl {
     this.updateMarkerHeading();
     this.updateAccuracyCircle();
     this.syncPresentation();
-    if (!this.centeredFirstFix) {
-      this.centeredFirstFix = true;
-      this.centerOn(position);
-    }
+    this.tryCenterFirstFix();
   };
 
   private handleError = (error: GeolocationPositionError): void => {
@@ -243,17 +304,23 @@ export class UserLocationControl implements IControl {
       this.lastPosition = undefined;
       this.marker?.remove();
       this.accuracyMarker?.remove();
-      this.showStatus("Location permission was denied. Enable it in your browser settings to try again.");
+      if (this.trackingOrigin === "user") {
+        this.showStatus("Location permission was denied. Enable it in your browser settings to try again.");
+      }
     } else if (this.lastPosition) {
       this.state = "stale";
       this.markerElement?.classList.add("is-stale");
       this.accuracyElement?.classList.add("is-stale");
-      this.showStatus("Using your last known location while a fresh fix is unavailable.");
+      if (this.trackingOrigin === "user") {
+        this.showStatus("Using your last known location while a fresh fix is unavailable.");
+      }
     } else {
       this.state = "unavailable";
-      this.showStatus(error.code === error.TIMEOUT
-        ? "Location timed out. Press the button to try again."
-        : "Your location is currently unavailable.");
+      if (this.trackingOrigin === "user") {
+        this.showStatus(error.code === error.TIMEOUT
+          ? "Location timed out. Press the button to try again."
+          : "Your location is currently unavailable.");
+      }
       this.stopWatch();
     }
     this.syncPresentation();
@@ -277,12 +344,48 @@ export class UserLocationControl implements IControl {
     });
   }
 
-  private centerOn(position: GeolocationPosition): void {
+  private centerOn(position: GeolocationPosition, zoom?: number): void {
     if (!this.map) return;
     this.map.easeTo({
       center: [position.coords.longitude, position.coords.latitude],
+      ...(zoom === undefined ? {} : { zoom }),
       duration: cameraTransitionDuration(window.matchMedia("(prefers-reduced-motion: reduce)").matches),
     });
+  }
+
+  private tryCenterFirstFix(): void {
+    if (!this.lastPosition || !this.firstFixOrigin) return;
+    const origin = this.firstFixOrigin;
+    if (origin === "automatic" && !this.autoCenterBounds) return;
+    const isInBounds = origin === "user" || locationIsWithinBounds(
+      this.lastPosition.coords.longitude,
+      this.lastPosition.coords.latitude,
+      this.autoCenterBounds as LocationBounds,
+    );
+    this.firstFixOrigin = undefined;
+    if (shouldCenterFirstFix(origin, this.userInteractedBeforeFirstFix, isInBounds)) {
+      this.centerOn(this.lastPosition, this.options.firstFixZoom);
+    }
+  }
+
+  private handleMapMoveStart = (event: { originalEvent?: unknown }): void => {
+    if (event.originalEvent) this.userInteractedBeforeFirstFix = true;
+  };
+
+  private async startAutomaticallyIfGranted(map: MapLibreMap, lifecycleGeneration: number): Promise<void> {
+    if (!this.options.autoStartIfGranted || this.blockedReason || !navigator.permissions) return;
+    try {
+      const permission = await navigator.permissions.query({ name: "geolocation" });
+      if (
+        lifecycleGeneration !== this.lifecycleGeneration
+        || this.map !== map
+        || this.manualActivationAttempted
+        || !permissionAllowsAutoStart(permission.state)
+      ) return;
+      this.startTracking("automatic");
+    } catch {
+      // Unsupported permission queries retain the explicit location-button flow.
+    }
   }
 
   private updateAccuracyCircle = (): void => {
@@ -310,6 +413,11 @@ export class UserLocationControl implements IControl {
       return;
     }
     this.startOrientation();
+  }
+
+  private startOrientationWithoutPermissionPrompt(): void {
+    const constructor = window.DeviceOrientationEvent as PermissionCapableOrientationConstructor | undefined;
+    if (constructor && typeof constructor.requestPermission !== "function") this.startOrientation();
   }
 
   private startOrientation(): void {
