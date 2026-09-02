@@ -3,6 +3,7 @@ import maplibregl, { type Map as MapLibreMap } from "maplibre-gl";
 
 import { resolveApiUrl } from "./apiUrl";
 import { createBasemapStyle, DEFAULT_BASEMAP_TILEJSON_URL } from "./basemap";
+import { dayCode, dayFromCode, weekdays, type Weekday } from "./collectionDay";
 import { MAP_INTERACTION_OPTIONS, MapViewControl } from "./mapView";
 import {
   classifySheetGesture,
@@ -13,8 +14,6 @@ import {
 } from "./sheetGesture";
 import { UserLocationControl } from "./userLocation";
 
-const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
-type Weekday = (typeof weekdays)[number];
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "";
 const basemapTileJsonUrl = import.meta.env.VITE_BASEMAP_TILEJSON_URL?.trim() || DEFAULT_BASEMAP_TILEJSON_URL;
 const defaultAppConfig = {
@@ -77,14 +76,6 @@ function readInitialAppConfig(): AppConfig {
 
 const initialAppConfig = readInitialAppConfig();
 
-function dayCode(day: Weekday): string {
-  return day.slice(0, 3).toUpperCase();
-}
-
-function dayFromCode(code: string | null): Weekday {
-  return weekdays.find((day) => dayCode(day) === code) ?? "Monday";
-}
-
 function dayShortLabel(day: Weekday): string {
   return day.slice(0, 2);
 }
@@ -116,13 +107,15 @@ export function App() {
   const sheetGesturePointerIdRef = useRef<number | null>(null);
   const sheetGestureHandledRef = useRef(false);
   const lastExpandedSheetStateRef = useRef<ExpandedSheetState>("core");
-  const selectedDayRef = useRef<Weekday>(dayFromCode(new URLSearchParams(window.location.search).get("day")));
+  const [selectedDay, setSelectedDay] = useState<Weekday>(() => (
+    dayFromCode(new URLSearchParams(window.location.search).get("day"))
+  ));
+  const selectedDayRef = useRef<Weekday>(selectedDay);
   const selectedTypesRef = useRef<CollectionType[]>(["REFUSE"]);
   const showCoverageGapsRef = useRef(true);
   const showInsufficientAddressRef = useRef(true);
   const updateTileStatusRef = useRef<(() => void) | null>(null);
   const tileErrorRef = useRef<string | null>(null);
-  const [selectedDay, setSelectedDay] = useState<Weekday>(selectedDayRef.current);
   const appTitle = initialAppConfig.title;
   const appSubtitle = initialAppConfig.subtitle;
   const [backendConnection, setBackendConnection] = useState<BackendConnection>("checking");
