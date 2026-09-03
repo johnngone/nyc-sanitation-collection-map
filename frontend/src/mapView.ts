@@ -27,6 +27,10 @@ export interface MapViewState {
   showFlatBuildings: boolean;
 }
 
+interface MapViewControlOptions {
+  onResetView?: () => void;
+}
+
 function normalizedBearing(bearing: number): number {
   return ((bearing + 180) % 360 + 360) % 360 - 180;
 }
@@ -85,12 +89,17 @@ function createCompassNeedle(): SVGSVGElement {
 }
 
 export class MapViewControl implements IControl {
+  private readonly options: MapViewControlOptions;
   private map?: MapLibreMap;
   private container?: HTMLDivElement;
   private compassButton?: HTMLButtonElement;
   private compassIcon?: HTMLSpanElement;
   private extrusionLatched = false;
   private resettingView = false;
+
+  constructor(options: MapViewControlOptions = {}) {
+    this.options = options;
+  }
 
   getDefaultPosition(): ControlPosition {
     return "top-right";
@@ -151,6 +160,7 @@ export class MapViewControl implements IControl {
 
   private resetView = (): void => {
     if (!this.map) return;
+    this.options.onResetView?.();
     const camera = { bearing: this.map.getBearing(), pitch: this.map.getPitch() };
     this.resettingView = true;
     this.extrusionLatched = false;

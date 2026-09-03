@@ -9,9 +9,15 @@ import { cameraTransitionDuration } from "./mapView";
 
 const COMPASS_FRESHNESS_MS = 5_000;
 const STATUS_DURATION_MS = 5_000;
+const HEADING_AVAILABILITY_DELAY_MS = 2_000;
+const FOLLOW_CAMERA_DURATION_MS = 250;
+const FOLLOW_BEARING_DEADBAND_DEGREES = 3;
+const FOLLOW_CAMERA_EASE_ID = "user-location-follow";
 const AUTO_LOCATION_PREFERENCE_KEY = "trashmap:auto-location";
 
 export type UserLocationState = "inactive" | "requesting" | "active" | "stale" | "denied" | "unavailable";
+export type CameraFollowState = "free" | "following";
+export type CameraFollowEvent = "activate" | "pause";
 export type LocationBounds = [west: number, south: number, east: number, north: number];
 
 type TrackingOrigin = "automatic" | "user";
@@ -23,7 +29,7 @@ interface UserLocationControlOptions {
 
 type PermissionResult = "granted" | "denied";
 type PermissionCapableOrientationConstructor = typeof DeviceOrientationEvent & {
-  requestPermission?: () => Promise<PermissionResult>;
+  requestPermission?: (absolute?: boolean) => Promise<PermissionResult>;
 };
 type CompassOrientationEvent = DeviceOrientationEvent & {
   webkitCompassHeading?: number;
@@ -108,17 +114,55 @@ export function preferredHeading(
   return validHeading(compassHeading) ?? validHeading(movementHeading);
 }
 
-export function locationStatePresentation(state: UserLocationState): {
+export function shortestCameraBearing(currentBearing: number, heading: number): number {
+  const delta = ((normalizeHeading(heading) - normalizeHeading(currentBearing) + 540) % 360) - 180;
+  return currentBearing + delta;
+}
+
+export function headingExceedsDeadband(
+  previousHeading: number | undefined,
+  nextHeading: number,
+  deadbandDegrees = FOLLOW_BEARING_DEADBAND_DEGREES,
+): boolean {
+  if (previousHeading === undefined) return true;
+  return Math.abs(shortestCameraBearing(previousHeading, nextHeading) - previousHeading) >= deadbandDegrees;
+}
+
+export function followCameraTransitionDuration(prefersReducedMotion: boolean): number {
+  return prefersReducedMotion ? 0 : FOLLOW_CAMERA_DURATION_MS;
+}
+
+export function nextCameraFollowState(
+  _currentState: CameraFollowState,
+  event: CameraFollowEvent,
+): CameraFollowState {
+  return event === "activate" ? "following" : "free";
+}
+
+export function locationStatePresentation(
+  state: UserLocationState,
+  cameraFollowState: CameraFollowState = "free",
+): {
   label: string;
   pressed: boolean;
 } {
+  const following = cameraFollowState === "following";
   switch (state) {
-    case "requesting": return { label: "Waiting for your location", pressed: true };
-    case "active": return { label: "Center map on your location", pressed: true };
-    case "stale": return { label: "Center map on your last known location", pressed: true };
+    case "requesting": return {
+      label: following ? "Waiting for your location to begin following" : "Waiting for your location",
+      pressed: following,
+    };
+    case "active": return {
+      label: following ? "Following your location and heading" : "Center and follow your location and heading",
+      pressed: following,
+    };
+    case "stale": return {
+      label: following ? "Following your last known location and heading" : "Center and follow your last known location",
+      pressed: following,
+    };
     case "denied": return { label: "Location permission was denied", pressed: false };
     case "unavailable": return { label: "Location is unavailable", pressed: false };
-    default: return { label: "Show your location", pressed: false };
+    default: return { label: "Show and follow your location", pressed: false };
   }
 }
 
@@ -171,9 +215,15 @@ export class UserLocationControl implements IControl {
   private watchId?: number;
   private statusTimer?: number;
   private compassTimer?: number;
+  private headingAvailabilityTimer?: number;
+  private followCameraFrame?: number;
   private lastPosition?: GeolocationPosition;
   private compassHeading?: number;
   private movementHeading?: number;
+  private lastRequestedHeading?: number;
+  private lastRequestedCoordinates?: [number, number];
+  private pendingFollowZoom?: number;
+  private forceFollowBearing = false;
   private autoCenterBounds?: LocationBounds;
   private firstFixOrigin?: TrackingOrigin;
   private trackingOrigin?: TrackingOrigin;
@@ -182,6 +232,7 @@ export class UserLocationControl implements IControl {
   private autoLocationRemembered = false;
   private lifecycleGeneration = 0;
   private orientationListening = false;
+  private cameraFollowState: CameraFollowState = "free";
   private state: UserLocationState = "inactive";
   private blockedReason?: string;
 
@@ -202,6 +253,9 @@ export class UserLocationControl implements IControl {
     this.manualActivationAttempted = false;
     this.userInteractedBeforeFirstFix = false;
     this.autoLocationRemembered = readAutoLocationPreference();
+    this.cameraFollowState = "free";
+    this.lastRequestedHeading = undefined;
+    this.lastRequestedCoordinates = undefined;
     this.container = document.createElement("div");
     this.container.className = "maplibregl-ctrl user-location-control";
     const buttonFrame = document.createElement("div");
@@ -243,10 +297,16 @@ export class UserLocationControl implements IControl {
     this.tryCenterFirstFix();
   }
 
+  pauseCameraFollow(): void {
+    this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), true);
+  }
+
   onRemove(): void {
     this.lifecycleGeneration += 1;
     this.stopWatch();
     this.stopOrientation();
+    this.cancelFollowCameraUpdate();
+    this.clearHeadingAvailabilityTimer();
     if (this.map) {
       this.map.off("zoom", this.updateAccuracyCircle);
       this.map.off("move", this.updateAccuracyCircle);
@@ -270,13 +330,15 @@ export class UserLocationControl implements IControl {
     }
     this.manualActivationAttempted = true;
     this.trackingOrigin = "user";
+    this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "activate"), false);
+    this.scheduleHeadingAvailabilityNotice();
     this.requestOrientationAccess();
     if (this.watchId === undefined) {
       this.startTracking("user");
       return;
     }
     if (this.lastPosition) {
-      this.centerOn(this.lastPosition);
+      this.scheduleFollowCameraUpdate();
     } else {
       this.firstFixOrigin = "user";
       this.showStatus("Waiting for your location…");
@@ -303,6 +365,7 @@ export class UserLocationControl implements IControl {
       );
     } catch {
       this.state = "unavailable";
+      this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
       this.syncPresentation();
       if (origin === "user") this.showStatus("Location is unavailable.");
     }
@@ -315,6 +378,7 @@ export class UserLocationControl implements IControl {
     }
     this.lastPosition = position;
     this.movementHeading = validHeading(position.coords.heading);
+    if (this.movementHeading !== undefined) this.clearHeadingAvailabilityTimer();
     this.state = "active";
     this.ensureMarkers();
     const coordinates: [number, number] = [position.coords.longitude, position.coords.latitude];
@@ -327,7 +391,10 @@ export class UserLocationControl implements IControl {
     this.updateMarkerHeading();
     this.updateAccuracyCircle();
     this.syncPresentation();
-    this.tryCenterFirstFix();
+    const centeredFirstFix = this.tryCenterFirstFix();
+    if (this.cameraFollowState === "following" && !centeredFirstFix) {
+      this.scheduleFollowCameraUpdate();
+    }
   };
 
   private handleError = (error: GeolocationPositionError): void => {
@@ -335,6 +402,7 @@ export class UserLocationControl implements IControl {
       this.autoLocationRemembered = false;
       forgetAutoLocationPreference();
       this.state = "denied";
+      this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
       this.stopWatch();
       this.stopOrientation();
       this.lastPosition = undefined;
@@ -352,6 +420,7 @@ export class UserLocationControl implements IControl {
       }
     } else {
       this.state = "unavailable";
+      this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
       if (this.trackingOrigin === "user") {
         this.showStatus(error.code === error.TIMEOUT
           ? "Location timed out. Press the button to try again."
@@ -389,10 +458,10 @@ export class UserLocationControl implements IControl {
     });
   }
 
-  private tryCenterFirstFix(): void {
-    if (!this.lastPosition || !this.firstFixOrigin) return;
+  private tryCenterFirstFix(): boolean {
+    if (!this.lastPosition || !this.firstFixOrigin) return false;
     const origin = this.firstFixOrigin;
-    if (origin === "automatic" && !this.autoCenterBounds) return;
+    if (origin === "automatic" && !this.autoCenterBounds) return false;
     const isInBounds = origin === "user" || locationIsWithinBounds(
       this.lastPosition.coords.longitude,
       this.lastPosition.coords.latitude,
@@ -400,12 +469,20 @@ export class UserLocationControl implements IControl {
     );
     this.firstFixOrigin = undefined;
     if (shouldCenterFirstFix(origin, this.userInteractedBeforeFirstFix, isInBounds)) {
-      this.centerOn(this.lastPosition, this.options.firstFixZoom);
+      if (origin === "user" && this.cameraFollowState === "following") {
+        this.scheduleFollowCameraUpdate(this.options.firstFixZoom);
+      } else {
+        this.centerOn(this.lastPosition, this.options.firstFixZoom);
+      }
+      return true;
     }
+    return false;
   }
 
   private handleMapMoveStart = (event: { originalEvent?: unknown }): void => {
-    if (event.originalEvent) this.userInteractedBeforeFirstFix = true;
+    if (!event.originalEvent) return;
+    this.userInteractedBeforeFirstFix = true;
+    this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
   };
 
   private async startAutomaticallyIfGranted(map: MapLibreMap, lifecycleGeneration: number): Promise<void> {
@@ -446,13 +523,17 @@ export class UserLocationControl implements IControl {
 
   private requestOrientationAccess(): void {
     const constructor = window.DeviceOrientationEvent as PermissionCapableOrientationConstructor | undefined;
-    if (!constructor) return;
+    if (!constructor) {
+      this.showHeadingUnavailableStatus();
+      return;
+    }
     if (typeof constructor.requestPermission === "function") {
-      void constructor.requestPermission()
+      void constructor.requestPermission(true)
         .then((result) => {
           if (result === "granted" && this.map) this.startOrientation();
+          else this.showHeadingUnavailableStatus();
         })
-        .catch(() => { /* Movement heading remains available as the fallback. */ });
+        .catch(() => this.showHeadingUnavailableStatus());
       return;
     }
     this.startOrientation();
@@ -481,12 +562,18 @@ export class UserLocationControl implements IControl {
     const heading = orientationHeading(event as CompassOrientationEvent, screenOrientationAngle());
     if (heading === undefined) return;
     this.compassHeading = heading;
+    this.clearHeadingAvailabilityTimer();
     if (this.compassTimer !== undefined) window.clearTimeout(this.compassTimer);
     this.compassTimer = window.setTimeout(() => {
       this.compassHeading = undefined;
       this.updateMarkerHeading();
+      if (preferredHeading(this.compassHeading, this.movementHeading) === undefined) {
+        this.showHeadingUnavailableStatus();
+      }
+      this.scheduleFollowCameraUpdate();
     }, COMPASS_FRESHNESS_MS);
     this.updateMarkerHeading();
+    this.scheduleFollowCameraUpdate();
   };
 
   private updateMarkerHeading(): void {
@@ -494,6 +581,108 @@ export class UserLocationControl implements IControl {
     const heading = preferredHeading(this.compassHeading, this.movementHeading);
     this.markerElement.classList.toggle("has-heading", heading !== undefined);
     this.marker.setRotation(heading ?? 0);
+  }
+
+  private setCameraFollowState(state: CameraFollowState, stopCamera: boolean): void {
+    if (this.cameraFollowState === state) {
+      if (state === "following") {
+        this.lastRequestedCoordinates = undefined;
+        this.forceFollowBearing = true;
+        this.scheduleFollowCameraUpdate();
+      }
+      return;
+    }
+    this.cameraFollowState = state;
+    if (state === "free") {
+      this.cancelFollowCameraUpdate();
+      this.clearHeadingAvailabilityTimer();
+      if (stopCamera) this.map?.stop();
+    } else {
+      this.lastRequestedCoordinates = undefined;
+      this.forceFollowBearing = true;
+    }
+    this.syncPresentation();
+  }
+
+  private scheduleFollowCameraUpdate(zoom?: number): void {
+    if (this.cameraFollowState !== "following" || !this.map || !this.lastPosition) return;
+    if (zoom !== undefined) this.pendingFollowZoom = zoom;
+    if (this.followCameraFrame !== undefined) return;
+    this.followCameraFrame = window.requestAnimationFrame(this.applyFollowCameraUpdate);
+  }
+
+  private applyFollowCameraUpdate = (): void => {
+    this.followCameraFrame = undefined;
+    if (this.cameraFollowState !== "following" || !this.map || !this.lastPosition) return;
+
+    const coordinates: [number, number] = [
+      this.lastPosition.coords.longitude,
+      this.lastPosition.coords.latitude,
+    ];
+    const positionChanged = !this.lastRequestedCoordinates
+      || coordinates[0] !== this.lastRequestedCoordinates[0]
+      || coordinates[1] !== this.lastRequestedCoordinates[1];
+    const heading = preferredHeading(this.compassHeading, this.movementHeading);
+    const forceBearing = this.forceFollowBearing;
+    this.forceFollowBearing = false;
+    const headingChanged = heading !== undefined && (
+      forceBearing || headingExceedsDeadband(this.lastRequestedHeading, heading)
+    );
+    const zoom = this.pendingFollowZoom;
+    this.pendingFollowZoom = undefined;
+
+    let bearing: number | undefined;
+    if (headingChanged && heading !== undefined) {
+      bearing = shortestCameraBearing(this.map.getBearing(), heading);
+      this.lastRequestedHeading = heading;
+    } else if (forceBearing || (heading === undefined && this.lastRequestedHeading === undefined)) {
+      bearing = shortestCameraBearing(this.map.getBearing(), this.lastRequestedHeading ?? 0);
+    }
+
+    if (!positionChanged && !headingChanged && bearing === undefined && zoom === undefined) return;
+    this.lastRequestedCoordinates = coordinates;
+    this.map.easeTo({
+      center: coordinates,
+      ...(bearing === undefined ? {} : { bearing }),
+      ...(zoom === undefined ? {} : { zoom }),
+      duration: followCameraTransitionDuration(
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+      ),
+      easeId: FOLLOW_CAMERA_EASE_ID,
+    });
+  };
+
+  private cancelFollowCameraUpdate(): void {
+    if (this.followCameraFrame !== undefined) {
+      window.cancelAnimationFrame(this.followCameraFrame);
+      this.followCameraFrame = undefined;
+    }
+    this.pendingFollowZoom = undefined;
+    this.forceFollowBearing = false;
+  }
+
+  private scheduleHeadingAvailabilityNotice(): void {
+    this.clearHeadingAvailabilityTimer();
+    this.headingAvailabilityTimer = window.setTimeout(() => {
+      this.headingAvailabilityTimer = undefined;
+      if (preferredHeading(this.compassHeading, this.movementHeading) === undefined) {
+        this.showHeadingUnavailableStatus();
+      }
+    }, HEADING_AVAILABILITY_DELAY_MS);
+  }
+
+  private clearHeadingAvailabilityTimer(): void {
+    if (this.headingAvailabilityTimer === undefined) return;
+    window.clearTimeout(this.headingAvailabilityTimer);
+    this.headingAvailabilityTimer = undefined;
+  }
+
+  private showHeadingUnavailableStatus(): void {
+    if (this.cameraFollowState !== "following") return;
+    this.clearHeadingAvailabilityTimer();
+    this.showStatus(this.lastRequestedHeading !== undefined
+      ? "Heading signal was lost. Holding the last direction while location follow continues."
+      : "Compass heading is unavailable. Following location north-up and using travel direction when available.");
   }
 
   private stopWatch(): void {
@@ -504,12 +693,13 @@ export class UserLocationControl implements IControl {
 
   private syncPresentation(): void {
     if (!this.button || !this.container) return;
-    const presentation = locationStatePresentation(this.state);
+    const presentation = locationStatePresentation(this.state, this.cameraFollowState);
     const label = this.blockedReason ?? presentation.label;
     this.button.title = label;
     this.button.setAttribute("aria-label", label);
     this.button.setAttribute("aria-pressed", String(presentation.pressed));
     this.container.dataset.state = this.state;
+    this.container.dataset.cameraFollow = this.cameraFollowState;
   }
 
   private showStatus(message: string): void {

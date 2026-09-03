@@ -43,6 +43,18 @@ jobs:
       - name: Run full Python test suite
         run: python -m pytest
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Run frontend test suite
+        run: npm test
+        working-directory: frontend
+
       - name: Build app image for verification
         uses: docker/build-push-action@v7
         with:

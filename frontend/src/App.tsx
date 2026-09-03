@@ -242,10 +242,12 @@ export function App() {
       style: createBasemapStyle(basemapTileJsonUrl),
     });
     mapRef.current = map;
-    const viewControl = new MapViewControl();
     const userLocationControl = new UserLocationControl({
       autoStartIfGranted: true,
       firstFixZoom: userLocationFirstFixZoom,
+    });
+    const viewControl = new MapViewControl({
+      onResetView: () => userLocationControl.pauseCameraFollow(),
     });
     map.addControl(new maplibregl.AttributionControl({ compact: false }), "bottom-right");
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");

@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  followCameraTransitionDuration,
+  headingExceedsDeadband,
   locationStatePresentation,
   locationIsWithinBounds,
+  nextCameraFollowState,
   normalizeHeading,
   orientationHeading,
   permissionAllowsAutoStart,
   preferredHeading,
   shouldCenterFirstFix,
+  shortestCameraBearing,
   validHeading,
 } from "./userLocation";
 
@@ -46,15 +50,46 @@ describe("user location heading", () => {
     expect(preferredHeading(undefined, 80)).toBe(80);
     expect(preferredHeading(undefined, null)).toBeUndefined();
   });
+
+  it("takes the shortest camera path across north", () => {
+    expect(shortestCameraBearing(350, 10)).toBe(370);
+    expect(shortestCameraBearing(10, 350)).toBe(-10);
+    expect(shortestCameraBearing(-179, 179)).toBe(-181);
+  });
+
+  it("coalesces heading jitter inside a three-degree deadband", () => {
+    expect(headingExceedsDeadband(undefined, 20)).toBe(true);
+    expect(headingExceedsDeadband(359, 1)).toBe(false);
+    expect(headingExceedsDeadband(358, 2)).toBe(true);
+  });
+
+  it("uses shorter follow transitions while honoring reduced motion", () => {
+    expect(followCameraTransitionDuration(false)).toBe(250);
+    expect(followCameraTransitionDuration(true)).toBe(0);
+  });
 });
 
 describe("user location presentation", () => {
   it("exposes accessible labels and tracking state", () => {
-    expect(locationStatePresentation("inactive")).toEqual({ label: "Show your location", pressed: false });
-    expect(locationStatePresentation("requesting").pressed).toBe(true);
-    expect(locationStatePresentation("active")).toEqual({ label: "Center map on your location", pressed: true });
+    expect(locationStatePresentation("inactive")).toEqual({ label: "Show and follow your location", pressed: false });
+    expect(locationStatePresentation("requesting").pressed).toBe(false);
+    expect(locationStatePresentation("active")).toEqual({
+      label: "Center and follow your location and heading",
+      pressed: false,
+    });
+    expect(locationStatePresentation("active", "following")).toEqual({
+      label: "Following your location and heading",
+      pressed: true,
+    });
     expect(locationStatePresentation("stale").label).toContain("last known");
     expect(locationStatePresentation("denied").pressed).toBe(false);
+  });
+
+  it("enters follow on activation and pauses after user navigation or reset", () => {
+    expect(nextCameraFollowState("free", "activate")).toBe("following");
+    expect(nextCameraFollowState("following", "activate")).toBe("following");
+    expect(nextCameraFollowState("following", "pause")).toBe("free");
+    expect(nextCameraFollowState("free", "pause")).toBe("free");
   });
 });
 
