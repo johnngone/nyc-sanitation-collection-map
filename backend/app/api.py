@@ -213,7 +213,6 @@ def vector_tile(version: str, z: int, x: int, y: int, request: Request) -> Respo
 def health() -> dict[str, object]:
     from .config import APP_ENV
 
-    metadata: dict[str, object] = {}
     try:
         release = read_current_release(DATA_MANIFEST_PATH)
     except ReleaseManifestError:
