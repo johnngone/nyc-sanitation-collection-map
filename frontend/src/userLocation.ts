@@ -1,0 +1,714 @@
+import maplibregl, {
+  type ControlPosition,
+  type IControl,
+  type Map as MapLibreMap,
+  type Marker,
+} from "maplibre-gl";
+
+import { cameraTransitionDuration } from "./mapView";
+
+const COMPASS_FRESHNESS_MS = 5_000;
+const STATUS_DURATION_MS = 5_000;
+const HEADING_AVAILABILITY_DELAY_MS = 2_000;
+const FOLLOW_CAMERA_DURATION_MS = 250;
+const FOLLOW_BEARING_DEADBAND_DEGREES = 3;
+const FOLLOW_CAMERA_EASE_ID = "user-location-follow";
+const AUTO_LOCATION_PREFERENCE_KEY = "nyc-trash-map:auto-location";
+
+export type UserLocationState = "inactive" | "requesting" | "active" | "stale" | "denied" | "unavailable";
+export type CameraFollowState = "free" | "following";
+export type CameraFollowEvent = "activate" | "pause";
+export type LocationBounds = [west: number, south: number, east: number, north: number];
+
+type TrackingOrigin = "automatic" | "user";
+
+interface UserLocationControlOptions {
+  autoStartIfGranted?: boolean;
+  firstFixZoom?: number;
+}
+
+type PermissionResult = "granted" | "denied";
+type PermissionCapableOrientationConstructor = typeof DeviceOrientationEvent & {
+  requestPermission?: (absolute?: boolean) => Promise<PermissionResult>;
+};
+type CompassOrientationEvent = DeviceOrientationEvent & {
+  webkitCompassHeading?: number;
+  webkitCompassAccuracy?: number;
+};
+
+export function permissionAllowsAutoStart(
+  state: PermissionState | undefined,
+  rememberedPreference = false,
+): boolean {
+  return state === "granted" || (state !== "denied" && rememberedPreference);
+}
+
+function readAutoLocationPreference(): boolean {
+  try {
+    return window.localStorage.getItem(AUTO_LOCATION_PREFERENCE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function rememberAutoLocationPreference(): void {
+  try {
+    window.localStorage.setItem(AUTO_LOCATION_PREFERENCE_KEY, "true");
+  } catch {
+    // Location still works when storage is unavailable; it just will not auto-start next time.
+  }
+}
+
+function forgetAutoLocationPreference(): void {
+  try {
+    window.localStorage.removeItem(AUTO_LOCATION_PREFERENCE_KEY);
+  } catch {
+    // A browser denial remains authoritative for this page even when storage is unavailable.
+  }
+}
+
+export function locationIsWithinBounds(
+  longitude: number,
+  latitude: number,
+  [west, south, east, north]: LocationBounds,
+): boolean {
+  return longitude >= west && longitude <= east && latitude >= south && latitude <= north;
+}
+
+export function shouldCenterFirstFix(
+  origin: TrackingOrigin,
+  userInteracted: boolean,
+  locationIsInBounds: boolean,
+): boolean {
+  return origin === "user" || (!userInteracted && locationIsInBounds);
+}
+
+export function normalizeHeading(heading: number): number {
+  return ((heading % 360) + 360) % 360;
+}
+
+export function validHeading(heading: number | null | undefined): number | undefined {
+  return typeof heading === "number" && Number.isFinite(heading)
+    ? normalizeHeading(heading)
+    : undefined;
+}
+
+export function orientationHeading(
+  event: Pick<CompassOrientationEvent, "absolute" | "alpha" | "webkitCompassHeading" | "webkitCompassAccuracy">,
+  screenAngle = 0,
+): number | undefined {
+  const webkitHeading = validHeading(event.webkitCompassHeading);
+  const webkitAccuracy = event.webkitCompassAccuracy;
+  if (webkitHeading !== undefined && (webkitAccuracy === undefined || webkitAccuracy >= 0)) {
+    return webkitHeading;
+  }
+  const alpha = validHeading(event.alpha);
+  if (!event.absolute || alpha === undefined) return undefined;
+  return normalizeHeading(360 - alpha + screenAngle);
+}
+
+export function preferredHeading(
+  compassHeading: number | undefined,
+  movementHeading: number | null | undefined,
+): number | undefined {
+  return validHeading(compassHeading) ?? validHeading(movementHeading);
+}
+
+export function shortestCameraBearing(currentBearing: number, heading: number): number {
+  const delta = ((normalizeHeading(heading) - normalizeHeading(currentBearing) + 540) % 360) - 180;
+  return currentBearing + delta;
+}
+
+export function headingExceedsDeadband(
+  previousHeading: number | undefined,
+  nextHeading: number,
+  deadbandDegrees = FOLLOW_BEARING_DEADBAND_DEGREES,
+): boolean {
+  if (previousHeading === undefined) return true;
+  return Math.abs(shortestCameraBearing(previousHeading, nextHeading) - previousHeading) >= deadbandDegrees;
+}
+
+export function followCameraTransitionDuration(prefersReducedMotion: boolean): number {
+  return prefersReducedMotion ? 0 : FOLLOW_CAMERA_DURATION_MS;
+}
+
+export function nextCameraFollowState(
+  _currentState: CameraFollowState,
+  event: CameraFollowEvent,
+): CameraFollowState {
+  return event === "activate" ? "following" : "free";
+}
+
+export function locationStatePresentation(
+  state: UserLocationState,
+  cameraFollowState: CameraFollowState = "free",
+): {
+  label: string;
+  pressed: boolean;
+} {
+  const following = cameraFollowState === "following";
+  switch (state) {
+    case "requesting": return {
+      label: following ? "Waiting for your location to begin following" : "Waiting for your location",
+      pressed: following,
+    };
+    case "active": return {
+      label: following ? "Following your location and heading" : "Center and follow your location and heading",
+      pressed: following,
+    };
+    case "stale": return {
+      label: following ? "Following your last known location and heading" : "Center and follow your last known location",
+      pressed: following,
+    };
+    case "denied": return { label: "Location permission was denied", pressed: false };
+    case "unavailable": return { label: "Location is unavailable", pressed: false };
+    default: return { label: "Show and follow your location", pressed: false };
+  }
+}
+
+function screenOrientationAngle(): number {
+  return window.screen.orientation?.angle ?? 0;
+}
+
+function createLocationMarkerElement(): HTMLDivElement {
+  const marker = document.createElement("div");
+  marker.className = "user-location-marker";
+  marker.setAttribute("aria-hidden", "true");
+  const direction = document.createElement("span");
+  direction.className = "user-location-direction";
+  const dot = document.createElement("span");
+  dot.className = "user-location-dot";
+  marker.append(direction, dot);
+  return marker;
+}
+
+function createLocationControlIcon(): SVGSVGElement {
+  const namespace = "http://www.w3.org/2000/svg";
+  const icon = document.createElementNS(namespace, "svg");
+  icon.setAttribute("class", "user-location-control-icon");
+  icon.setAttribute("viewBox", "0 0 32 32");
+  icon.setAttribute("aria-hidden", "true");
+  const pulse = document.createElementNS(namespace, "circle");
+  pulse.setAttribute("class", "user-location-control-pulse");
+  pulse.setAttribute("cx", "16");
+  pulse.setAttribute("cy", "16");
+  pulse.setAttribute("r", "6");
+  const dot = document.createElementNS(namespace, "circle");
+  dot.setAttribute("class", "user-location-control-dot");
+  dot.setAttribute("cx", "16");
+  dot.setAttribute("cy", "16");
+  dot.setAttribute("r", "6");
+  icon.append(pulse, dot);
+  return icon;
+}
+
+export class UserLocationControl implements IControl {
+  private readonly options: Required<UserLocationControlOptions>;
+  private map?: MapLibreMap;
+  private container?: HTMLDivElement;
+  private button?: HTMLButtonElement;
+  private statusElement?: HTMLDivElement;
+  private marker?: Marker;
+  private markerElement?: HTMLDivElement;
+  private accuracyMarker?: Marker;
+  private accuracyElement?: HTMLDivElement;
+  private watchId?: number;
+  private statusTimer?: number;
+  private compassTimer?: number;
+  private headingAvailabilityTimer?: number;
+  private followCameraFrame?: number;
+  private lastPosition?: GeolocationPosition;
+  private compassHeading?: number;
+  private movementHeading?: number;
+  private lastRequestedHeading?: number;
+  private lastRequestedCoordinates?: [number, number];
+  private pendingFollowZoom?: number;
+  private forceFollowBearing = false;
+  private autoCenterBounds?: LocationBounds;
+  private firstFixOrigin?: TrackingOrigin;
+  private trackingOrigin?: TrackingOrigin;
+  private userInteractedBeforeFirstFix = false;
+  private manualActivationAttempted = false;
+  private autoLocationRemembered = false;
+  private lifecycleGeneration = 0;
+  private orientationListening = false;
+  private cameraFollowState: CameraFollowState = "free";
+  private state: UserLocationState = "inactive";
+  private blockedReason?: string;
+
+  constructor(options: UserLocationControlOptions = {}) {
+    this.options = {
+      autoStartIfGranted: options.autoStartIfGranted ?? false,
+      firstFixZoom: options.firstFixZoom ?? 13,
+    };
+  }
+
+  getDefaultPosition(): ControlPosition {
+    return "top-right";
+  }
+
+  onAdd(map: MapLibreMap): HTMLElement {
+    const lifecycleGeneration = ++this.lifecycleGeneration;
+    this.map = map;
+    this.manualActivationAttempted = false;
+    this.userInteractedBeforeFirstFix = false;
+    this.autoLocationRemembered = readAutoLocationPreference();
+    this.cameraFollowState = "free";
+    this.lastRequestedHeading = undefined;
+    this.lastRequestedCoordinates = undefined;
+    this.container = document.createElement("div");
+    this.container.className = "maplibregl-ctrl user-location-control";
+    const buttonFrame = document.createElement("div");
+    buttonFrame.className = "maplibregl-ctrl-group user-location-button-frame";
+    this.button = document.createElement("button");
+    this.button.type = "button";
+    this.button.className = "user-location-button";
+    this.button.append(createLocationControlIcon());
+    this.statusElement = document.createElement("div");
+    this.statusElement.className = "user-location-status";
+    this.statusElement.hidden = true;
+    this.statusElement.setAttribute("role", "status");
+    this.statusElement.setAttribute("aria-live", "polite");
+    buttonFrame.append(this.button);
+    this.container.append(buttonFrame, this.statusElement);
+
+    if (!window.isSecureContext) {
+      this.blockedReason = "Location requires HTTPS or localhost.";
+      this.state = "unavailable";
+      this.button.setAttribute("aria-disabled", "true");
+    } else if (!navigator.geolocation) {
+      this.blockedReason = "Location is not supported by this browser.";
+      this.state = "unavailable";
+      this.button.setAttribute("aria-disabled", "true");
+    }
+    this.syncPresentation();
+    this.button.addEventListener("click", this.handleClick);
+    map.on("zoom", this.updateAccuracyCircle);
+    map.on("move", this.updateAccuracyCircle);
+    map.on("rotate", this.updateAccuracyCircle);
+    map.on("pitch", this.updateAccuracyCircle);
+    map.on("movestart", this.handleMapMoveStart);
+    void this.startAutomaticallyIfGranted(map, lifecycleGeneration);
+    return this.container;
+  }
+
+  setAutoCenterBounds(bounds: LocationBounds): void {
+    this.autoCenterBounds = [...bounds];
+    this.tryCenterFirstFix();
+  }
+
+  pauseCameraFollow(): void {
+    this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), true);
+  }
+
+  onRemove(): void {
+    this.lifecycleGeneration += 1;
+    this.stopWatch();
+    this.stopOrientation();
+    this.cancelFollowCameraUpdate();
+    this.clearHeadingAvailabilityTimer();
+    if (this.map) {
+      this.map.off("zoom", this.updateAccuracyCircle);
+      this.map.off("move", this.updateAccuracyCircle);
+      this.map.off("rotate", this.updateAccuracyCircle);
+      this.map.off("pitch", this.updateAccuracyCircle);
+      this.map.off("movestart", this.handleMapMoveStart);
+    }
+    this.button?.removeEventListener("click", this.handleClick);
+    this.marker?.remove();
+    this.accuracyMarker?.remove();
+    this.container?.remove();
+    if (this.statusTimer !== undefined) window.clearTimeout(this.statusTimer);
+    if (this.compassTimer !== undefined) window.clearTimeout(this.compassTimer);
+    this.map = undefined;
+  }
+
+  private handleClick = (): void => {
+    if (this.blockedReason) {
+      this.showStatus(this.blockedReason);
+      return;
+    }
+    this.manualActivationAttempted = true;
+    this.trackingOrigin = "user";
+    this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "activate"), false);
+    this.scheduleHeadingAvailabilityNotice();
+    this.requestOrientationAccess();
+    if (this.watchId === undefined) {
+      this.startTracking("user");
+      return;
+    }
+    if (this.lastPosition) {
+      this.scheduleFollowCameraUpdate();
+    } else {
+      this.firstFixOrigin = "user";
+      this.showStatus("Waiting for your location…");
+    }
+  };
+
+  private startTracking(origin: TrackingOrigin): void {
+    if (this.watchId !== undefined) {
+      if (origin === "user" && !this.lastPosition) this.firstFixOrigin = "user";
+      return;
+    }
+    this.trackingOrigin = origin;
+    if (!this.lastPosition) {
+      this.firstFixOrigin = origin;
+    }
+    this.state = "requesting";
+    this.syncPresentation();
+    if (origin === "automatic") this.startOrientationWithoutPermissionPrompt();
+    try {
+      this.watchId = navigator.geolocation.watchPosition(
+        this.handlePosition,
+        this.handleError,
+        { enableHighAccuracy: true, maximumAge: 5_000, timeout: 10_000 },
+      );
+    } catch {
+      this.state = "unavailable";
+      this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
+      this.syncPresentation();
+      if (origin === "user") this.showStatus("Location is unavailable.");
+    }
+  }
+
+  private handlePosition = (position: GeolocationPosition): void => {
+    if (this.trackingOrigin === "user" && !this.autoLocationRemembered) {
+      this.autoLocationRemembered = true;
+      rememberAutoLocationPreference();
+    }
+    this.lastPosition = position;
+    this.movementHeading = validHeading(position.coords.heading);
+    if (this.movementHeading !== undefined) this.clearHeadingAvailabilityTimer();
+    this.state = "active";
+    this.ensureMarkers();
+    const coordinates: [number, number] = [position.coords.longitude, position.coords.latitude];
+    if (this.map) {
+      this.accuracyMarker?.setLngLat(coordinates).addTo(this.map);
+      this.marker?.setLngLat(coordinates).addTo(this.map);
+    }
+    this.markerElement?.classList.remove("is-stale");
+    this.accuracyElement?.classList.remove("is-stale");
+    this.updateMarkerHeading();
+    this.updateAccuracyCircle();
+    this.syncPresentation();
+    const centeredFirstFix = this.tryCenterFirstFix();
+    if (this.cameraFollowState === "following" && !centeredFirstFix) {
+      this.scheduleFollowCameraUpdate();
+    }
+  };
+
+  private handleError = (error: GeolocationPositionError): void => {
+    if (error.code === error.PERMISSION_DENIED) {
+      this.autoLocationRemembered = false;
+      forgetAutoLocationPreference();
+      this.state = "denied";
+      this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
+      this.stopWatch();
+      this.stopOrientation();
+      this.lastPosition = undefined;
+      this.marker?.remove();
+      this.accuracyMarker?.remove();
+      if (this.trackingOrigin === "user") {
+        this.showStatus("Location permission was denied. Enable it in your browser settings to try again.");
+      }
+    } else if (this.lastPosition) {
+      this.state = "stale";
+      this.markerElement?.classList.add("is-stale");
+      this.accuracyElement?.classList.add("is-stale");
+      if (this.trackingOrigin === "user") {
+        this.showStatus("Using your last known location while a fresh fix is unavailable.");
+      }
+    } else {
+      this.state = "unavailable";
+      this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
+      if (this.trackingOrigin === "user") {
+        this.showStatus(error.code === error.TIMEOUT
+          ? "Location timed out. Press the button to try again."
+          : "Your location is currently unavailable.");
+      }
+      this.stopWatch();
+    }
+    this.syncPresentation();
+  };
+
+  private ensureMarkers(): void {
+    if (!this.map || this.marker) return;
+    this.accuracyElement = document.createElement("div");
+    this.accuracyElement.className = "user-location-accuracy";
+    this.accuracyElement.setAttribute("aria-hidden", "true");
+    this.accuracyMarker = new maplibregl.Marker({
+      element: this.accuracyElement,
+      pitchAlignment: "map",
+      rotationAlignment: "map",
+    });
+    this.markerElement = createLocationMarkerElement();
+    this.marker = new maplibregl.Marker({
+      element: this.markerElement,
+      pitchAlignment: "viewport",
+      rotationAlignment: "map",
+    });
+  }
+
+  private centerOn(position: GeolocationPosition, zoom?: number): void {
+    if (!this.map) return;
+    this.map.easeTo({
+      center: [position.coords.longitude, position.coords.latitude],
+      ...(zoom === undefined ? {} : { zoom }),
+      duration: cameraTransitionDuration(window.matchMedia("(prefers-reduced-motion: reduce)").matches),
+    });
+  }
+
+  private tryCenterFirstFix(): boolean {
+    if (!this.lastPosition || !this.firstFixOrigin) return false;
+    const origin = this.firstFixOrigin;
+    if (origin === "automatic" && !this.autoCenterBounds) return false;
+    const isInBounds = origin === "user" || locationIsWithinBounds(
+      this.lastPosition.coords.longitude,
+      this.lastPosition.coords.latitude,
+      this.autoCenterBounds as LocationBounds,
+    );
+    this.firstFixOrigin = undefined;
+    if (shouldCenterFirstFix(origin, this.userInteractedBeforeFirstFix, isInBounds)) {
+      if (origin === "user" && this.cameraFollowState === "following") {
+        this.scheduleFollowCameraUpdate(this.options.firstFixZoom);
+      } else {
+        this.centerOn(this.lastPosition, this.options.firstFixZoom);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private handleMapMoveStart = (event: { originalEvent?: unknown }): void => {
+    if (!event.originalEvent) return;
+    this.userInteractedBeforeFirstFix = true;
+    this.setCameraFollowState(nextCameraFollowState(this.cameraFollowState, "pause"), false);
+  };
+
+  private async startAutomaticallyIfGranted(map: MapLibreMap, lifecycleGeneration: number): Promise<void> {
+    if (!this.options.autoStartIfGranted || this.blockedReason) return;
+    let permissionState: PermissionState | undefined;
+    try {
+      permissionState = navigator.permissions
+        ? (await navigator.permissions.query({ name: "geolocation" })).state
+        : undefined;
+    } catch {
+      // Firefox can retain a temporary geolocation grant without exposing it here.
+    }
+    if (permissionState === "denied") {
+      this.autoLocationRemembered = false;
+      forgetAutoLocationPreference();
+    }
+    if (
+      lifecycleGeneration !== this.lifecycleGeneration
+      || this.map !== map
+      || this.manualActivationAttempted
+      || !permissionAllowsAutoStart(permissionState, this.autoLocationRemembered)
+    ) return;
+    this.startTracking("automatic");
+  }
+
+  private updateAccuracyCircle = (): void => {
+    if (!this.map || !this.lastPosition || !this.accuracyElement || !this.accuracyMarker) return;
+    const location = this.accuracyMarker.getLngLat();
+    if (!location || !Number.isFinite(this.lastPosition.coords.accuracy)) return;
+    const screenPosition = this.map.project(location);
+    const comparisonLocation = this.map.unproject([screenPosition.x + 100, screenPosition.y]);
+    const pixelsToMeters = location.distanceTo(comparisonLocation) / 100;
+    if (!Number.isFinite(pixelsToMeters) || pixelsToMeters <= 0) return;
+    const diameter = Math.max(1, 2 * this.lastPosition.coords.accuracy / pixelsToMeters);
+    this.accuracyElement.style.width = `${diameter.toFixed(2)}px`;
+    this.accuracyElement.style.height = `${diameter.toFixed(2)}px`;
+  };
+
+  private requestOrientationAccess(): void {
+    const constructor = window.DeviceOrientationEvent as PermissionCapableOrientationConstructor | undefined;
+    if (!constructor) {
+      this.showHeadingUnavailableStatus();
+      return;
+    }
+    if (typeof constructor.requestPermission === "function") {
+      void constructor.requestPermission(true)
+        .then((result) => {
+          if (result === "granted" && this.map) this.startOrientation();
+          else this.showHeadingUnavailableStatus();
+        })
+        .catch(() => this.showHeadingUnavailableStatus());
+      return;
+    }
+    this.startOrientation();
+  }
+
+  private startOrientationWithoutPermissionPrompt(): void {
+    const constructor = window.DeviceOrientationEvent as PermissionCapableOrientationConstructor | undefined;
+    if (constructor && typeof constructor.requestPermission !== "function") this.startOrientation();
+  }
+
+  private startOrientation(): void {
+    if (this.orientationListening) return;
+    window.addEventListener("deviceorientationabsolute", this.handleOrientation);
+    window.addEventListener("deviceorientation", this.handleOrientation);
+    this.orientationListening = true;
+  }
+
+  private stopOrientation(): void {
+    if (!this.orientationListening) return;
+    window.removeEventListener("deviceorientationabsolute", this.handleOrientation);
+    window.removeEventListener("deviceorientation", this.handleOrientation);
+    this.orientationListening = false;
+  }
+
+  private handleOrientation = (event: DeviceOrientationEvent): void => {
+    const heading = orientationHeading(event as CompassOrientationEvent, screenOrientationAngle());
+    if (heading === undefined) return;
+    this.compassHeading = heading;
+    this.clearHeadingAvailabilityTimer();
+    if (this.compassTimer !== undefined) window.clearTimeout(this.compassTimer);
+    this.compassTimer = window.setTimeout(() => {
+      this.compassHeading = undefined;
+      this.updateMarkerHeading();
+      if (preferredHeading(this.compassHeading, this.movementHeading) === undefined) {
+        this.showHeadingUnavailableStatus();
+      }
+      this.scheduleFollowCameraUpdate();
+    }, COMPASS_FRESHNESS_MS);
+    this.updateMarkerHeading();
+    this.scheduleFollowCameraUpdate();
+  };
+
+  private updateMarkerHeading(): void {
+    if (!this.marker || !this.markerElement) return;
+    const heading = preferredHeading(this.compassHeading, this.movementHeading);
+    this.markerElement.classList.toggle("has-heading", heading !== undefined);
+    this.marker.setRotation(heading ?? 0);
+  }
+
+  private setCameraFollowState(state: CameraFollowState, stopCamera: boolean): void {
+    if (this.cameraFollowState === state) {
+      if (state === "following") {
+        this.lastRequestedCoordinates = undefined;
+        this.forceFollowBearing = true;
+        this.scheduleFollowCameraUpdate();
+      }
+      return;
+    }
+    this.cameraFollowState = state;
+    if (state === "free") {
+      this.cancelFollowCameraUpdate();
+      this.clearHeadingAvailabilityTimer();
+      if (stopCamera) this.map?.stop();
+    } else {
+      this.lastRequestedCoordinates = undefined;
+      this.forceFollowBearing = true;
+    }
+    this.syncPresentation();
+  }
+
+  private scheduleFollowCameraUpdate(zoom?: number): void {
+    if (this.cameraFollowState !== "following" || !this.map || !this.lastPosition) return;
+    if (zoom !== undefined) this.pendingFollowZoom = zoom;
+    if (this.followCameraFrame !== undefined) return;
+    this.followCameraFrame = window.requestAnimationFrame(this.applyFollowCameraUpdate);
+  }
+
+  private applyFollowCameraUpdate = (): void => {
+    this.followCameraFrame = undefined;
+    if (this.cameraFollowState !== "following" || !this.map || !this.lastPosition) return;
+
+    const coordinates: [number, number] = [
+      this.lastPosition.coords.longitude,
+      this.lastPosition.coords.latitude,
+    ];
+    const positionChanged = !this.lastRequestedCoordinates
+      || coordinates[0] !== this.lastRequestedCoordinates[0]
+      || coordinates[1] !== this.lastRequestedCoordinates[1];
+    const heading = preferredHeading(this.compassHeading, this.movementHeading);
+    const forceBearing = this.forceFollowBearing;
+    this.forceFollowBearing = false;
+    const headingChanged = heading !== undefined && (
+      forceBearing || headingExceedsDeadband(this.lastRequestedHeading, heading)
+    );
+    const zoom = this.pendingFollowZoom;
+    this.pendingFollowZoom = undefined;
+
+    let bearing: number | undefined;
+    if (headingChanged && heading !== undefined) {
+      bearing = shortestCameraBearing(this.map.getBearing(), heading);
+      this.lastRequestedHeading = heading;
+    } else if (forceBearing || (heading === undefined && this.lastRequestedHeading === undefined)) {
+      bearing = shortestCameraBearing(this.map.getBearing(), this.lastRequestedHeading ?? 0);
+    }
+
+    if (!positionChanged && !headingChanged && bearing === undefined && zoom === undefined) return;
+    this.lastRequestedCoordinates = coordinates;
+    this.map.easeTo({
+      center: coordinates,
+      ...(bearing === undefined ? {} : { bearing }),
+      ...(zoom === undefined ? {} : { zoom }),
+      duration: followCameraTransitionDuration(
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+      ),
+      easeId: FOLLOW_CAMERA_EASE_ID,
+    });
+  };
+
+  private cancelFollowCameraUpdate(): void {
+    if (this.followCameraFrame !== undefined) {
+      window.cancelAnimationFrame(this.followCameraFrame);
+      this.followCameraFrame = undefined;
+    }
+    this.pendingFollowZoom = undefined;
+    this.forceFollowBearing = false;
+  }
+
+  private scheduleHeadingAvailabilityNotice(): void {
+    this.clearHeadingAvailabilityTimer();
+    this.headingAvailabilityTimer = window.setTimeout(() => {
+      this.headingAvailabilityTimer = undefined;
+      if (preferredHeading(this.compassHeading, this.movementHeading) === undefined) {
+        this.showHeadingUnavailableStatus();
+      }
+    }, HEADING_AVAILABILITY_DELAY_MS);
+  }
+
+  private clearHeadingAvailabilityTimer(): void {
+    if (this.headingAvailabilityTimer === undefined) return;
+    window.clearTimeout(this.headingAvailabilityTimer);
+    this.headingAvailabilityTimer = undefined;
+  }
+
+  private showHeadingUnavailableStatus(): void {
+    if (this.cameraFollowState !== "following") return;
+    this.clearHeadingAvailabilityTimer();
+    this.showStatus(this.lastRequestedHeading !== undefined
+      ? "Heading signal was lost. Holding the last direction while location follow continues."
+      : "Compass heading is unavailable. Following location north-up and using travel direction when available.");
+  }
+
+  private stopWatch(): void {
+    if (this.watchId === undefined) return;
+    navigator.geolocation.clearWatch(this.watchId);
+    this.watchId = undefined;
+  }
+
+  private syncPresentation(): void {
+    if (!this.button || !this.container) return;
+    const presentation = locationStatePresentation(this.state, this.cameraFollowState);
+    const label = this.blockedReason ?? presentation.label;
+    this.button.title = label;
+    this.button.setAttribute("aria-label", label);
+    this.button.setAttribute("aria-pressed", String(presentation.pressed));
+    this.container.dataset.state = this.state;
+    this.container.dataset.cameraFollow = this.cameraFollowState;
+  }
+
+  private showStatus(message: string): void {
+    if (!this.statusElement) return;
+    this.statusElement.textContent = message;
+    this.statusElement.hidden = false;
+    if (this.statusTimer !== undefined) window.clearTimeout(this.statusTimer);
+    this.statusTimer = window.setTimeout(() => {
+      if (this.statusElement) this.statusElement.hidden = true;
+    }, STATUS_DURATION_MS);
+  }
+}

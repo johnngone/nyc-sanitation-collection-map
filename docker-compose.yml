@@ -1,0 +1,44 @@
+name: nyc-trash-map
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_BASEMAP_TILEJSON_URL: ${VITE_BASEMAP_TILEJSON_URL:-https://tiles.openfreemap.org/planet}
+    ports:
+      - "${APP_HOST_PORT:-8080}:8000"
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_TITLE: ${APP_TITLE:-NYC Trash Map}
+      APP_SUBTITLE: ${APP_SUBTITLE:-See collection schedules by street and day.}
+      APP_BROWSER_TITLE: ${APP_BROWSER_TITLE:-NYC Trash Map}
+      APP_SHORT_NAME: ${APP_SHORT_NAME:-NYC Trash Map}
+      APP_META_DESCRIPTION: ${APP_META_DESCRIPTION:-Explore NYC sanitation schedules by street and day. View trash, recycling, organics, and bulk collection near your live location on an interactive map.}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-}
+      APP_ROBOTS_TXT: ${APP_ROBOTS_TXT:-}
+      DATA_MANIFEST_PATH: /app/data/data_manifest.json
+      HEALTH_SYNC_HASH_MAX_BYTES: ${HEALTH_SYNC_HASH_MAX_BYTES:-16777216}
+      DATA_REFRESH_ENABLED: ${DATA_REFRESH_ENABLED:-true}
+      DATA_REFRESH_INTERVAL_DAYS: ${DATA_REFRESH_INTERVAL_DAYS:-14}
+      DATA_REFRESH_FAILURE_RETRY_MINUTES: ${DATA_REFRESH_FAILURE_RETRY_MINUTES:-30}
+      DATA_REFRESH_ON_STARTUP: ${DATA_REFRESH_ON_STARTUP:-true}
+      DATA_RELEASE_RETENTION: ${DATA_RELEASE_RETENTION:-2}
+      MIN_LION_SOURCE_ROWS: ${MIN_LION_SOURCE_ROWS:-200000}
+      MIN_DSNY_SOURCE_ROWS: ${MIN_DSNY_SOURCE_ROWS:-500}
+      MIN_OUTPUT_FEATURES: ${MIN_OUTPUT_FEATURES:-100000}
+      MAX_COUNT_DROP_PERCENT: ${MAX_COUNT_DROP_PERCENT:-10}
+      TILE_MIN_ZOOM: ${TILE_MIN_ZOOM:-11}
+      TILE_MAX_ZOOM: ${TILE_MAX_ZOOM:-16}
+      TILE_MAX_COMPRESSED_BYTES: ${TILE_MAX_COMPRESSED_BYTES:-1572864}
+      TILE_MAX_UNCOMPRESSED_BYTES: ${TILE_MAX_UNCOMPRESSED_BYTES:-6291456}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/live')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -e ".[test,refresh]"
+      - name: Prepare writable runtime data directory
+        run: mkdir -p data
+      - run: python -m pytest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+      - run: docker build -f Dockerfile -t nyc-trash-map:test .
+      - name: Verify standalone refresh dependencies
+        run: docker run --rm --entrypoint python nyc-trash-map:test -c "import geopandas, mapbox_vector_tile, shapely; from scripts.build_tiles import build_tiles"
+      - name: Smoke-test standalone image
+        run: bash scripts/smoke_container.sh nyc-trash-map:test nyc-trash-map-test

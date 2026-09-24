@@ -1,0 +1,21 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	@blocked path /docs /docs/* /redoc /redoc/* /openapi.json /api/refuse-streets*
+	respond @blocked 404
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+		-Via
+	}
+
+	reverse_proxy app:8000
+}
+
+www.{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
+}
